@@ -1,0 +1,175 @@
+本书由五篇组成，各篇之间有依赖关系，也有相对独立的模块。不同背景和目标的读者，可以参照以下路线图规划阅读顺序。
+
+\section*{总体结构}
+
+\begin{center}
+\begin{tikzpicture}[
+    font=\small,
+    part/.style={draw, rounded corners=4pt, minimum width=4.2cm, minimum height=1.0cm, align=center, thick},
+    arrow/.style={-{Latex[length=3mm]}, thick}
+  ]
+
+  \node[part, fill=blue!10] (p1) at (0,4.0) {第一篇：基石\\数学 $\cdot$ CUDA $\cdot$ 深度学习};
+  \node[part, fill=green!10] (p2) at (0,2.2) {第二篇：演进\\Transformer $\cdot$ LLM 架构};
+  \node[part, fill=orange!12] (p3) at (-3.5,0.2) {第三篇：分布式训练\\DP $\cdot$ TP $\cdot$ PP $\cdot$ 3D $\cdot$ ZeRO};
+  \node[part, fill=red!10] (p4) at (3.5,0.2) {第四篇：推理优化\\KV Cache $\cdot$ PagedAttn $\cdot$ FlashAttn $\cdot$ 量化};
+  \node[part, fill=purple!10] (p5) at (0,-1.8) {第五篇：硬件与调度\\GPU $\cdot$ NVLink $\cdot$ RDMA $\cdot$ K8s};
+
+  \draw[arrow] (p1) -- (p2);
+  \draw[arrow] (p2) -- (p3);
+  \draw[arrow] (p2) -- (p4);
+  \draw[arrow] (p3) -- (p5);
+  \draw[arrow] (p4) -- (p5);
+
+  \node[align=left, text width=8cm] at (0,-3.2) {
+    第一篇是全书基础；第二篇连接基础与系统；\\
+    第三、四篇相对独立，可按需选择；第五篇提供硬件支撑。
+  };
+\end{tikzpicture}
+\end{center}
+
+\section*{路线一：系统入门路线}
+
+适合\textbf{刚接触 AI Infra} 的读者，从零开始建立完整知识体系。
+
+\begin{enumerate}
+\item \textbf{第一篇：基石}（第 1--3 章）——顺序阅读。这是全书的数学和编程基础，后续所有章节都会引用其中的概念。重点关注：shape 与显存估算、矩阵乘法与 FLOPs、链式法则与反向传播、CUDA 线程层次与内存模型、混合精度训练。
+\item \textbf{第二篇：演进}（第 4--6 章）——顺序阅读。理解 Transformer 的每个组件如何从数学公式变成系统成本。重点关注：Attention 的 $S^2$ 瓶颈、FFN 的参数量来源、RoPE 与 KV Cache 的关系、GQA 与推理效率。
+\item \textbf{第三篇：分布式训练}（第 7--11 章）——顺序阅读。从单卡瓶颈出发，逐步理解为什么需要分布式、每种并行策略解决什么问题。重点关注：Ring AllReduce 的通信量推导、TP 的 column/row splitting、PP 的 bubble 分析、3D 并行配置推导、ZeRO 各 Stage 的显存与通信 trade-off。
+\item \textbf{第四篇：推理优化}（第 12--16 章）——顺序阅读。从自回归推理流程出发，逐步理解推理系统的每个优化层次。重点关注：KV Cache 的显存估算、PagedAttention 的内存管理、FlashAttention 的 IO 优化本质、量化对精度和吞吐的影响、Continuous Batching 的调度逻辑。
+\item \textbf{第五篇：硬件与调度}（第 17--20 章）——按需阅读。回到物理世界，理解分布式策略和推理优化的硬件基础。
+\end{enumerate}
+
+\section*{路线二：训练工程师路线}
+
+适合\textbf{已有模型训练经验}，需要深入理解分布式训练架构的读者。你可以快速回顾第一篇的关键章节，然后集中精力在第二篇和第三篇。
+
+\begin{enumerate}
+\item \textbf{快速回顾}：第 1 章的显存/FLOPs/通信量估算、第 2 章的 CUDA 内存模型与 kernel 性能分析、第 3 章的混合精度训练与优化器状态。
+\item \textbf{重点阅读}：第 4 章的 Attention 系统成本、第 6 章的 GQA/SwiGLU/MoE 架构对训练的影响。
+\item \textbf{核心章节}：第 7--11 章全部。这是训练工程师的核心知识——数据并行、张量并行、流水线并行、3D 并行策略和 ZeRO。建议仔细推导每种策略的通信量和显存收益，不要只记结论。
+\item \textbf{补充阅读}：第 12 章的 KV Cache 基础和第 14 章的 FlashAttention，因为训练中同样需要高效 attention kernel。第 17--19 章的硬件与网络知识，帮助你理解并行策略在真实集群上的表现。
+\end{enumerate}
+
+\section*{路线三：推理工程师路线}
+
+适合\textbf{主要做推理服务部署与优化}的读者。你可以跳过训练篇的大部分内容，但第二篇的架构知识和第四篇是核心。
+
+\begin{enumerate}
+\item \textbf{快速回顾}：第 1 章的显存估算与数值稳定性、第 2 章的 GPU 内存层级与访存模式、第 3 章的混合精度格式。
+\item \textbf{重点阅读}：第 4 章的 Attention mask 与 causal 结构、第 6 章的 GQA/RoPE/SwiGLU 架构——这些直接影响 KV Cache 设计、attention kernel 实现和 serving 配置。
+\item \textbf{核心章节}：第 12--16 章全部。这是推理工程师的核心知识——KV Cache 机制与显存估算、PagedAttention 与 vLLM 架构、FlashAttention 的 IO 优化原理、量化方法与精度-吞吐权衡、Continuous Batching 与调度策略。
+\item \textbf{补充阅读}：第 8 章的张量并行（推理中的 TP 通信与权重切分方式与训练一致）、第 17 章的 GPU 架构（decode 阶段的 memory-bound 特性与 Tensor Core 利用率）、第 18 章的 NVLink/NVSwitch（多卡推理的互联基础）。
+\end{enumerate}
+
+\section*{路线四：系统工程师路线}
+
+适合\textbf{已有分布式系统/网络/调度经验}，需要理解 AI 工作负载特征的读者。
+
+\begin{enumerate}
+\item \textbf{快速回顾}：第 1 章的显存/计算量/通信量估算公式、第 3 章的优化器状态与混合精度。
+\item \textbf{理解负载}：第 4--6 章。重点理解 Transformer 的计算模式（GEMM 密集 vs memory-bound 小算子）、LLM 训练与推理的形态差异、MoE 的 all-to-all 通信特征。
+\item \textbf{理解并行}：第 7--11 章。重点不是配置方法，而是通信模式：Ring AllReduce、reduce-scatter、all-gather、all-to-all 的通信量与拓扑关系；TP/PP/DP 的 group 划分与 rank 映射；ZeRO 的分片策略与 checkpoint 写入模式。
+\item \textbf{理解推理}：第 12--13 章、第 16 章。重点理解 prefill 与 decode 的差异、KV Cache 的显存与带宽瓶颈、continuous batching 的调度逻辑。
+\item \textbf{核心章节}：第 17--20 章。GPU 架构、NVLink/NVSwitch 拓扑、RDMA/RoCE 通信、K8s AI 调度——这是系统工程师最能发挥专业优势的领域。
+\end{enumerate}
+
+\section*{各章依赖关系}
+
+\begin{center}
+\begin{tikzpicture}[
+    font=\small,
+    ch/.style={draw, rounded corners=2pt, minimum width=2.0cm, minimum height=0.55cm, align=center, fill=blue!6},
+    arrow/.style={-{Latex[length=2mm]}, thick}
+  ]
+
+  \node[ch, fill=blue!10] (c1) at (0,6.0) {第1章\\数学基础};
+  \node[ch, fill=blue!10] (c2) at (3.5,6.0) {第2章\\CUDA C++};
+  \node[ch, fill=blue!10] (c3) at (7.0,6.0) {第3章\\深度学习};
+
+  \node[ch, fill=green!10] (c4) at (1.75,4.5) {第4章\\Transformer};
+  \node[ch, fill=green!10] (c5) at (5.25,4.5) {第5章\\LLM 历史};
+
+  \node[ch, fill=green!10] (c6) at (3.5,3.0) {第6章\\LLM 架构};
+
+  \node[ch, fill=orange!12] (c7) at (-1.5,1.5) {第7章\\数据并行};
+  \node[ch, fill=orange!12] (c8) at (1.75,1.5) {第8章\\张量并行};
+  \node[ch, fill=orange!12] (c9) at (5.0,1.5) {第9章\\流水线并行};
+
+  \node[ch, fill=orange!12] (c10) at (1.75,0.0) {第10章\\3D并行};
+  \node[ch, fill=orange!12] (c11) at (5.0,0.0) {第11章\\ZeRO};
+
+  \node[ch, fill=red!10] (c12) at (8.5,3.0) {第12章\\KV Cache};
+  \node[ch, fill=red!10] (c13) at (11.5,3.0) {第13章\\PagedAttn};
+  \node[ch, fill=red!10] (c14) at (8.5,1.5) {第14章\\FlashAttn};
+  \node[ch, fill=red!10] (c15) at (11.5,1.5) {第15章\\量化};
+  \node[ch, fill=red!10] (c16) at (10.0,0.0) {第16章\\Cont.Batching};
+
+  \node[ch, fill=purple!10] (c17) at (3.5,-1.5) {第17章\\GPU架构};
+  \node[ch, fill=purple!10] (c18) at (6.5,-1.5) {第18章\\NVLink};
+  \node[ch, fill=purple!10] (c19) at (9.5,-1.5) {第19章\\RDMA};
+  \node[ch, fill=purple!10] (c20) at (12.5,-1.5) {第20章\\K8s调度};
+
+  \draw[arrow] (c1) -- (c2);
+  \draw[arrow] (c2) -- (c3);
+  \draw[arrow] (c1) -- (c4);
+  \draw[arrow] (c3) -- (c4);
+  \draw[arrow] (c4) -- (c5);
+  \draw[arrow] (c5) -- (c6);
+  \draw[arrow] (c4) -- (c6);
+
+  \draw[arrow] (c6) -- (c7);
+  \draw[arrow] (c6) -- (c8);
+  \draw[arrow] (c6) -- (c9);
+  \draw[arrow] (c7) -- (c10);
+  \draw[arrow] (c8) -- (c10);
+  \draw[arrow] (c9) -- (c10);
+  \draw[arrow] (c7) -- (c11);
+  \draw[arrow] (c10) -- (c11);
+
+  \draw[arrow] (c6) -- (c12);
+  \draw[arrow] (c12) -- (c13);
+  \draw[arrow] (c2) -- (c14);
+  \draw[arrow] (c12) -- (c14);
+  \draw[arrow] (c6) -- (c15);
+  \draw[arrow] (c13) -- (c16);
+  \draw[arrow] (c14) -- (c16);
+
+  \draw[arrow] (c2) -- (c17);
+  \draw[arrow] (c8) -- (c17);
+  \draw[arrow] (c10) -- (c18);
+  \draw[arrow] (c17) -- (c18);
+  \draw[arrow] (c7) -- (c19);
+  \draw[arrow] (c18) -- (c19);
+  \draw[arrow] (c19) -- (c20);
+\end{tikzpicture}
+\end{center}
+
+\section*{符号与约定}
+
+本书使用如下符号约定，详细符号表见附录 A：
+
+\begin{itemize}
+\item 标量用小写斜体：$x,y,z,n,b,s$；
+\item 向量用粗体小写：$\vect{x},\vect{y},\vect{b}$；
+\item 矩阵用粗体大写：$\mat{X},\mat{W},\mat{A}$；
+\item 高阶张量用粗体大写加特殊标记：$\tensor{X}\in\mathbb{R}^{B\times S\times H}$；
+\item $B$ 为 batch size，$S$ 为 sequence length，$H$ 为 hidden size，$V$ 为词表大小，$L$ 为层数；
+\item $N$ 为模型参数量，FLOPs 表示浮点运算次数，$1\text{ FLOP}=1$ 次乘法或加法；
+\item 显存以 bytes 为单位，带宽以 bytes/s 或 GB/s 为单位；
+\item 代码示例使用 Python（PyTorch 风格）或 CUDA C++。
+\end{itemize}
+
+\section*{实践建议}
+
+本书不是一本只需要"读"的书。AI Infra 的很多直觉只能通过动手获得。以下建议适用于所有读者：
+
+\begin{itemize}
+\item \textbf{运行代码示例}：书中的代码都可以在单卡 GPU 上运行。如果你没有 GPU，可以使用 Google Colab 或云上 GPU 实例。亲手观察 shape、stride、显存和 kernel 时间，比单纯阅读公式有效得多。
+\item \textbf{做显存估算练习}：选择一个你熟悉的模型（如 LLaMA-7B），用第 1 章的公式估算训练和推理的显存，然后与实际运行结果对比。差距会帮助你理解哪些因素被简化了。
+\item \textbf{用 Nsight Systems 做一次 profiling}：找一个训练或推理任务，用 Nsight Systems 拍一张时间线截图。识别 forward、backward、communication、optimizer step 各占多少时间。这个习惯会让你对系统瓶颈产生直觉。
+\item \textbf{尝试不同的并行配置}：如果你有集群条件，尝试用不同的 TP/PP/DP 组合运行同一个模型，观察吞吐、显存和通信时间的变化。
+\item \textbf{部署一个推理服务}：用 vLLM 或 TensorRT-LLM 部署一个模型，用压测工具模拟多用户并发请求，观察 KV Cache 使用率、batch 动态变化和延迟分布。
+\end{itemize}
+
+AI Infra 是一门实践性极强的学科。希望你在阅读本书的同时，始终有一张 GPU 在旁边运行着代码。

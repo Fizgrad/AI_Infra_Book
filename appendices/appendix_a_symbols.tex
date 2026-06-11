@@ -1,0 +1,235 @@
+% appendices/appendix_a_symbols.tex
+
+\chapter{数学符号与张量维度约定}
+
+在大模型工程中，许多问题表面上看是系统问题，实际根源却来自张量维度、矩阵乘法方向、并行切分方式或内存布局理解不一致。例如，同样是一个 attention tensor，在论文中可能写作 $[B, H, S, D_h]$，在框架实现中可能变成 $[S, B, H, D_h]$，在 CUDA kernel 中又可能被重排为适合访存合并的连续布局。本附录统一本书使用的数学符号、维度命名和公式排版规则，方便读者在阅读后续章节时快速对齐语义。
+
+\section{常用数学符号}
+
+\subsection{标量、向量、矩阵与张量}
+
+本书使用如下约定：
+
+\begin{longtable}{p{0.22\textwidth}p{0.68\textwidth}}
+\toprule
+符号 & 含义 \
+\midrule
+$a, b, c$ & 标量，通常表示单个数值，例如 loss、学习率、温度参数等。 \
+$\vect{x}, \vect{y}, \vect{z}$ & 向量，通常表示一个 token 的 hidden state、一个参数向量或一个概率分布。 \
+$\mat{A}, \mat{B}, \mat{W}$ & 矩阵，通常表示线性层权重、二维激活或批量矩阵乘法中的单个矩阵。 \
+$\tensor{X}, \tensor{Y}, \tensor{Z}$ & 高维张量，通常表示 batch、sequence、head、hidden 等多个维度组成的数据。 \
+$\theta$ & 模型参数集合。 \
+$\nabla_{\theta}\mathcal{L}$ & loss 对模型参数的梯度。 \
+$\mathcal{L}$ & 损失函数。 \
+$\eta$ & 学习率。 \
+\bottomrule
+\end{longtable}
+
+在具体实现中，一个变量到底是向量、矩阵还是高维张量，取决于上下文。例如，Transformer 中的 hidden states 在单个 token 视角下是向量，在单个序列视角下是矩阵，在 batch 视角下是三维张量。
+
+\subsection{索引与集合}
+
+本书常用如下索引：
+
+\begin{longtable}{p{0.22\textwidth}p{0.68\textwidth}}
+\toprule
+符号 & 含义 \
+\midrule
+$i, j, k$ & 通用索引，常用于矩阵元素、token 位置或循环变量。 \
+$b$ & batch 中的样本索引。 \
+$s, t$ & sequence 中的 token 位置索引。 \
+$h$ & attention head 索引。 \
+$l$ & Transformer 层索引。 \
+$r$ & 分布式训练中的 rank 索引。 \
+$N$ & 通用数量，例如样本数、节点数、GPU 数等。 \
+$V$ & 词表大小 vocabulary size。 \
+\bottomrule
+\end{longtable}
+
+若存在歧义，本书会在公式前显式说明索引含义。例如：
+[
+\tensor{X}_{b,s,:}
+]
+表示第 $b$ 个样本、第 $s$ 个 token 对应的 hidden vector。
+
+\section{Transformer 中的维度命名}
+
+Transformer 工程实现中最容易出错的地方之一，是不同维度含义相近但用途不同。尤其在多头注意力、KV Cache、张量并行和推理服务章节中，维度命名必须保持一致。
+
+\subsection{基础维度}
+
+本书默认使用如下维度符号：
+
+\begin{longtable}{p{0.2\textwidth}p{0.24\textwidth}p{0.46\textwidth}}
+\toprule
+符号 & 名称 & 含义 \
+\midrule
+$B$ & batch size & 一个 step 或一次推理迭代中同时处理的样本数量。 \
+$S$ & sequence length & 输入序列长度，也可表示 prefill 阶段上下文长度。 \
+$T$ & generated length & 自回归生成阶段生成的 token 数。 \
+$D$ & hidden size & 每个 token 的隐藏状态维度。 \
+$H$ & number of heads & attention head 数量。 \
+$D_h$ & head dimension & 单个 attention head 的维度，通常满足 $D = H \cdot D_h$。 \
+$D_{\mathrm{ff}}$ & FFN intermediate size & Feed-Forward Network 中间层维度。 \
+$V$ & vocabulary size & tokenizer 对应的词表大小。 \
+$L$ & number of layers & Transformer block 层数。 \
+\bottomrule
+\end{longtable}
+
+典型 Decoder-only LLM 的主要张量形状如下：
+
+\begin{longtable}{p{0.28\textwidth}p{0.28\textwidth}p{0.34\textwidth}}
+\toprule
+对象 & 形状 & 说明 \
+\midrule
+Token IDs & $[B, S]$ & 输入 token 编号。 \
+Embedding Output & $[B, S, D]$ & token embedding 后的隐藏状态。 \
+Q / K / V & $[B, S, H, D_h]$ & 多头注意力中的 query、key、value。 \
+Attention Scores & $[B, H, S, S]$ & prefill 阶段完整 self-attention 分数矩阵。 \
+Attention Output & $[B, S, H, D_h]$ & 每个 head 的 attention 输出。 \
+Merged Attention Output & $[B, S, D]$ & 多头合并后的输出。 \
+FFN Intermediate & $[B, S, D_{\mathrm{ff}}]$ & FFN 上投影后的中间激活。 \
+Logits & $[B, S, V]$ & 每个 token 位置上的词表 logits。 \
+\bottomrule
+\end{longtable}
+
+\subsection{MHA、MQA 与 GQA 中的 head 维度}
+
+标准 Multi-Head Attention 中，Query、Key、Value 通常具有相同数量的 heads：
+[
+H_q = H_k = H_v = H.
+]
+
+在 Multi-Query Attention 中，多个 query heads 共享一组 key/value heads：
+[
+H_q = H,\qquad H_k = H_v = 1.
+]
+
+在 Grouped-Query Attention 中，query heads 被分组，每组共享一个 key/value head：
+[
+H_q = H,\qquad H_k = H_v = H_{\mathrm{kv}},\qquad H_{\mathrm{kv}} < H.
+]
+
+因此，KV Cache 的大小与 $H_{\mathrm{kv}}$ 直接相关，而不是只与 $H_q$ 相关。推理系统中估算显存时，应使用：
+[
+\mathrm{KVCacheBytes}
+=====================
+
+2 \cdot B \cdot S \cdot L \cdot H_{\mathrm{kv}} \cdot D_h \cdot \mathrm{bytes_per_element}.
+]
+其中系数 $2$ 分别对应 Key Cache 与 Value Cache。
+
+\section{batch、sequence、hidden、head 维度约定}
+
+\subsection{默认逻辑布局}
+
+除非特别说明，本书在数学推导中默认使用 batch-first 布局：
+[
+\tensor{X} \in \mathbb{R}^{B \times S \times D}.
+]
+
+这与许多现代 PyTorch 模型实现保持一致，便于读者理解 batch、sequence 与 hidden 的关系。在讲解注意力时，本书通常将 Q/K/V 写作：
+[
+\tensor{Q}, \tensor{K}, \tensor{V}
+\in
+\mathbb{R}^{B \times S \times H \times D_h}.
+]
+
+实际工程中，为了适配 kernel 或提高访存效率，常见布局还包括：
+
+\begin{itemize}
+\item $[S, B, D]$：早期序列模型和部分框架内部实现常用。
+\item $[B, H, S, D_h]$：attention kernel 中常用，方便按 head 并行。
+\item $[B, S, H \cdot D_h]$：linear projection 前后的合并 hidden 表示。
+\item $[L, B, H_{\mathrm{kv}}, S, D_h]$：KV Cache 的一种逻辑表达方式。
+\end{itemize}
+
+本书会在涉及 kernel 或内存布局时明确区分“逻辑形状”和“物理布局”。逻辑形状描述语义，物理布局描述内存中连续存储的顺序。
+
+\subsection{矩阵乘法方向}
+
+线性层通常写作：
+[
+\mat{Y} = \mat{X}\mat{W} + \vect{b},
+]
+其中：
+[
+\mat{X} \in \mathbb{R}^{N \times D_{\mathrm{in}}},
+\qquad
+\mat{W} \in \mathbb{R}^{D_{\mathrm{in}} \times D_{\mathrm{out}}},
+\qquad
+\mat{Y} \in \mathbb{R}^{N \times D_{\mathrm{out}}}.
+]
+
+在 PyTorch 的 \texttt{nn.Linear(in_features, out_features)} 中，权重参数的存储形状通常是：
+[
+[D_{\mathrm{out}}, D_{\mathrm{in}}],
+]
+前向计算在语义上等价于：
+[
+\mat{Y} = \mat{X}\mat{W}^{\top} + \vect{b}.
+]
+
+因此，阅读代码时不要只根据权重 tensor 的 shape 判断数学公式方向，而要结合框架 API 的约定。
+
+\section{本书公式排版规范}
+
+\subsection{公式与代码之间的对应关系}
+
+本书尽量保持公式与代码之间的一一对应。例如，Scaled Dot-Product Attention 写作：
+[
+\Attention(\mat{Q}, \mat{K}, \mat{V})
+=====================================
+
+\softmax\left(
+\frac{\mat{Q}\mat{K}^{\top}}{\sqrt{D_h}}
+\right)\mat{V}.
+]
+
+对应到伪代码时，通常写为：
+
+\begin{lstlisting}[language=Python,caption={Scaled Dot-Product Attention 的基本形式},label={lst:appendix-attention-basic}]
+scores = q @ k.transpose(-2, -1)
+scores = scores / math.sqrt(head_dim)
+probs = torch.softmax(scores, dim=-1)
+out = probs @ v
+\end{lstlisting}
+
+这里的 \texttt{transpose(-2, -1)} 对应公式中的 $\mat{K}^{\top}$，\texttt{dim=-1} 表示沿 key sequence 维度做 softmax。
+
+\subsection{复杂度记号}
+
+本书使用 $\mathcal{O}(\cdot)$ 表示渐进复杂度。若讨论 Transformer attention 的计算复杂度，常写作：
+[
+\mathcal{O}(B \cdot H \cdot S^2 \cdot D_h).
+]
+
+若讨论 KV Cache 显存复杂度，常写作：
+[
+\mathcal{O}(B \cdot L \cdot H_{\mathrm{kv}} \cdot S \cdot D_h).
+]
+
+需要注意，复杂度表达式只表达增长趋势，不等价于真实运行时间。真实性能还受到 kernel fusion、访存模式、HBM 带宽、Tensor Core 利用率、通信拓扑和调度策略影响。
+
+\subsection{单位约定}
+
+本书在系统性能章节中常用如下单位：
+
+\begin{longtable}{p{0.22\textwidth}p{0.68\textwidth}}
+\toprule
+单位 & 含义 \
+\midrule
+FLOPs & 浮点运算次数。 \
+TFLOPS & 每秒万亿次浮点运算。 \
+GB / GiB & 十进制 GB 与二进制 GiB。工程排查中需注意二者差异。 \
+GB/s & 每秒传输的字节数，常用于显存带宽、PCIe 带宽、网络带宽。 \
+tokens/s & 推理或训练中每秒处理的 token 数。 \
+steps/s & 训练中每秒完成的 optimizer step 数。 \
+TTFT & Time To First Token，推理请求首 token 延迟。 \
+TPOT & Time Per Output Token，生成阶段单 token 平均耗时。 \
+\bottomrule
+\end{longtable}
+
+\section{附录 A 小结}
+
+本附录定义了本书使用的主要数学符号、Transformer 维度命名、张量布局约定与公式排版规范。读者在阅读训练并行、推理优化、GPU kernel 和集群调度章节时，可以随时回到本附录对齐变量含义。尤其在分析 KV Cache、Tensor Parallelism、FlashAttention 与 Continuous Batching 时，明确维度语义往往比记住某个公式更重要。

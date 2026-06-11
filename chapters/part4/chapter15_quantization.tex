@@ -1,0 +1,1997 @@
+\chapter{量化技术}
+\label{chap:quantization}
+
+\section{为什么推理需要量化}
+\label{sec:why-inference-needs-quantization}
+
+前面两章分别讨论了 PagedAttention 与 FlashAttention。PagedAttention 解决 KV Cache 的动态内存管理问题，FlashAttention 解决 Attention 计算中的 HBM IO 瓶颈。本章进入推理优化的另一个核心方向：\textbf{量化 Quantization}。
+
+量化的基本思想是：用更低 bit-width 的数值格式表示模型权重、激活或 KV Cache，从而降低显存占用、减少内存带宽压力，并在硬件支持时提升计算吞吐。
+
+在大模型推理中，量化的价值尤其明显。以一个 dense Decoder-only 模型为例，如果参数量为 $N$，使用 FP16/BF16 存储权重，则权重显存约为：
+
+[
+M_{\mathrm{weight,fp16}} = 2N\ \mathrm{bytes}.
+]
+
+如果使用 INT8 权重量化：
+
+[
+M_{\mathrm{weight,int8}} \approx 1N\ \mathrm{bytes}.
+]
+
+如果使用 INT4 权重量化：
+
+[
+M_{\mathrm{weight,int4}} \approx 0.5N\ \mathrm{bytes}.
+]
+
+忽略 scale、zero point、alignment 和 packing metadata，仅从权重本体看，INT8 相比 FP16 约节省一半显存，INT4 约节省四分之三显存。对于 70B 参数模型，FP16/BF16 权重大约需要：
+
+[
+70\times 10^9\times 2
+=====================
+
+140\ \mathrm{GB}.
+]
+
+如果权重压到 INT4，理论权重本体约为：
+
+[
+70\times 10^9\times 0.5
+=======================
+
+35\ \mathrm{GB}.
+]
+
+这会直接改变部署形态：原本需要多张 GPU 才能装下的模型，可能可以用更少 GPU 部署；原本显存主要被权重占满的服务，可以留出更多空间给 KV Cache，从而支持更高并发或更长上下文。
+
+\subsection{权重显存}
+\label{subsec:weight-memory}
+
+推理阶段不需要保存梯度和优化器状态，显存主要由以下部分组成：
+
+[
+M_{\mathrm{inference}}
+======================
+
+M_{\mathrm{weights}}
++
+M_{\mathrm{KV}}
++
+M_{\mathrm{activations}}
++
+M_{\mathrm{workspace}}
++
+M_{\mathrm{runtime}}.
+]
+
+其中权重显存通常是常驻显存，KV Cache 随请求增长，activation 和 workspace 随 batch、sequence length 和 kernel 实现变化。
+
+在 batch 较小、上下文不太长的场景中，权重可能是主要显存占用；在长上下文和高并发 serving 中，KV Cache 可能成为主要显存占用。量化可以作用于不同对象：
+
+\begin{itemize}
+\item \textbf{Weight Quantization}：压缩模型权重，例如 W8A16、W4A16；
+\item \textbf{Activation Quantization}：压缩中间激活，例如 W8A8；
+\item \textbf{KV Cache Quantization}：压缩推理缓存，例如 FP8 KV、INT8 KV；
+\item \textbf{Optimizer Quantization}：训练中压缩优化器状态，本章不重点展开。
+\end{itemize}
+
+其中推理部署最常见的是 weight-only quantization，即权重量化到 INT8/INT4，激活仍用 FP16/BF16。它实现难度相对较低，精度风险也比同时量化激活更可控。
+
+\begin{table}[H]
+\centering
+\small
+\caption{常见推理量化对象}
+\label{tab:quantization-targets}
+\begin{tabular}{p{0.22\textwidth}p{0.28\textwidth}p{0.38\textwidth}}
+\toprule
+\textbf{量化对象} & \textbf{常见格式} & \textbf{主要收益与风险} \
+\midrule
+权重
+& INT8, INT4, NF4, FP8
+& 降低常驻显存和权重读取带宽；风险主要是模型精度下降。 \
+\midrule
+激活
+& INT8, FP8
+& 降低 GEMM 输入带宽并启用低精度算力；风险是 activation outlier 造成误差放大。 \
+\midrule
+KV Cache
+& INT8, FP8, INT4
+& 降低长上下文和高并发的 cache 显存；风险是 decode 质量和长程依赖下降。 \
+\midrule
+Logits / Sampling
+& 通常保持 FP16/FP32
+& 采样对数值稳定敏感，通常不作为主要量化对象。 \
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{显存带宽}
+\label{subsec:memory-bandwidth}
+
+量化不仅减少显存容量，也减少显存带宽压力。推理中的 Linear 层通常形如：
+
+[
+\mat{Y}=\mat{X}\mat{W}.
+]
+
+在 decode 阶段，batch 维和 token 维可能很小，权重读取成本会非常重要。每生成一个 token，模型需要经过所有层，每层读取 QKV projection、output projection、FFN up/gate/down projection 等权重。若权重以 FP16 存储，读取字节数大约是 INT8 的 2 倍、INT4 的 4 倍。
+
+当 kernel 是 memory-bound 时，减少权重读取字节数可以直接提升速度。设某层需要读取权重大小 $M_W$，有效 HBM 带宽为 $\beta$，则权重读取时间下界为：
+
+[
+T_{\mathrm{read}}
+\ge
+\frac{M_W}{\beta}.
+]
+
+如果量化后权重字节数降低为原来的 $\rho$，则读取时间下界也降低为：
+
+[
+T_{\mathrm{read,quant}}
+\ge
+\frac{\rho M_W}{\beta}.
+]
+
+其中：
+
+[
+\rho_{\mathrm{INT8}}\approx \frac{1}{2},
+\quad
+\rho_{\mathrm{INT4}}\approx \frac{1}{4}.
+]
+
+当然，实际速度不一定按这个比例提升，因为还要考虑 dequantization、packing/unpacking、Tensor Core 支持、kernel fusion 和 batch size。量化后的 GEMM 如果需要先把 INT4 解包并反量化到 FP16，再执行普通 GEMM，可能会被解包开销抵消。高性能量化推理必须让 dequantization 与 GEMM 融合。
+
+\subsection{compute-bound 与 memory-bound}
+\label{subsec:compute-bound-memory-bound-quantization}
+
+量化是否能加速，取决于当前瓶颈。若推理主要受权重读取或 KV Cache 读取限制，量化往往收益明显；若推理主要受计算 FLOPs 限制，则需要硬件真正支持低精度计算，才能获得吞吐提升。
+
+可以用 roofline 直觉理解。算术强度为：
+
+[
+I=\frac{\mathrm{FLOPs}}{\mathrm{Bytes}}.
+]
+
+量化减少 bytes，因此提高 $I$。如果原 kernel 处于 memory-bound 区域，提高算术强度可以提升性能；如果原 kernel 已经 compute-bound，仅减少 bytes 未必能提升很多，除非低精度格式也提高 compute throughput。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+axis/.style={-{Latex[length=2.2mm]}, thick},
+curve/.style={thick},
+point/.style={circle, draw, minimum size=0.16cm}
+]
+
+```
+\node[font=\bfseries] at (0,3.0) {量化通过减少 Bytes 提高算术强度};
+
+\draw[axis] (-5.1,-1.15) -- (5.2,-1.15) node[right] {Arithmetic Intensity};
+\draw[axis] (-5.1,-1.15) -- (-5.1,2.25) node[above] {Performance};
+
+\draw[curve, orange!80!black] (-4.8,-0.95) -- (-1.4,1.55);
+\draw[curve, orange!80!black] (-1.4,1.55) -- (4.8,1.55);
+
+\node[point, fill=red!20] (fp16) at (-3.2,0.15) {};
+\node[anchor=west] at (-3.0,0.15) {FP16 weights};
+
+\node[point, fill=green!20] (int4) at (-0.8,1.05) {};
+\node[anchor=west] at (-0.6,1.05) {INT4 weights};
+
+\draw[->, thick, blue!70] (fp16) -- (int4);
+
+\node[align=left, text width=10.5cm] at (0,-2.2) {
+  对 memory-bound 推理，量化减少 HBM 读取字节数，使 kernel 向更高算术强度移动。
+  但若 dequantization 开销过高，或 kernel 无法利用低精度算力，速度收益会下降。
+};
+```
+
+\end{tikzpicture}
+\caption{从 roofline 视角理解量化的性能收益}
+\label{fig:quantization-roofline}
+\end{figure}
+
+\subsection{量化与前几章优化的关系}
+\label{subsec:quantization-relation-to-previous-chapters}
+
+量化不是孤立优化。它与前几章技术相互影响：
+
+\begin{itemize}
+\item 与 \textbf{PagedAttention} 的关系：KV Cache 量化可以进一步降低 paged block 的显存占用，提高可并发请求数；
+\item 与 \textbf{FlashAttention} 的关系：FlashAttention 降低 attention 中间 IO，量化降低输入/权重/KV 字节数，两者可互补；
+\item 与 \textbf{Tensor Parallel} 的关系：TP 下权重和 KV head 已经切分，量化进一步降低每 GPU shard 的显存和带宽；
+\item 与 \textbf{Serving Scheduler} 的关系：量化降低单请求资源占用，改变 admission control、batch size 和成本模型；
+\item 与 \textbf{模型架构} 的关系：RMSNorm、GQA、SwiGLU、MoE、RoPE 等结构会影响量化敏感性。
+\end{itemize}
+
+因此，量化不能只看模型文件大小，还要看端到端 serving 指标：
+
+[
+\text{TTFT},\quad
+\text{TPOT},\quad
+\text{tokens/s},\quad
+\text{P99 latency},\quad
+\text{quality},\quad
+\text{cost/token}.
+]
+
+\section{数值表示与量化基础}
+\label{sec:numerical-representation-and-quantization-basics}
+
+量化的本质是用有限个离散值近似连续或高精度值。对深度学习而言，量化通常包含三个步骤：
+
+\begin{enumerate}
+\item 选择低精度表示范围；
+\item 将高精度 tensor 映射到低精度整数或浮点值；
+\item 在计算时直接使用低精度算子，或反量化回高精度参与计算。
+\end{enumerate}
+
+\subsection{FP32、FP16、BF16、FP8、INT8、INT4}
+\label{subsec:number-formats}
+
+常见数值格式可以分为浮点和整数两类。
+
+\textbf{FP32} 是传统训练和高精度计算格式，精度和动态范围都较高，但显存和带宽开销大。
+
+\textbf{FP16} 使用 16 bit 浮点，显存减半，Tensor Core 支持好，但指数位较少，动态范围小，训练中可能需要 loss scaling。
+
+\textbf{BF16} 也是 16 bit 浮点，它保留与 FP32 类似的指数位宽，因此动态范围较大，但尾数位较少。大模型训练和推理中 BF16 非常常见。
+
+\textbf{FP8} 是 8 bit 浮点格式，常见有 E4M3、E5M2 等变体。FP8 的优点是比 INT8 更像浮点，有指数动态范围；缺点是硬件和软件栈要求更高，并且需要 scale 管理。
+
+\textbf{INT8} 是 8 bit 整数量化格式，范围通常为：
+
+[
+[-128,127]
+]
+
+或：
+
+[
+[0,255].
+]
+
+\textbf{INT4} 是 4 bit 整数量化格式，范围通常为：
+
+[
+[-8,7]
+]
+
+或：
+
+[
+[0,15].
+]
+
+INT4 的压缩率高，但误差更大，通常需要 per-group scale、精心校准和高质量量化算法。
+
+\begin{table}[H]
+\centering
+\small
+\caption{常见数值格式对比}
+\label{tab:numeric-format-comparison-quant}
+\begin{tabular}{p{0.16\textwidth}p{0.16\textwidth}p{0.24\textwidth}p{0.32\textwidth}}
+\toprule
+\textbf{格式} & \textbf{bit 数} & \textbf{典型用途} & \textbf{特点} \
+\midrule
+FP32
+& 32
+& 高精度训练、累积
+& 动态范围和精度高，显存/带宽开销大。 \
+\midrule
+FP16
+& 16
+& 训练/推理
+& Tensor Core 支持好，但动态范围较小。 \
+\midrule
+BF16
+& 16
+& 大模型训练/推理
+& 动态范围接近 FP32，尾数精度低于 FP16。 \
+\midrule
+FP8
+& 8
+& 新硬件上的训练/推理
+& 有指数动态范围，需要 scale 与 amax 管理。 \
+\midrule
+INT8
+& 8
+& W8A8、weight-only
+& 整数表示，硬件支持较广，校准较重要。 \
+\midrule
+INT4
+& 4
+& weight-only LLM 推理
+& 压缩率高，需要 group scale 和专用 kernel。 \
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{uniform quantization}
+\label{subsec:uniform-quantization}
+
+最基础的是 uniform quantization，即用等间隔离散值近似连续值。给定实数 $x$，scale 为 $s$，zero point 为 $z$，量化为整数 $q$：
+
+[
+q
+=
+
+\operatorname{clip}
+\left(
+\left\lfloor \frac{x}{s}\right\rceil + z,
+q_{\min},
+q_{\max}
+\right).
+]
+
+反量化为：
+
+[
+\hat{x}
+=======
+
+s(q-z).
+]
+
+其中：
+
+\begin{itemize}
+\item $s$ 控制量化步长；
+\item $z$ 控制实数 0 对应的整数位置；
+\item $q_{\min},q_{\max}$ 由 bit-width 决定；
+\item $\lfloor\cdot\rceil$ 表示四舍五入。
+\end{itemize}
+
+量化误差为：
+
+[
+e=x-\hat{x}.
+]
+
+Uniform quantization 的优点是简单、硬件友好；缺点是当 tensor 分布有 outlier 时，scale 被 outlier 拉大，大部分普通值的量化分辨率变差。
+
+\subsection{symmetric 与 asymmetric quantization}
+\label{subsec:symmetric-asymmetric-quantization}
+
+\textbf{Symmetric quantization} 使用零点 $z=0$，量化区间关于 0 对称。例如 INT8 symmetric 范围为：
+
+[
+q\in[-127,127]
+]
+
+或：
+
+[
+q\in[-128,127].
+]
+
+Scale 可取：
+
+[
+s
+=
+
+\frac{\max(|x_{\min}|,|x_{\max}|)}{q_{\max}}.
+]
+
+量化为：
+
+[
+q
+=
+
+\operatorname{clip}
+\left(
+\left\lfloor \frac{x}{s}\right\rceil,
+q_{\min},
+q_{\max}
+\right).
+]
+
+Symmetric quantization 的优点是计算简单，尤其适合权重，因为权重分布通常近似以 0 为中心。
+
+\textbf{Asymmetric quantization} 使用非零 zero point，使实数范围 $[x_{\min},x_{\max}]$ 映射到整数范围 $[q_{\min},q_{\max}]$：
+
+[
+s=
+\frac{x_{\max}-x_{\min}}
+{q_{\max}-q_{\min}},
+]
+
+[
+z=
+q_{\min}
+--------
+
+\left\lfloor
+\frac{x_{\min}}{s}
+\right\rceil.
+]
+
+Asymmetric quantization 更适合非对称分布，例如 ReLU 后激活。但它在矩阵乘法中需要处理 zero point 修正，kernel 更复杂。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+axis/.style={-{Latex[length=2.1mm]}, thick},
+tick/.style={thick},
+qpt/.style={circle, draw, minimum size=0.18cm, fill=blue!12}
+]
+
+```
+\node[font=\bfseries] at (0,3.0) {Symmetric 与 Asymmetric Quantization};
+
+% symmetric
+\node[font=\bfseries] at (-3.3,2.25) {Symmetric};
+\draw[axis] (-5.4,1.3) -- (-1.2,1.3);
+\foreach \x/\lab in {-5.0/$-a$,-3.3/$0$,-1.6/$a$} {
+  \draw[tick] (\x,1.18) -- (\x,1.42);
+  \node[font=\scriptsize] at (\x,0.92) {\lab};
+}
+\foreach \x in {-5.0,-4.55,-4.1,-3.65,-3.3,-2.95,-2.5,-2.05,-1.6} {
+  \node[qpt] at (\x,1.3) {};
+}
+
+% asymmetric
+\node[font=\bfseries] at (3.0,2.25) {Asymmetric};
+\draw[axis] (0.8,1.3) -- (5.4,1.3);
+\foreach \x/\lab in {1.2/$x_{\min}$,2.1/$0$,5.0/$x_{\max}$} {
+  \draw[tick] (\x,1.18) -- (\x,1.42);
+  \node[font=\scriptsize] at (\x,0.92) {\lab};
+}
+\foreach \x in {1.2,1.68,2.16,2.64,3.12,3.60,4.08,4.56,5.04} {
+  \node[qpt, fill=green!12] at (\x,1.3) {};
+}
+
+\node[align=left, text width=10.5cm] at (0,-0.35) {
+  symmetric quantization 以 0 为中心，权重中常用；
+  asymmetric quantization 可以更好覆盖非对称激活分布，但 zero point 会增加 kernel 复杂度。
+};
+```
+
+\end{tikzpicture}
+\caption{对称与非对称量化的区间映射}
+\label{fig:symmetric-asymmetric-quantization}
+\end{figure}
+
+\subsection{per-tensor、per-channel、per-group scale}
+\label{subsec:per-tensor-channel-group-scale}
+
+Scale 的粒度决定了量化误差和 metadata 开销。
+
+\textbf{Per-tensor quantization} 对整个 tensor 使用一个 scale：
+
+[
+s_{\mathrm{tensor}}.
+]
+
+优点是 metadata 少、实现简单；缺点是如果 tensor 不同通道分布差异大，一个 scale 难以兼顾所有通道。
+
+\textbf{Per-channel quantization} 对每个输出通道或输入通道使用独立 scale。例如 Linear 权重：
+
+[
+\mat{W}\in\mathbb{R}^{H_{\mathrm{out}}\times H_{\mathrm{in}}}.
+]
+
+若按 output channel 量化：
+
+[
+s_i,\quad i=0,\ldots,H_{\mathrm{out}}-1.
+]
+
+第 $i$ 行权重使用 scale $s_i$。这种方式通常显著降低误差。
+
+\textbf{Per-group quantization} 将通道或列划分为小组，每组一个 scale。例如 group size 为 $G$，则每 $G$ 个元素共享一个 scale：
+
+[
+s_{i,g}.
+]
+
+INT4 LLM weight-only quantization 中 per-group scale 很常见。它在精度和 metadata 之间折中：group 越小，量化更精细，但 scale metadata 越多，kernel 更复杂；group 越大，metadata 少，但误差增大。
+
+[
+\text{per-tensor}
+\rightarrow
+\text{per-channel}
+\rightarrow
+\text{per-group}
+]
+
+不是简单单调关系。实际选择取决于 weight layout、kernel 支持和精度目标。
+
+\begin{table}[H]
+\centering
+\small
+\caption{Scale 粒度对比}
+\label{tab:scale-granularity}
+\begin{tabular}{p{0.22\textwidth}p{0.30\textwidth}p{0.36\textwidth}}
+\toprule
+\textbf{粒度} & \textbf{优点} & \textbf{缺点} \
+\midrule
+Per-tensor
+& metadata 最少，实现简单
+& outlier 影响全 tensor，误差可能较大。 \
+\midrule
+Per-channel
+& 每个通道适配自身范围，精度较好
+& scale 数量增加，kernel 需支持通道 scale。 \
+\midrule
+Per-group
+& INT4 常用，精度和 metadata 折中
+& group size 需要调参，解包和 scale 应用更复杂。 \
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{dequantization}
+\label{subsec:dequantization}
+
+低精度权重可以有两种计算方式。
+
+第一种是\textbf{反量化后计算}：
+
+[
+\hat{\mat{W}}=s(\mat{Q}_W-z),
+]
+[
+\mat{Y}=\mat{X}\hat{\mat{W}}.
+]
+
+这种方式实现简单，但如果先把整块权重反量化到 FP16/BF16 再 GEMM，会失去显存带宽收益，并增加临时显存。
+
+第二种是\textbf{融合反量化与 GEMM}。Kernel 从 HBM 读取 packed INT4/INT8 权重，在寄存器或片上存储中解包并乘 scale，然后参与矩阵乘法：
+
+[
+\mat{Y}
+=======
+
+\mat{X}
+\left[
+s(\mat{Q}_W-z)
+\right].
+]
+
+高性能 weight-only 推理必须使用这种方式。也就是说，量化模型的速度不仅取决于量化算法，还取决于是否有高质量 kernel。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+box/.style={draw, rounded corners=3pt, minimum width=2.05cm, minimum height=0.7cm, align=center},
+arrow/.style={-{Latex[length=2.2mm]}, thick}
+]
+
+```
+\node[font=\bfseries] at (0,3.1) {反量化路径：离线展开 vs fused dequant GEMM};
+
+\node[box, fill=blue!8] (q1) at (-5.0,1.55) {INT4 packed\\weights};
+\node[box, fill=orange!14] (dq1) at (-2.6,1.55) {dequant to\\FP16 tensor};
+\node[box, fill=green!10] (gemm1) at (-0.2,1.55) {FP16 GEMM};
+\draw[arrow] (q1) -- (dq1);
+\draw[arrow] (dq1) -- (gemm1);
+
+\node[box, fill=blue!8] (q2) at (-5.0,0.2) {INT4 packed\\weights};
+\node[box, fill=purple!10, minimum width=3.0cm] (fused) at (-1.9,0.2) {fused unpack + scale + GEMM};
+\node[box, fill=green!10] (out) at (1.3,0.2) {output};
+\draw[arrow] (q2) -- (fused);
+\draw[arrow] (fused) -- (out);
+
+\node[align=left, text width=10.5cm] at (0,-1.35) {
+  若先反量化完整 FP16 权重，再执行普通 GEMM，会失去许多带宽收益。
+  高性能量化推理通常把 unpack、scale 和 GEMM 融合到一个 kernel 中。
+};
+```
+
+\end{tikzpicture}
+\caption{量化权重的两种计算路径}
+\label{fig:dequantization-paths}
+\end{figure}
+
+\section{PTQ 与 QAT}
+\label{sec:ptq-and-qat}
+
+量化方法可以从训练介入程度分为两大类：
+
+\begin{itemize}
+\item \textbf{PTQ, Post-Training Quantization}：训练完成后量化，不重新训练或只做少量校准；
+\item \textbf{QAT, Quantization-Aware Training}：训练或微调时模拟量化误差，让模型适应低精度。
+\end{itemize}
+
+LLM 推理部署中，PTQ 非常流行，因为重新训练大模型成本很高。GPTQ、AWQ、SmoothQuant 都属于后训练量化或校准型方法。QAT 精度潜力更高，但成本也更高，且对训练数据、训练 recipe 和工程流程要求更强。
+
+\subsection{Post-Training Quantization}
+\label{subsec:post-training-quantization}
+
+PTQ 的基本流程是：
+
+\begin{enumerate}
+\item 加载训练好的高精度模型；
+\item 准备少量校准数据；
+\item 收集权重和激活统计；
+\item 选择 scale、zero point、group size、clipping 策略；
+\item 量化权重或激活；
+\item 评估 perplexity、benchmark、下游任务和生成质量；
+\item 导出量化模型和推理 kernel 所需 metadata。
+\end{enumerate}
+
+PTQ 的优点是：
+
+\begin{itemize}
+\item 不需要重新训练；
+\item 成本低；
+\item 部署速度快；
+\item 适合已有开源模型和内部 checkpoint；
+\item 可以对不同硬件生成不同量化格式。
+\end{itemize}
+
+缺点是：
+
+\begin{itemize}
+\item 低 bit 下精度可能明显下降；
+\item 对校准数据敏感；
+\item outlier 和敏感层难处理；
+\item 不同模型架构量化难度不同；
+\item 需要专门算法降低误差。
+\end{itemize}
+
+\subsection{calibration dataset}
+\label{subsec:calibration-dataset}
+
+校准数据用于估计激活范围、outlier、通道重要性和 scale。它不一定需要很大，但必须代表模型实际使用分布。如果部署场景是代码生成，用普通百科文本校准可能不理想；如果部署场景是长文档问答，短指令数据可能无法覆盖长上下文激活分布。
+
+校准数据需要考虑：
+
+\begin{itemize}
+\item 领域是否匹配；
+\item prompt 长度是否匹配；
+\item 是否包含真实 chat template；
+\item 是否包含 system prompt；
+\item 是否覆盖代码、数学、多语言等高风险输入；
+\item 是否覆盖长上下文；
+\item 数据量是否足够稳定估计统计量。
+\end{itemize}
+
+校准样本数量不是越多越好。太少统计不稳，太多校准耗时高。很多 PTQ 方法使用几百到几千条样本即可得到可用结果，但具体取决于模型和 bit-width。
+
+\subsection{Quantization-Aware Training}
+\label{subsec:quantization-aware-training}
+
+QAT 在训练或微调中引入 fake quantization。Forward 时模拟量化：
+
+[
+\hat{x}
+=======
+
+s\cdot
+\operatorname{round}
+\left(
+\frac{x}{s}
+\right),
+]
+
+但 backward 时通常使用 straight-through estimator，简称 STE：
+
+[
+\frac{\partial \hat{x}}{\partial x}\approx 1.
+]
+
+这样模型可以在训练中适应量化误差。QAT 通常比 PTQ 精度更好，尤其在极低 bit、activation quantization 或任务敏感场景中。但 QAT 需要训练资源，也可能需要原始训练数据或高质量微调数据。
+
+QAT 适合：
+
+\begin{itemize}
+\item 对质量要求极高的生产模型；
+\item 低 bit 下 PTQ 精度不够；
+\item 硬件固定，需要深度适配；
+\item 模型训练流程可控；
+\item 有足够校准/微调数据。
+\end{itemize}
+
+\begin{lstlisting}[language=Python,caption={Fake Quantization 的简化 PyTorch 实现},label={lst:fake-quantization-pytorch}]
+import torch
+
+class FakeQuantize(torch.autograd.Function):
+@staticmethod
+def forward(ctx, x, scale, qmin, qmax):
+q = torch.round(x / scale)
+q = torch.clamp(q, qmin, qmax)
+return q * scale
+
+```
+@staticmethod
+def backward(ctx, grad_output):
+    # Straight-through estimator.
+    return grad_output, None, None, None
+```
+
+def fake_quant(x, scale, qmin=-127, qmax=127):
+return FakeQuantize.apply(x, scale, qmin, qmax)
+\end{lstlisting}
+
+这个代码只是说明 STE 思想。真实 QAT 需要 observer、scale 更新、per-channel quantization、梯度稳定性、混合精度和训练 recipe 配合。
+
+\subsection{PTQ 与 QAT 的工程选择}
+\label{subsec:ptq-vs-qat-engineering-choice}
+
+工程上常见选择是：
+
+[
+\text{先 PTQ，若质量不够，再考虑 QAT 或低秩微调补偿。}
+]
+
+原因是 PTQ 成本低，可以快速得到多个候选量化配置。例如：
+
+[
+\text{W8A16},\quad
+\text{W4A16 group size 128},\quad
+\text{W8A8 SmoothQuant},\quad
+\text{FP8 KV}.
+]
+
+如果某个配置满足质量和性能要求，就无需进行昂贵的 QAT。如果 PTQ 在关键任务上损失明显，再考虑 QAT、LoRA-QAT、混合精度保护敏感层等方案。
+
+\begin{table}[H]
+\centering
+\small
+\caption{PTQ 与 QAT 对比}
+\label{tab:ptq-vs-qat}
+\begin{tabular}{p{0.20\textwidth}p{0.34\textwidth}p{0.34\textwidth}}
+\toprule
+\textbf{维度} & \textbf{PTQ} & \textbf{QAT} \
+\midrule
+训练成本
+& 低，只需校准或重构
+& 高，需要训练或微调 \
+\midrule
+部署速度
+& 快
+& 慢 \
+\midrule
+精度潜力
+& 中到高，取决于算法和 bit-width
+& 通常更高 \
+\midrule
+数据需求
+& 少量校准数据
+& 微调或训练数据 \
+\midrule
+工程复杂度
+& 中等
+& 高 \
+\midrule
+适合场景
+& 快速部署、已有模型、多硬件格式
+& 极致低 bit、质量要求极高、训练流程可控 \
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Weight-only Quantization}
+\label{sec:weight-only-quantization}
+
+Weight-only quantization 是 LLM 推理中最常见的量化方式之一。它只量化权重，激活仍保持 FP16/BF16：
+
+[
+\mat{Y}
+=======
+
+\mat{X}*{\mathrm{fp16}}
+\cdot
+\operatorname{Dequant}(\mat{W}*{\mathrm{int4/int8}}).
+]
+
+常见形式包括：
+
+[
+\text{W8A16},
+\quad
+\text{W4A16}.
+]
+
+其中 W 表示 weight bit-width，A 表示 activation bit-width。
+
+\subsection{W8A16 / W4A16}
+\label{subsec:w8a16-w4a16}
+
+W8A16 使用 INT8 权重和 FP16/BF16 激活。它通常精度较稳，压缩率约 2 倍，kernel 实现也相对容易。
+
+W4A16 使用 INT4 权重和 FP16/BF16 激活。它压缩率约 4 倍，但更容易损失精度，需要更复杂算法和 kernel 支持。W4A16 常用于单机部署更大模型，或在显存固定时提高并发和上下文长度。
+
+在 weight-only quantization 中，矩阵乘法可以写作：
+
+[
+\mat{Y}
+=======
+
+\mat{X}
+\left(
+\mat{S}\odot
+\mat{Q}_W
+\right),
+]
+
+其中 $\mat{Q}_W$ 是低精度整数权重，$\mat{S}$ 是 scale。根据 scale 粒度不同，$\mat{S}$ 可以按 tensor、channel 或 group broadcast。
+
+\subsection{group-wise quantization}
+\label{subsec:group-wise-weight-quantization}
+
+INT4 常用 group-wise quantization。设权重矩阵某一行被划分为多个 group，每个 group 大小为 $G$。第 $g$ 个 group 的权重为：
+
+[
+\vect{w}_g\in\mathbb{R}^{G}.
+]
+
+Symmetric INT4 量化可取：
+
+[
+s_g=
+\frac{\max_i |w_{g,i}|}{7}.
+]
+
+量化：
+
+[
+q_{g,i}
+=======
+
+\operatorname{clip}
+\left(
+\left\lfloor
+\frac{w_{g,i}}{s_g}
+\right\rceil,
+-8,
+7
+\right).
+]
+
+反量化：
+
+[
+\hat{w}*{g,i}=s_gq*{g,i}.
+]
+
+Group size 常见选择如 32、64、128。Group 越小，scale 更精细，精度更好；但 scale metadata 更多，kernel 读取 scale 更频繁。Group 越大，metadata 少，但 outlier 更容易拉大量化范围。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+cell/.style={draw, minimum width=0.38cm, minimum height=0.34cm},
+groupbox/.style={draw, rounded corners=2pt, dashed, thick},
+arrow/.style={-{Latex[length=2.0mm]}, thick}
+]
+
+```
+\node[font=\bfseries] at (0,3.0) {Group-wise INT4 Weight Quantization};
+
+\foreach \i in {0,...,23} {
+  \node[cell, fill=blue!10] at ({-4.6+0.38*\i},1.45) {};
+}
+
+\draw[groupbox] (-4.82,1.17) rectangle (-1.62,1.72);
+\draw[groupbox] (-1.54,1.17) rectangle (1.66,1.72);
+\draw[groupbox] (1.74,1.17) rectangle (4.94,1.72);
+
+\node[font=\scriptsize] at (-3.22,0.9) {scale $s_0$};
+\node[font=\scriptsize] at (0.06,0.9) {scale $s_1$};
+\node[font=\scriptsize] at (3.34,0.9) {scale $s_2$};
+
+\node[align=left, text width=10.5cm] at (0,-0.65) {
+  每个 group 使用独立 scale。group size 越小，量化误差通常越低；
+  但 scale metadata 和 kernel 复杂度也更高。
+};
+```
+
+\end{tikzpicture}
+\caption{按 group 量化权重并保存 scale}
+\label{fig:group-wise-weight-quantization}
+\end{figure}
+
+\subsection{packing 与 kernel}
+\label{subsec:int4-packing-and-kernel}
+
+INT4 权重需要 packing。一个 8-bit byte 可以存两个 4-bit 权重：
+
+[
+\text{byte}
+===========
+
+(q_0\ &\ 0xF)
+|
+((q_1\ &\ 0xF)\ll 4).
+]
+
+Packing 的目的包括：
+
+\begin{itemize}
+\item 降低存储大小；
+\item 降低 HBM 读取字节数；
+\item 对齐 kernel 的向量化加载；
+\item 适配 Tensor Core 或自定义 MMA 路径。
+\end{itemize}
+
+下面是教学版 INT4 packing 代码。
+
+\begin{lstlisting}[language=Python,caption={教学版 INT4 packing 与 unpacking},label={lst:int4-pack-unpack}]
+import torch
+
+def pack_int4(q):
+"""
+q: int tensor with values in [0, 15], shape [..., N]
+N must be even.
+return: uint8 tensor shape [..., N // 2]
+"""
+assert q.shape[-1] % 2 == 0
+q = q.to(torch.uint8)
+
+```
+low = q[..., 0::2] & 0x0F
+high = (q[..., 1::2] & 0x0F) << 4
+
+return low | high
+```
+
+def unpack_int4(packed):
+"""
+packed: uint8 tensor shape [..., N_packed]
+return: uint8 tensor with values in [0, 15], shape [..., 2 * N_packed]
+"""
+low = packed & 0x0F
+high = (packed >> 4) & 0x0F
+
+```
+out = torch.empty(
+    *packed.shape[:-1],
+    packed.shape[-1] * 2,
+    dtype=torch.uint8,
+    device=packed.device,
+)
+out[..., 0::2] = low
+out[..., 1::2] = high
+return out
+```
+
+\end{lstlisting}
+
+真实 kernel 不会先 unpack 整个权重矩阵，而是在 GEMM 内部按 tile 解包、转换、乘 scale，并与 activation 做乘加。否则 INT4 的带宽优势会被临时展开抵消。
+
+\subsection{accuracy drop 的来源}
+\label{subsec:weight-only-accuracy-drop-sources}
+
+Weight-only quantization 的精度下降主要来自：
+
+\begin{itemize}
+\item 权重分布 outlier；
+\item 通道重要性差异；
+\item 量化误差在层间累积；
+\item attention projection 或 FFN 某些矩阵更敏感；
+\item 最前/最后几层更敏感；
+\item embedding/lm head 更敏感；
+\item group size 过大；
+\item calibration 数据不匹配；
+\item 低 bit 下 rounding error 太大。
+\end{itemize}
+
+一个常见工程策略是混合精度保护敏感部分。例如：
+
+\begin{itemize}
+\item embedding 保持 FP16；
+\item lm head 保持 FP16；
+\item 第一层和最后一层保持 FP16/INT8；
+\item 某些 outlier channels 使用更高精度；
+\item attention output 或 FFN down projection 使用更保守量化。
+\end{itemize}
+
+这类策略会牺牲部分压缩率，但常能显著改善质量。
+
+\section{GPTQ}
+\label{sec:gptq}
+
+GPTQ 是 LLM PTQ 中非常有代表性的方法。它属于 weight-only post-training quantization，核心思想是利用近似二阶信息，在逐列量化权重时补偿误差，使量化后的层输出尽量接近原始层输出。
+
+\subsection{二阶误差直觉}
+\label{subsec:gptq-second-order-intuition}
+
+对某个 Linear 层：
+
+[
+\mat{Y}=\mat{X}\mat{W}.
+]
+
+量化后权重为：
+
+[
+\hat{\mat{W}}=\mat{W}+\Delta\mat{W}.
+]
+
+输出误差为：
+
+[
+\Delta\mat{Y}
+=============
+
+\mat{X}\Delta\mat{W}.
+]
+
+我们希望最小化：
+
+[
+|\mat{X}\mat{W}-\mat{X}\hat{\mat{W}}|_2^2
+=========================================
+
+|\mat{X}\Delta\mat{W}|_2^2.
+]
+
+展开可得误差与输入协方差有关：
+
+[
+|\mat{X}\Delta\mat{W}|_2^2
+==========================
+
+\operatorname{tr}
+\left(
+\Delta\mat{W}^{\mathsf{T}}
+\mat{X}^{\mathsf{T}}\mat{X}
+\Delta\mat{W}
+\right).
+]
+
+令：
+
+[
+\mat{H}\approx \mat{X}^{\mathsf{T}}\mat{X}.
+]
+
+则量化误差可以用 Hessian-like 矩阵 $\mat{H}$ 加权。直觉是：如果某个权重方向对输出影响大，则量化误差应该更小；如果某个方向对输出影响小，则可以承受更大误差。
+
+\subsection{逐列量化与误差补偿}
+\label{subsec:gptq-sequential-quantization}
+
+GPTQ 的一个关键思想是逐列或分块量化权重，并在量化某一列后，把误差补偿到尚未量化的列上。
+
+设当前要量化权重列 $\vect{w}_i$，量化后为 $\hat{\vect{w}}_i$，误差为：
+
+[
+\vect{e}_i=\vect{w}_i-\hat{\vect{w}}_i.
+]
+
+如果直接忽略误差，后续输出会偏离。GPTQ 利用 $\mat{H}^{-1}$ 的信息，把该误差对后续列的影响进行更新。抽象地：
+
+[
+\mat{W}*{j}
+\leftarrow
+\mat{W}*{j}
+-----------
+
+\alpha_{ij}\vect{e}_i,
+\quad j>i.
+]
+
+其中 $\alpha_{ij}$ 来自 Hessian inverse 的相关项。这样后续列在量化前已经吸收部分误差补偿。
+
+这个过程类似“带二阶信息的贪心量化”。它不是简单地对每个 group 独立 round，而是考虑输入分布和权重列之间的耦合。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+col/.style={draw, rounded corners=2pt, minimum width=0.55cm, minimum height=1.6cm, align=center},
+arrow/.style={-{Latex[length=2.1mm]}, thick}
+]
+
+```
+\node[font=\bfseries] at (0,3.0) {GPTQ：逐列量化并向后续列传播误差补偿};
+
+\foreach \i/\x/\colr in {0/-3.6/green!12,1/-2.9/blue!10,2/-2.2/blue!10,3/-1.5/blue!10,4/-0.8/blue!10} {
+  \node[col, fill=\colr] (c\i) at (\x,1.25) {$w_{\i}$};
+}
+
+\node[draw, rounded corners=3pt, fill=orange!14, minimum width=1.4cm, minimum height=0.6cm, align=center] (q) at (-3.6,-0.1)
+  {quantize\\$w_0$};
+
+\draw[arrow] (c0) -- (q);
+
+\foreach \i in {1,2,3,4} {
+  \draw[arrow, red!70] (q) .. controls (-3.0,-0.85) and (-2.2,-0.85) .. (c\i.south);
+}
+
+\node[align=left, text width=10.5cm] at (0,-1.5) {
+  GPTQ 不是独立量化每一列，而是在量化当前列后，将误差按近似二阶信息补偿到后续未量化列。
+  这样可以降低层输出重构误差。
+};
+```
+
+\end{tikzpicture}
+\caption{GPTQ 的逐列量化与误差补偿直觉}
+\label{fig:gptq-sequential-error-compensation}
+\end{figure}
+
+\subsection{Hessian 近似}
+\label{subsec:gptq-hessian-approximation}
+
+GPTQ 不会计算完整训练 loss 的真实 Hessian，而是对每层局部重构误差使用近似：
+
+[
+\mat{H}=\mat{X}^{\mathsf{T}}\mat{X}.
+]
+
+这里 $\mat{X}$ 是校准数据经过该层时的输入 activation。实际实现中会加入 damping，避免矩阵病态：
+
+[
+\mat{H}_{\mathrm{damped}}
+=========================
+
+\mat{H}
++
+\lambda \operatorname{diag}(\mat{H}).
+]
+
+然后使用 Cholesky 分解或其他数值方法得到所需的逆相关信息。由于层维度很大，GPTQ 通常采用 blockwise 处理，避免一次操作完整巨大矩阵。
+
+\subsection{工程流程}
+\label{subsec:gptq-engineering-flow}
+
+GPTQ 的工程流程可以概括为：
+
+\begin{enumerate}
+\item 准备校准样本；
+\item 对模型逐层 forward，收集每层输入 activation；
+\item 对每个 Linear 层构造 $\mat{H}\approx \mat{X}^{\mathsf{T}}\mat{X}$；
+\item 对权重按 block/group 逐步量化；
+\item 使用 Hessian inverse 信息进行误差补偿；
+\item 导出 INT4/INT3/INT8 权重、scale、zero point 和 packing layout；
+\item 使用支持 GPTQ 格式的推理 kernel 执行。
+\end{enumerate}
+
+GPTQ 的优势是低 bit 下精度较好，尤其适合 weight-only INT4。代价是量化过程比简单 min-max PTQ 更复杂，需要校准数据和矩阵分解，量化耗时更长。
+
+\section{AWQ}
+\label{sec:awq}
+
+AWQ，Activation-aware Weight Quantization，是另一类重要的 LLM weight-only PTQ 方法。它的核心观察是：权重并非同等重要，少量 salient weight channels 对模型输出影响很大；识别这些重要通道时，应该关注 activation 分布，而不只是权重本身。
+
+\subsection{activation-aware 的动机}
+\label{subsec:awq-activation-aware-motivation}
+
+对 Linear 层：
+
+[
+\mat{Y}=\mat{X}\mat{W}.
+]
+
+某个权重通道的量化误差对输出影响，不仅取决于权重误差本身，还取决于输入 activation 的大小。如果某个输入通道的 activation 经常很大，那么对应权重列的误差会被放大。
+
+设第 $j$ 个输入通道 activation 平均幅度较大：
+
+[
+\mathbb{E}[|X_j|]\ \text{large}.
+]
+
+那么权重列 $\mat{W}_{j,:}$ 的量化误差会对输出产生更大影响：
+
+[
+\Delta\mat{Y}
+=============
+
+\sum_j
+\mat{X}*j
+\Delta\mat{W}*{j,:}.
+]
+
+因此，AWQ 使用 activation 统计来判断哪些 channels 更重要，并对这些 channels 做保护。
+
+\subsection{salient channels}
+\label{subsec:awq-salient-channels}
+
+AWQ 的思想可以简化为：
+
+[
+\text{找出 activation 大、对输出敏感的 channels}
+\rightarrow
+\text{降低这些 channels 的量化误差}.
+]
+
+一种直接做法是混合精度：把重要 channels 保持高精度。但混合精度可能不硬件友好，因为 kernel 需要同时处理 INT4 和 FP16 权重，导致实现复杂。
+
+AWQ 更偏向硬件友好方案：通过缩放变换保护 salient channels，同时保持整体权重仍可统一低 bit 量化。
+
+\subsection{scale 变换}
+\label{subsec:awq-scale-transformation}
+
+考虑 Linear：
+
+[
+\mat{Y}=\mat{X}\mat{W}.
+]
+
+引入对角缩放矩阵 $\mat{S}$：
+
+[
+\mat{Y}
+=======
+
+(\mat{X}\mat{S}^{-1})
+(\mat{S}\mat{W}).
+]
+
+这是数学等价变换：
+
+[
+\mat{X}\mat{W}
+==============
+
+\mat{X}\mat{S}^{-1}\mat{S}\mat{W}.
+]
+
+AWQ 的直觉是，适当放大某些重要 weight channels，使其在量化时相对误差更小，同时在 activation 侧用反向缩放保持等价。实际中，需要搜索或确定合适的 scale，使量化后误差最小。
+
+这个方法的优点是：最终仍然可以使用统一的 low-bit weight-only kernel，而不必在 kernel 内混合处理不同精度的权重。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+box/.style={draw, rounded corners=3pt, minimum width=1.8cm, minimum height=0.65cm, align=center},
+arrow/.style={-{Latex[length=2.1mm]}, thick}
+]
+
+```
+\node[font=\bfseries] at (0,3.05) {AWQ：通过等价缩放保护重要通道};
+
+\node[box, fill=blue!8] (x) at (-5.0,1.3) {$X$};
+\node[box, fill=orange!14] (sinv) at (-2.9,1.3) {$S^{-1}$\\on activation};
+\node[box, fill=green!10] (sweight) at (-0.6,1.3) {$S W$\\scaled weight};
+\node[box, fill=purple!10] (quant) at (1.7,1.3) {INT4\\quantize};
+\node[box, fill=red!8] (y) at (4.2,1.3) {$Y$};
+
+\draw[arrow] (x) -- (sinv);
+\draw[arrow] (sinv) -- (sweight);
+\draw[arrow] (sweight) -- (quant);
+\draw[arrow] (quant) -- (y);
+
+\node[align=left, text width=10.5cm] at (0,-0.65) {
+  AWQ 使用 activation 统计识别重要通道，并通过等价缩放降低这些通道的量化误差。
+  最终仍保持硬件友好的 weight-only quantization。
+};
+```
+
+\end{tikzpicture}
+\caption{AWQ 中 activation-aware scaling 的直觉}
+\label{fig:awq-scale-transformation}
+\end{figure}
+
+\subsection{AWQ 的适用场景}
+\label{subsec:awq-use-cases}
+
+AWQ 适合：
+
+\begin{itemize}
+\item INT4 weight-only 推理；
+\item 希望校准成本较低；
+\item 希望保持 kernel 硬件友好；
+\item 模型是 instruction-tuned LLM 或多模态 LLM；
+\item 部署在边缘设备或显存紧张环境；
+\item 不希望做复杂二阶重构。
+\end{itemize}
+
+与 GPTQ 相比，AWQ 更强调 activation-aware channel protection 和硬件友好性；GPTQ 更强调二阶误差补偿和逐列重构。实际中二者都常作为 INT4 量化候选，需要在目标模型和任务上评估。
+
+\section{SmoothQuant 与 W8A8}
+\label{sec:smoothquant-w8a8}
+
+Weight-only quantization 只量化权重，激活仍是 FP16/BF16。若想进一步利用 INT8 GEMM，需要同时量化权重和激活，即 W8A8。SmoothQuant 是 LLM W8A8 PTQ 中代表性方法之一。
+
+\subsection{activation outlier 问题}
+\label{subsec:activation-outlier-problem}
+
+LLM 激活中常存在 outlier channels。某些通道的 activation 幅度远大于其他通道。如果直接对 activation 做 per-tensor INT8 量化，scale 会被 outlier 拉大，导致大多数普通值分辨率不足。
+
+设 activation 向量某些通道非常大：
+
+[
+|x_j|\gg |x_k|.
+]
+
+Per-tensor scale 必须覆盖最大值：
+
+[
+s=\frac{\max_j |x_j|}{127}.
+]
+
+若 $\max_j |x_j|$ 很大，普通通道的值会被量化到很粗的整数网格上，误差增大。
+
+权重相比激活更容易量化，因为权重是固定的，可以按通道或 group 使用 scale；activation 是动态的，范围随输入变化，outlier 更难处理。
+
+\subsection{将量化难度从 activation 转移到 weight}
+\label{subsec:smoothquant-migrate-difficulty}
+
+SmoothQuant 的核心思想是使用等价变换，将 activation outlier 的难度迁移到 weight 上。
+
+对于 Linear：
+
+[
+\mat{Y}=\mat{X}\mat{W}.
+]
+
+引入对角矩阵 $\mat{S}$：
+
+[
+\mat{Y}
+=======
+
+(\mat{X}\mat{S}^{-1})
+(\mat{S}\mat{W}).
+]
+
+如果某些 activation channel 很大，可以选择较大的 scale $s_j$，让：
+
+[
+\mat{X}'_j=\frac{\mat{X}_j}{s_j}
+]
+
+变得更平滑。对应权重：
+
+[
+\mat{W}'_j=s_j\mat{W}_j.
+]
+
+这样 activation 更容易 INT8 量化，而权重量化难度增加。由于权重是静态的，更容易通过 per-channel scale 处理。因此整体 W8A8 可行性提高。
+
+SmoothQuant 通常用参数 $\alpha$ 控制平滑程度。若 activation 通道幅度为 $a_j$，weight 通道幅度为 $w_j$，scale 可设计为某种函数：
+
+[
+s_j
+===
+
+\frac{a_j^{\alpha}}
+{w_j^{1-\alpha}}.
+]
+
+直觉上，$\alpha$ 越大，越多地平滑 activation；$\alpha$ 越小，越少改变权重。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+box/.style={draw, rounded corners=3pt, minimum width=1.95cm, minimum height=0.7cm, align=center},
+arrow/.style={-{Latex[length=2.1mm]}, thick}
+]
+
+```
+\node[font=\bfseries] at (0,3.1) {SmoothQuant：平滑 Activation Outlier};
+
+\node[box, fill=blue!8] (x) at (-5.1,1.45) {activation\\with outliers};
+\node[box, fill=orange!14] (scale) at (-2.7,1.45) {$X'=XS^{-1}$\\smooth};
+\node[box, fill=green!10] (w) at (-0.2,1.45) {$W'=SW$\\adjust weight};
+\node[box, fill=purple!10] (w8a8) at (2.3,1.45) {W8A8\\GEMM};
+\node[box, fill=red!8] (y) at (4.8,1.45) {$Y$};
+
+\draw[arrow] (x) -- (scale);
+\draw[arrow] (scale) -- (w8a8);
+\draw[arrow] (w) -- (w8a8);
+\draw[arrow] (w8a8) -- (y);
+
+\node[align=left, text width=10.5cm] at (0,-0.65) {
+  SmoothQuant 通过等价缩放把 activation outlier 平滑掉，
+  将部分量化难度转移到静态权重上，从而支持 W8A8 PTQ。
+};
+```
+
+\end{tikzpicture}
+\caption{SmoothQuant 的 activation 平滑思想}
+\label{fig:smoothquant-activation-smoothing}
+\end{figure}
+
+\subsection{W8A8 GEMM}
+\label{subsec:w8a8-gemm}
+
+W8A8 的目标是让权重和激活都用 INT8 表示，矩阵乘法使用 INT8 Tensor Core 或等价硬件路径：
+
+[
+\mat{Y}_{\mathrm{int32}}
+========================
+
+\mat{X}*{\mathrm{int8}}
+\mat{W}*{\mathrm{int8}}.
+]
+
+累积通常使用 INT32，然后再乘 scale 转回 FP16/BF16 或继续保持低精度：
+
+[
+\hat{\mat{Y}}
+=============
+
+s_Xs_W
+\mat{Y}_{\mathrm{int32}}.
+]
+
+W8A8 的潜在收益包括：
+
+\begin{itemize}
+\item 权重读取减半；
+\item 激活读取减半；
+\item 使用 INT8 矩阵乘加硬件；
+\item 降低中间 activation 显存。
+\end{itemize}
+
+难点包括：
+
+\begin{itemize}
+\item activation 动态范围；
+\item outlier；
+\item scale 管理；
+\item layernorm/RMSNorm 后分布变化；
+\item residual add 的 scale 对齐；
+\item kernel 对动态 scale 的支持；
+\item 不同层量化敏感度差异。
+\end{itemize}
+
+\section{FP8 与低精度浮点}
+\label{sec:fp8-low-precision-floating-point}
+
+INT 量化使用固定线性 scale 映射到整数。FP8 则使用 8 bit 浮点格式，包含 sign、exponent 和 mantissa。相比 INT8，FP8 可以覆盖更大动态范围，适合训练和推理中的激活、权重或梯度。
+
+\subsection{E4M3 与 E5M2}
+\label{subsec:e4m3-e5m2}
+
+常见 FP8 格式包括：
+
+\begin{itemize}
+\item \textbf{E4M3}：4 bit exponent，3 bit mantissa；
+\item \textbf{E5M2}：5 bit exponent，2 bit mantissa。
+\end{itemize}
+
+E4M3 尾数更多，精度更高，但动态范围较小。E5M2 指数更多，动态范围更大，但精度较低。不同张量可能适合不同格式。例如 forward activation 和 weight 可能更偏 E4M3，gradient 可能需要更大动态范围。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+bit/.style={draw, minimum width=0.5cm, minimum height=0.45cm, align=center}
+]
+
+```
+\node[font=\bfseries] at (0,3.0) {FP8 E4M3 与 E5M2 bit layout};
+
+\node[anchor=east] at (-4.2,1.55) {E4M3};
+\node[bit, fill=red!15] at (-3.6,1.55) {S};
+\foreach \i/\x in {0/-3.05,1/-2.5,2/-1.95,3/-1.4} {
+  \node[bit, fill=blue!12] at (\x,1.55) {E};
+}
+\foreach \i/\x in {0/-0.85,1/-0.3,2/0.25} {
+  \node[bit, fill=green!12] at (\x,1.55) {M};
+}
+
+\node[anchor=east] at (-4.2,0.65) {E5M2};
+\node[bit, fill=red!15] at (-3.6,0.65) {S};
+\foreach \i/\x in {0/-3.05,1/-2.5,2/-1.95,3/-1.4,4/-0.85} {
+  \node[bit, fill=blue!12] at (\x,0.65) {E};
+}
+\foreach \i/\x in {0/-0.3,1/0.25} {
+  \node[bit, fill=green!12] at (\x,0.65) {M};
+}
+
+\node[align=left, text width=10.4cm] at (0,-0.75) {
+  E4M3 提供更多 mantissa 精度，E5M2 提供更大 exponent 动态范围。
+  FP8 通常需要配合 scale、amax history 和硬件支持使用。
+};
+```
+
+\end{tikzpicture}
+\caption{FP8 两种常见格式的 bit 分配}
+\label{fig:fp8-e4m3-e5m2}
+\end{figure}
+
+\subsection{scale 与 amax}
+\label{subsec:fp8-scale-amax}
+
+FP8 表示范围有限，需要 scale 管理。常见做法是记录 tensor 的绝对最大值：
+
+[
+a_{\max}=\max_i |x_i|.
+]
+
+根据 FP8 格式最大可表示值 $f_{\max}$，选择 scale：
+
+[
+s=
+\frac{a_{\max}}{f_{\max}}.
+]
+
+量化时：
+
+[
+x_{\mathrm{fp8}}
+================
+
+\operatorname{cast}_{\mathrm{fp8}}
+\left(
+\frac{x}{s}
+\right).
+]
+
+反量化时：
+
+[
+\hat{x}=s\cdot x_{\mathrm{fp8}}.
+]
+
+为了避免 scale 随 batch 抖动，系统可能维护 amax history，并用滑动窗口或 delayed scaling 更新 scale。这样可以减少异常 batch 导致的 scale 波动。
+
+FP8 的工程难点在于：每个 tensor 或每类 tensor 的 scale 如何选择、何时更新、是否 per-tensor 或 per-channel、是否 delayed、如何与分布式并行和 kernel fusion 配合。
+
+\subsection{FP8 训练与推理}
+\label{subsec:fp8-training-inference}
+
+FP8 可用于训练和推理。训练中，部分 GEMM 输入可以使用 FP8，累积通常使用更高精度，master weights 仍可能保留 BF16/FP32。推理中，权重和激活可使用 FP8，以降低带宽和提高吞吐。
+
+FP8 相比 INT8 的优势是动态范围更自然；相比 BF16 的优势是字节数更低。它更依赖硬件支持，例如特定 GPU 架构的 FP8 Tensor Core，以及软件库对 scale 管理和 kernel 的支持。
+
+FP8 与 INT8/INT4 的关系不是谁完全替代谁：
+
+\begin{itemize}
+\item INT4 weight-only 适合极致压缩权重；
+\item INT8 W8A8 适合成熟整数硬件路径；
+\item FP8 适合有硬件支持、希望兼顾动态范围和低字节数的训练/推理；
+\item KV Cache 可用 FP8 或 INT8，取决于质量和 kernel 支持。
+\end{itemize}
+
+\section{KV Cache 量化}
+\label{sec:kv-cache-quantization}
+
+前面几章已经看到，KV Cache 是长上下文和高并发 serving 的关键显存瓶颈。KV Cache 量化的目标是降低：
+
+[
+M_{\mathrm{KV}}
+===============
+
+2LBSn_{kv}d_hs_{\mathrm{dtype}}.
+]
+
+如果把 BF16 KV Cache 换成 FP8 或 INT8，$s_{\mathrm{dtype}}$ 从 2 bytes 降为 1 byte，理论上 KV Cache 显存减半。若使用 INT4，理论上可进一步减半，但质量风险和 kernel 复杂度更高。
+
+\subsection{KV Cache 为什么适合量化}
+\label{subsec:why-kv-cache-quantization}
+
+KV Cache 量化适合以下场景：
+
+\begin{itemize}
+\item 长上下文；
+\item 高并发；
+\item batch decode；
+\item GQA/MQA 后仍然 cache 很大；
+\item 显存主要被 KV Cache 占用；
+\item decode memory bandwidth 成为瓶颈。
+\end{itemize}
+
+在 decode 中，每一步都读取历史 K/V。如果 K/V 字节数减半，HBM 读取压力也可能下降。尤其对于 memory-bound decode attention，KV 量化有潜在速度收益。
+
+\subsection{K 与 V 的敏感性}
+\label{subsec:k-v-sensitivity}
+
+K 和 V 的量化误差影响不同。K 参与 attention score：
+
+[
+qk^{\mathsf{T}}.
+]
+
+K 的误差会改变 attention 分布：
+
+[
+\softmax(q(K+\Delta K)^{\mathsf{T}}).
+]
+
+V 的误差会改变被加权汇聚的内容：
+
+[
+P(V+\Delta V).
+]
+
+K 的误差可能通过 softmax 放大，因为 score 的相对差异会影响注意力权重；V 的误差则更像输出内容误差。实际系统可能对 K 和 V 使用不同 scale、不同格式，甚至只量化 V 或对 K 更保守。
+
+\subsection{per-token 与 per-channel KV scale}
+\label{subsec:kv-per-token-per-channel-scale}
+
+KV Cache 量化需要 scale。常见粒度包括：
+
+\begin{itemize}
+\item per-tensor：整个 cache 一个 scale，简单但误差大；
+\item per-layer：每层一个 scale；
+\item per-head：每个 KV head 一个 scale；
+\item per-token：每个 token 的 K/V 向量一个 scale；
+\item per-channel：每个 head dimension 一个 scale；
+\item per-block：PagedAttention block 内共享 scale。
+\end{itemize}
+
+Per-token scale 可以适应不同 token 的幅度变化，但 metadata 较多；per-channel scale 可以保护某些维度，但 kernel 读取 scale 更复杂；per-block scale 与 paged KV blocks 很自然，metadata 与 block table 可结合。
+
+KV Cache 量化的工程设计需要同时考虑：
+
+\begin{itemize}
+\item scale metadata 显存；
+\item attention kernel 读取 scale 的开销；
+\item PagedAttention block layout；
+\item TP 下 KV heads 切分；
+\item prefix cache 共享 blocks；
+\item copy-on-write；
+\item 长上下文质量。
+\end{itemize}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+block/.style={draw, rounded corners=2pt, minimum width=0.7cm, minimum height=0.45cm, align=center},
+scale/.style={draw, rounded corners=2pt, minimum width=0.9cm, minimum height=0.35cm, align=center, fill=orange!14}
+]
+
+```
+\node[font=\bfseries] at (0,3.0) {Paged KV Cache 中的 per-block scale};
+
+\foreach \i/\x in {0/-3.6,1/-2.7,2/-1.8,3/-0.9,4/0.0} {
+  \node[block, fill=blue!10] (b\i) at (\x,1.35) {$B_{\i}$};
+  \node[scale] at (\x,0.72) {$s_{\i}$};
+}
+
+\foreach \i/\x in {5/1.2,6/2.1,7/3.0} {
+  \node[block, fill=green!10] (b\i) at (\x,1.35) {$B_{\i}$};
+  \node[scale] at (\x,0.72) {$s_{\i}$};
+}
+
+\node[align=left, text width=10.5cm] at (0,-0.75) {
+  KV Cache 量化可以为每个 physical block 保存 scale。
+  这种方式与 PagedAttention 的 block 管理自然结合，但 attention kernel 必须读取并应用对应 scale。
+};
+```
+
+\end{tikzpicture}
+\caption{KV Cache per-block scale 与 paged blocks}
+\label{fig:kv-cache-per-block-scale}
+\end{figure}
+
+\section{量化对 Serving Infra 的影响}
+\label{sec:quantization-impact-on-serving-infra}
+
+量化不是只改变模型文件格式。它会影响模型加载、GPU kernel、调度器、KV Cache、并行推理、监控和质量评估。
+
+\subsection{模型加载与格式}
+\label{subsec:quantized-model-loading-format}
+
+量化模型通常包含：
+
+\begin{itemize}
+\item packed low-bit weights；
+\item scale tensors；
+\item zero point tensors；
+\item group size metadata；
+\item quantization method metadata；
+\item layer-wise configuration；
+\item kernel expected layout；
+\item optional outlier/salient channel metadata。
+\end{itemize}
+
+Serving engine 加载模型时必须确保：
+
+\begin{itemize}
+\item 权重 layout 与 kernel 匹配；
+\item TP 切分与 packed format 兼容；
+\item scale 切分与权重 shard 对齐；
+\item checkpoint 转换没有破坏 group 边界；
+\item lm head、embedding 等特殊层处理正确；
+\item adapter 或 LoRA 与量化权重兼容。
+\end{itemize}
+
+一个常见错误是：量化权重在单 GPU 上能跑，但切到 TP 后 group scale 对齐出错，导致输出异常。原因是 TP shard 边界可能切开 group，或 scale metadata 没有同步切分。因此，量化格式必须从一开始就考虑并行推理。
+
+\subsection{kernel 支持}
+\label{subsec:quantized-kernel-support}
+
+量化收益高度依赖 kernel。一个量化配置在纸面上显存很省，但如果没有高性能 kernel，可能速度很慢。
+
+Kernel 需要支持：
+
+\begin{itemize}
+\item INT4/INT8 unpack；
+\item per-group/per-channel scale；
+\item zero point；
+\item fused dequant GEMM；
+\item Tensor Parallel shard；
+\item activation dtype；
+\item batch GEMM shape；
+\item CUDA graph 或动态 shape；
+\item MoE grouped GEMM；
+\item LoRA adapter 合并或旁路。
+\end{itemize}
+
+如果推理框架 fallback 到普通 FP16 GEMM，可能会先反量化权重，导致显存和速度都不理想。因此上线前必须通过 profiler 或日志确认量化 kernel 被真正调用。
+
+\subsection{质量评估}
+\label{subsec:quantization-quality-evaluation}
+
+量化上线不能只看 perplexity。需要多层评估：
+
+\begin{itemize}
+\item 语言建模 perplexity；
+\item 通用 benchmark；
+\item 指令跟随；
+\item 代码能力；
+\item 数学推理；
+\item 多语言；
+\item 长上下文；
+\item RAG 场景；
+\item 安全策略；
+\item 真实线上 prompt 回放；
+\item 人工偏好评测。
+\end{itemize}
+
+低 bit 量化常见问题包括：
+
+\begin{itemize}
+\item 输出重复；
+\item 格式遵循下降；
+\item 长推理链更容易出错；
+\item 代码生成中小语法错误增加；
+\item 数学计算稳定性下降；
+\item 长上下文引用准确率下降；
+\item 多语言弱语言质量下降。
+\end{itemize}
+
+因此，量化模型需要按业务场景评估，而不是只看一个平均指标。
+
+\subsection{成本模型}
+\label{subsec:quantization-cost-model}
+
+量化的最终目标通常是降低成本。可以定义单位 token 成本：
+
+[
+C_{\mathrm{token}}
+==================
+
+\frac{C_{\mathrm{GPU/hour}}}
+{\mathrm{tokens/hour}}.
+]
+
+量化可能通过以下路径降低成本：
+
+\begin{itemize}
+\item 用更少 GPU 部署同一模型；
+\item 同一 GPU 承载更多并发；
+\item 提高 tokens/s；
+\item 降低能耗；
+\item 留出更多显存给 KV Cache；
+\item 支持更长上下文而不扩容。
+\end{itemize}
+
+但量化也可能引入额外成本：
+
+\begin{itemize}
+\item 质量下降导致重试或人工干预；
+\item kernel 不成熟导致延迟变差；
+\item 多格式模型管理复杂；
+\item 量化校准与评估成本；
+\item 特定硬件依赖增加。
+\end{itemize}
+
+因此，工程决策应比较端到端成本，而不是只看模型大小。
+
+\section{一个教学版量化实现}
+\label{sec:toy-quantization-implementation}
+
+下面给出一个教学版 per-group symmetric INT4 权重量化实现。它用于理解数据结构，不是生产级实现。
+
+\begin{lstlisting}[language=Python,caption={Per-group symmetric INT4 权重量化示意},label={lst:per-group-int4-quantization}]
+import torch
+
+def quantize_int4_per_group(weight, group_size=128):
+"""
+weight: [out_features, in_features], FP16/BF16/FP32
+return:
+q_packed: packed uint8 INT4 weights
+scales: [out_features, num_groups]
+"""
+out_features, in_features = weight.shape
+assert in_features % group_size == 0
+assert group_size % 2 == 0
+
+```
+num_groups = in_features // group_size
+
+w = weight.float().view(out_features, num_groups, group_size)
+
+max_abs = w.abs().amax(dim=-1).clamp_min(1e-8)
+scales = max_abs / 7.0
+
+q = torch.round(w / scales[..., None]).clamp(-8, 7)
+
+# Convert signed INT4 [-8, 7] to unsigned nibble [0, 15].
+q_u = (q.to(torch.int16) + 8).to(torch.uint8)
+
+# Pack two int4 values into one byte.
+low = q_u[..., 0::2] & 0x0F
+high = (q_u[..., 1::2] & 0x0F) << 4
+q_packed = (low | high).contiguous()
+
+return q_packed, scales.half()
+```
+
+def dequantize_int4_per_group(q_packed, scales, group_size=128):
+"""
+Slow reference dequantization for correctness tests.
+"""
+out_features, num_groups, packed_per_group = q_packed.shape
+assert packed_per_group * 2 == group_size
+
+```
+low = q_packed & 0x0F
+high = (q_packed >> 4) & 0x0F
+
+q_u = torch.empty(
+    out_features,
+    num_groups,
+    group_size,
+    dtype=torch.uint8,
+    device=q_packed.device,
+)
+q_u[..., 0::2] = low
+q_u[..., 1::2] = high
+
+q = q_u.to(torch.int16) - 8
+w = q.float() * scales.float()[..., None]
+
+return w.view(out_features, num_groups * group_size)
+```
+
+\end{lstlisting}
+
+量化后需要验证重构误差：
+
+[
+\frac{|\mat{W}-\hat{\mat{W}}|_F}
+{|\mat{W}|_F}.
+]
+
+更重要的是验证层输出误差：
+
+[
+\frac{|\mat{X}\mat{W}-\mat{X}\hat{\mat{W}}|_F}
+{|\mat{X}\mat{W}|_F}.
+]
+
+因为模型质量受输出误差影响，而不是只受权重误差影响。
+
+\begin{lstlisting}[language=Python,caption={量化权重的重构误差与层输出误差检查},label={lst:quantization-error-check}]
+def check_quantization_error(weight, x, group_size=128):
+q_packed, scales = quantize_int4_per_group(weight, group_size)
+w_hat = dequantize_int4_per_group(q_packed, scales, group_size)
+
+```
+weight_error = torch.norm(weight.float() - w_hat.float())
+weight_error = weight_error / torch.norm(weight.float())
+
+y_ref = x.float() @ weight.float().t()
+y_hat = x.float() @ w_hat.float().t()
+
+output_error = torch.norm(y_ref - y_hat) / torch.norm(y_ref)
+
+return {
+    "relative_weight_error": weight_error.item(),
+    "relative_output_error": output_error.item(),
+}
+```
+
+\end{lstlisting}
+
+生产系统中，不能对每层都用这种慢速反量化路径执行推理。但这些 reference 实现适合单元测试：确认 packing、scale、zero point、group 切分和 TP shard 都正确。
+
+\section{量化方案选型}
+\label{sec:quantization-scheme-selection}
+
+不同量化方案适合不同部署目标。
+
+\subsection{显存优先}
+\label{subsec:quantization-memory-first}
+
+如果目标是尽可能降低显存，使模型能装进更少 GPU，可优先考虑：
+
+[
+\text{W4A16 GPTQ/AWQ}
+]
+
+或更低 bit weight-only。适合：
+
+\begin{itemize}
+\item 单机部署大模型；
+\item 边缘设备；
+\item 低并发但显存紧张；
+\item 成本敏感场景；
+\item 能接受少量质量损失。
+\end{itemize}
+
+需要重点验证模型质量和 kernel 是否高效。
+
+\subsection{吞吐优先}
+\label{subsec:quantization-throughput-first}
+
+如果目标是提升吞吐，需要看硬件是否支持低精度计算。候选包括：
+
+[
+\text{W8A8},
+\quad
+\text{FP8},
+\quad
+\text{INT4 fused GEMM}.
+]
+
+如果只压缩权重但计算仍受 activation 或 compute 限制，速度收益可能有限。吞吐优先场景应使用 profiler 分析：
+
+\begin{itemize}
+\item weight read bandwidth 是否下降；
+\item GEMM kernel 是否使用低精度路径；
+\item dequantization 是否 fused；
+\item decode batch 是否变大；
+\item TTFT 和 TPOT 是否改善。
+\end{itemize}
+
+\subsection{质量优先}
+\label{subsec:quantization-quality-first}
+
+如果质量优先，可考虑：
+
+\begin{itemize}
+\item W8A16 而非 W4A16；
+\item INT4 中使用更小 group size；
+\item 保留敏感层为 FP16；
+\item 使用 GPTQ/AWQ 而非 naive min-max；
+\item 使用 QAT；
+\item 对业务数据做校准；
+\item 对长上下文和推理任务做专项评估。
+\end{itemize}
+
+质量优先并不意味着不能量化，而是需要保守配置和充分评估。
+
+\subsection{推理框架兼容性}
+\label{subsec:inference-framework-compatibility}
+
+量化方案必须与推理框架兼容。选择前需要确认：
+
+\begin{itemize}
+\item 框架是否支持该量化格式；
+\item 是否支持目标 GPU；
+\item 是否支持 TP/PP；
+\item 是否支持 PagedAttention；
+\item 是否支持 LoRA；
+\item 是否支持 speculative decoding；
+\item 是否支持 streaming；
+\item 是否支持 sharded checkpoint；
+\item 是否支持导出和加载 scale metadata；
+\item 是否能在生产中稳定运行。
+\end{itemize}
+
+一个在离线脚本中可用的量化模型，不一定能直接放进 serving engine。模型格式、kernel、scheduler、KV Cache 和并行策略必须一起验证。
+
+\section{本章小结}
+\label{sec:chapter15-summary}
+
+本章系统介绍了大模型推理中的量化技术，从数值表示、PTQ/QAT、weight-only quantization，到 GPTQ、AWQ、SmoothQuant、FP8、KV Cache 量化和 serving infra 影响。
+
+\begin{itemize}
+\item \textbf{量化的核心目标} 是用更低 bit-width 表示权重、激活或 KV Cache，从而降低显存占用、减少 HBM 带宽压力，并在硬件支持时提升计算吞吐。
+\item \textbf{Weight-only quantization} 是 LLM 推理中最常见的方案之一，典型形式包括 W8A16 和 W4A16。
+\item \textbf{Uniform quantization} 使用 scale 和 zero point 将浮点值映射到离散整数；symmetric quantization 简单硬件友好，asymmetric quantization 更适合非对称分布。
+\item \textbf{Scale 粒度很关键}：per-tensor 简单但误差大，per-channel 精度较好，per-group 是 INT4 LLM 推理中的常见折中。
+\item \textbf{高性能量化推理依赖 fused dequant GEMM}。如果先把低 bit 权重完整反量化为 FP16，再执行普通 GEMM，会损失许多带宽收益。
+\item \textbf{PTQ 成本低，适合快速部署已有模型}；QAT 精度潜力更高，但需要训练或微调成本。
+\item \textbf{GPTQ 利用近似二阶信息进行逐列量化和误差补偿}，适合低 bit weight-only PTQ。
+\item \textbf{AWQ 使用 activation 统计识别重要通道}，通过等价缩放保护 salient channels，同时保持硬件友好的 weight-only quantization。
+\item \textbf{SmoothQuant 通过等价变换平滑 activation outliers}，将量化难度从动态 activation 迁移到静态 weight，从而支持 W8A8 PTQ。
+\item \textbf{FP8 是低精度浮点格式}，通常需要 scale、amax history 和硬件支持，适合训练和推理中的低精度 GEMM。
+\item \textbf{KV Cache 量化可以显著降低长上下文和高并发 serving 的显存压力}，但需要处理 K/V 敏感性、scale 粒度和 paged block layout。
+\item \textbf{量化会影响整个 serving stack}：模型格式、kernel、TP/PP 切分、PagedAttention、scheduler、质量评估和成本模型都要一起考虑。
+\item \textbf{量化方案选型必须结合目标}：显存优先可选 INT4 weight-only，吞吐优先要看低精度硬件路径，质量优先则需要保守配置、敏感层保护和充分评估。
+\end{itemize}
+
+下一章将进入推理服务调度与 Continuous Batching。我们会把前面几章的 KV Cache、PagedAttention、FlashAttention 和量化技术放到一个在线 serving engine 中，分析请求如何排队、prefill 与 decode 如何混部、chunked prefill 如何降低首 token 延迟，以及调度器如何在吞吐、延迟、公平性和显存之间做决策。

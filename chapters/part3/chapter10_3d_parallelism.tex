@@ -1,0 +1,1909 @@
+\chapter{3D 并行策略}
+\label{chap:3d-parallelism}
+
+\section{DP、TP、PP 的组合}
+\label{sec:dp-tp-pp-composition}
+
+前面三章分别讨论了数据并行、张量并行和流水线并行。到这一章，我们把三者组合起来，进入大模型训练中最常见的系统形态：\textbf{3D 并行}。
+
+所谓 3D 并行，并不是指某个单独的新算法，而是把三类并行维度组织成一个三维并行网格：
+
+[
+\text{Data Parallelism}
+\times
+\text{Tensor Parallelism}
+\times
+\text{Pipeline Parallelism}.
+]
+
+如果用符号表示：
+
+[
+W
+=
+
+P_{\mathrm{DP}}
+\cdot
+P_{\mathrm{TP}}
+\cdot
+P_{\mathrm{PP}},
+]
+
+其中：
+
+\begin{itemize}
+\item $W$ 是总 GPU 数，也就是 world size；
+\item $P_{\mathrm{DP}}$ 是数据并行 size；
+\item $P_{\mathrm{TP}}$ 是张量并行 size；
+\item $P_{\mathrm{PP}}$ 是流水线并行 size。
+\end{itemize}
+
+3D 并行的目标是把一个超大 Transformer 训练任务拆解到许多 GPU 上，同时控制三个核心成本：
+
+\begin{itemize}
+\item \textbf{显存}：模型参数、梯度、优化器状态、激活和通信 buffer 能否放下；
+\item \textbf{计算}：每张 GPU 是否有足够大的 GEMM 和稳定工作量；
+\item \textbf{通信}：DP、TP、PP 三类通信是否能被网络拓扑和调度承受。
+\end{itemize}
+
+如果只使用一种并行方式，往往会遇到边界。只用 DDP，单卡必须放下完整模型；只用 TP，层内通信过于频繁，TP size 不能无限增大；只用 PP，pipeline bubble 和 stage 负载均衡会限制效率。因此，大模型训练通常需要三者组合。
+
+\subsection{三类并行的正交性}
+\label{subsec:orthogonality-of-parallelism}
+
+DP、TP、PP 的“正交性”是理解 3D 并行的关键。
+
+\textbf{数据并行}切分 batch。每个数据并行副本看到不同数据分片，但副本之间逻辑上训练同一个模型。每个 DP replica 内部可以包含多个 TP ranks 和多个 PP stages。DP 维度的通信主要是梯度同步，常见操作包括 all-reduce、reduce-scatter 或 ZeRO/FSDP 中的参数/梯度分片通信。
+
+[
+\text{DP}: \quad
+\mathcal{B}
+===========
+
+\mathcal{B}*0
+\cup
+\mathcal{B}*1
+\cup
+\cdots
+\cup
+\mathcal{B}*{P*{\mathrm{DP}}-1}.
+]
+
+\textbf{张量并行}切分每一层内部的大矩阵。一个 Transformer block 内的 QKV projection、output projection、FFN up/gate/down projection 会被切到 TP group 内的多张 GPU 上。TP 维度通信发生在每层内部，频率很高，因此通常要求 TP group 位于同一节点内或高速互联域内。
+
+[
+\mat{W}
+=======
+
+[\mat{W}*0,\mat{W}*1,\ldots,\mat{W}*{P*{\mathrm{TP}}-1}]
+\quad
+\text{or}
+\quad
+\mat{W}
+=======
+
+\begin{bmatrix}
+\mat{W}*0\
+\mat{W}*1\
+\vdots\
+\mat{W}*{P*{\mathrm{TP}}-1}
+\end{bmatrix}.
+]
+
+\textbf{流水线并行}切分模型层。不同 PP stages 负责不同层段，micro-batches 像流水线一样依次穿过这些 stages。PP 维度通信主要是相邻 stage 之间发送 forward activation 和 backward activation gradient。
+
+[
+{0,1,\ldots,L-1}
+================
+
+\mathcal{L}*0
+\cup
+\mathcal{L}*1
+\cup
+\cdots
+\cup
+\mathcal{L}*{P*{\mathrm{PP}}-1}.
+]
+
+三者正交的意思是：同一个全局 rank 可以同时属于一个 DP group、一个 TP group 和一个 PP group。它在 DP 维度上代表某个数据副本；在 TP 维度上代表某个 tensor shard；在 PP 维度上代表某个 layer stage。
+
+可以把一个 rank 的身份写成三元组：
+
+[
+r
+\leftrightarrow
+(d,t,p),
+]
+
+其中：
+
+\begin{itemize}
+\item $d\in[0,P_{\mathrm{DP}})$ 表示 data parallel index；
+\item $t\in[0,P_{\mathrm{TP}})$ 表示 tensor parallel index；
+\item $p\in[0,P_{\mathrm{PP}})$ 表示 pipeline parallel index。
+\end{itemize}
+
+一个完整的全局 rank 映射函数可以写为：
+
+[
+r
+=
+
+((d\cdot P_{\mathrm{PP}})+p)\cdot P_{\mathrm{TP}}+t.
+]
+
+也可以使用其他排列方式，例如让 TP 维最快变化，PP 维次之，DP 维最慢变化。不同排列方式会影响 rank mapping 和物理拓扑匹配，这一点稍后会详细讨论。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+cube/.style={draw, rounded corners=3pt, minimum width=1.1cm, minimum height=0.65cm, align=center, fill=blue!6},
+arrow/.style={-{Latex[length=2.2mm]}, thick},
+group/.style={draw, rounded corners=4pt, dashed, thick}
+]
+
+```
+\node[font=\bfseries] at (0,4.0) {3D 并行：DP、TP、PP 三个正交维度};
+
+% Draw a 2 x 2 x 3-ish grid projected
+\foreach \d/\dx in {0/0,1/0.55} {
+  \foreach \p/\py in {0/0,1/0.9,2/1.8} {
+    \foreach \t/\tx in {0/0,1/1.25} {
+      \pgfmathsetmacro{\x}{-3.6+\tx+\dx}
+      \pgfmathsetmacro{\y}{-0.5+\py+\dx*0.35}
+      \node[cube] (r\d\t\p) at (\x,\y) {$d\d$\\$t\t,p\p$};
+    }
+  }
+}
+
+\draw[arrow] (-4.4,-1.2) -- (-2.3,-1.2) node[midway,below] {TP};
+\draw[arrow] (-4.55,-0.85) -- (-4.55,2.1) node[midway,left] {PP};
+\draw[arrow] (-4.25,-0.95) -- (-3.55,-0.55) node[midway,below right] {DP};
+
+\node[group, fit=(r000)(r010)] {};
+\node[align=center, font=\scriptsize] at (-2.95,0.1) {同一层段内\\TP group};
+
+\draw[green!60!black, thick, dotted] (r000) -- (r100);
+\draw[green!60!black, thick, dotted] (r010) -- (r110);
+\node[align=center, font=\scriptsize, green!50!black] at (-1.2,-0.25) {DP replicas};
+
+\draw[red!70, thick, dashed] (r000) -- (r001) -- (r002);
+\node[align=center, font=\scriptsize, red!70] at (-4.85,1.4) {PP stages};
+
+\node[align=left, text width=10.8cm] at (1.8,-2.0) {
+  每个 rank 同时有 DP、TP、PP 三个坐标。TP group 负责层内张量切分；
+  PP group 负责层间流水线；DP group 负责不同数据副本之间的梯度同步。
+};
+```
+
+\end{tikzpicture}
+\caption{3D 并行 rank 拓扑示意图}
+\label{fig:3d-parallel-rank-topology}
+\end{figure}
+
+\subsection{group 划分}
+\label{subsec:3d-parallel-group-partition}
+
+在实际分布式训练框架中，3D 并行不是抽象概念，而是具体的 process groups。每个 rank 需要加入多个通信组。最少包括：
+
+\begin{itemize}
+\item \textbf{Tensor Parallel Group}：组内做层内 all-reduce、all-gather、reduce-scatter；
+\item \textbf{Pipeline Parallel Group}：组内相邻 rank 做 send/recv；
+\item \textbf{Data Parallel Group}：组内同步相同模型 shard 的梯度或状态；
+\item \textbf{Embedding Group}：首尾 stage 之间共享或同步 embedding/lm head 时可能需要；
+\item \textbf{Sequence Parallel Group}：通常与 TP group 相同或相关；
+\item \textbf{Expert Parallel Group}：MoE 训练中用于 expert dispatch 和 all-to-all。
+\end{itemize}
+
+假设：
+
+[
+P_{\mathrm{TP}}=2,\quad
+P_{\mathrm{PP}}=4,\quad
+P_{\mathrm{DP}}=2.
+]
+
+则总 GPU 数为：
+
+[
+W=2\times 4\times 2=16.
+]
+
+如果使用 rank 映射：
+
+[
+r=((dP_{\mathrm{PP}})+p)P_{\mathrm{TP}}+t,
+]
+
+则全局 rank 表如下：
+
+[
+\begin{array}{c|c|c|c}
+d & p & t & r\
+\hline
+0 & 0 & 0 & 0\
+0 & 0 & 1 & 1\
+0 & 1 & 0 & 2\
+0 & 1 & 1 & 3\
+0 & 2 & 0 & 4\
+0 & 2 & 1 & 5\
+0 & 3 & 0 & 6\
+0 & 3 & 1 & 7\
+1 & 0 & 0 & 8\
+1 & 0 & 1 & 9\
+1 & 1 & 0 & 10\
+1 & 1 & 1 & 11\
+1 & 2 & 0 & 12\
+1 & 2 & 1 & 13\
+1 & 3 & 0 & 14\
+1 & 3 & 1 & 15
+\end{array}
+]
+
+此时 TP groups 为：
+
+[
+(0,1),(2,3),(4,5),(6,7),
+]
+[
+(8,9),(10,11),(12,13),(14,15).
+]
+
+PP groups 为：
+
+[
+(0,2,4,6),\quad (1,3,5,7),
+]
+[
+(8,10,12,14),\quad (9,11,13,15).
+]
+
+DP groups 为：
+
+[
+(0,8),(1,9),(2,10),(3,11),
+]
+[
+(4,12),(5,13),(6,14),(7,15).
+]
+
+注意 DP group 中的 rank 必须代表\textbf{相同的 TP shard 和相同的 PP stage}，只是数据副本不同。因此 rank $0$ 和 rank $8$ 都是 $t=0,p=0$，只是 $d$ 不同。它们之间同步的是同一 shard 的梯度。
+
+下面给出一个简单的 group 生成代码。它用于帮助理解，真实框架会考虑更多并行维度和拓扑策略。
+
+\begin{lstlisting}[language=Python,caption={3D 并行中 TP/PP/DP groups 的生成示意},label={lst:3d-parallel-group-generation}]
+def rank_from_coords(d, p, t, dp, pp, tp):
+# Layout: DP outer, PP middle, TP inner.
+return ((d * pp) + p) * tp + t
+
+def build_3d_parallel_groups(dp, pp, tp):
+world_size = dp * pp * tp
+
+```
+tp_groups = []
+for d in range(dp):
+    for p in range(pp):
+        group = [
+            rank_from_coords(d, p, t, dp, pp, tp)
+            for t in range(tp)
+        ]
+        tp_groups.append(group)
+
+pp_groups = []
+for d in range(dp):
+    for t in range(tp):
+        group = [
+            rank_from_coords(d, p, t, dp, pp, tp)
+            for p in range(pp)
+        ]
+        pp_groups.append(group)
+
+dp_groups = []
+for p in range(pp):
+    for t in range(tp):
+        group = [
+            rank_from_coords(d, p, t, dp, pp, tp)
+            for d in range(dp)
+        ]
+        dp_groups.append(group)
+
+assert sorted(sum(tp_groups, [])) == list(range(world_size))
+return tp_groups, pp_groups, dp_groups
+```
+
+tp_groups, pp_groups, dp_groups = build_3d_parallel_groups(
+dp=2,
+pp=4,
+tp=2,
+)
+
+print("TP groups:", tp_groups)
+print("PP groups:", pp_groups)
+print("DP groups:", dp_groups)
+\end{lstlisting}
+
+在 PyTorch 中，这些 group 通常会通过 \texttt{torch.distributed.new_group()} 创建。训练框架会保存每个 rank 所属 group，并在不同模块中调用对应 group 的 collective 或 point-to-point 通信。
+
+\subsection{rank mapping}
+\label{subsec:rank-mapping}
+
+Rank mapping 是把逻辑三维坐标 $(d,p,t)$ 映射到物理 GPU 的过程。它极其重要，因为不同并行维度的通信频率和通信模式不同。
+
+一般经验是：
+
+\begin{itemize}
+\item \textbf{TP group 优先放在节点内高速互联}，因为 TP 通信发生在每层内部，频率最高；
+\item \textbf{PP 相邻 stage 尽量放在高速链路上}，因为每个 micro-batch 都要传递激活和梯度；
+\item \textbf{DP 可以跨节点}，因为 DP 通信虽然数据量大，但通常可与 backward 重叠，且模式规则；
+\item \textbf{同一节点内的 GPU 拓扑要考虑 NVLink/NVSwitch/PCIe 层级}；
+\item \textbf{跨节点要考虑 NIC 数量、rail、RDMA 路径和机架拓扑}。
+\end{itemize}
+
+设一个节点有 $G_{\mathrm{node}}=8$ 张 GPU。如果选择：
+
+[
+P_{\mathrm{TP}}=8,
+]
+
+则一个 TP group 可以完整放在单节点内。这样每层 TP all-reduce 都走节点内 NVLink/NVSwitch，通常性能较好。如果选择：
+
+[
+P_{\mathrm{TP}}=16,
+]
+
+则一个 TP group 跨两个节点，每层 TP 通信都要走跨节点网络，性能可能明显下降。除非模型极大必须这么做，否则通常避免跨节点 TP。
+
+PP group 是否跨节点要看 stage 数和节点布局。如果每个 stage 是一个 TP group，而 TP group 占满一个节点，那么 PP 相邻 stage 自然跨节点。此时 PP 通信是激活传递，其大小与：
+
+[
+B_{\mathrm{micro}}S H
+]
+
+成正比。对于长序列和大 hidden，PP 通信也不可忽略。因此有些训练会把相邻 PP stages 安排在网络拓扑相近的节点上。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+nodebox/.style={draw, rounded corners=5pt, minimum width=5.0cm, minimum height=2.3cm, fill=blue!3},
+gpu/.style={draw, rounded corners=2pt, minimum width=0.7cm, minimum height=0.46cm, align=center, fill=orange!12},
+arrow/.style={-{Latex[length=2.0mm]}, thick},
+fast/.style={thick, green!60!black},
+slow/.style={thick, red!70, dashed}
+]
+
+```
+\node[font=\bfseries] at (0,3.5) {Rank Mapping：让高频通信走高速链路};
+
+\node[nodebox, label={[font=\bfseries]above:Node 0}] (n0) at (-3.1,1.1) {};
+\node[nodebox, label={[font=\bfseries]above:Node 1}] (n1) at (3.1,1.1) {};
+
+\foreach \i/\x/\y in {0/-4.6/1.55,1/-3.8/1.55,2/-3.0/1.55,3/-2.2/1.55,4/-4.6/0.75,5/-3.8/0.75,6/-3.0/0.75,7/-2.2/0.75} {
+  \node[gpu] (g\i) at (\x,\y) {\i};
+}
+
+\foreach \i/\x/\y/\r in {0/1.6/1.55/8,1/2.4/1.55/9,2/3.2/1.55/10,3/4.0/1.55/11,4/1.6/0.75/12,5/2.4/0.75/13,6/3.2/0.75/14,7/4.0/0.75/15} {
+  \node[gpu] (h\i) at (\x,\y) {\r};
+}
+
+\draw[fast] (g0) -- (g1);
+\draw[fast] (g1) -- (g2);
+\draw[fast] (g2) -- (g3);
+\draw[fast] (g4) -- (g5);
+\draw[fast] (g5) -- (g6);
+\draw[fast] (g6) -- (g7);
+
+\draw[fast] (h0) -- (h1);
+\draw[fast] (h1) -- (h2);
+\draw[fast] (h2) -- (h3);
+\draw[fast] (h4) -- (h5);
+\draw[fast] (h5) -- (h6);
+\draw[fast] (h6) -- (h7);
+
+\draw[slow] (g3) -- node[above,font=\scriptsize] {cross-node} (h0);
+
+\node[align=left, text width=10.8cm] at (0,-1.2) {
+  TP 通信通常最高频，应尽量限制在节点内高速互联范围。
+  如果 TP group 跨节点，每层都会付出跨节点通信成本，扩展效率可能急剧下降。
+};
+```
+
+\end{tikzpicture}
+\caption{rank mapping 对通信路径的影响}
+\label{fig:rank-mapping-topology}
+\end{figure}
+
+\subsection{为什么 rank mapping 影响性能}
+\label{subsec:why-rank-mapping-affects-performance}
+
+通信性能不是只由总 GPU 数决定，而是由\textbf{哪个 rank 和哪个 rank 通信、通信走哪条链路、链路是否拥塞}决定。
+
+TP 通信常发生在每层内部。一个 80 层模型，每层 attention output 和 FFN down projection 至少各一次 TP all-reduce，则一个 forward/backward step 中 TP collective 次数非常多。如果 TP group 跨节点，每层都要跨网络同步，通信尾部可能无法隐藏。
+
+PP 通信发生在 stage 边界。若 micro-batch 数 $M$ 很大，stage 间 send/recv 次数为 $O(MP_{\mathrm{PP}})$。如果相邻 PP stages 被放在跨机架或拥塞链路上，pipeline bubble 和等待时间会上升。
+
+DP 通信通常发生在 backward 梯度同步。DDP bucket 可以与 backward 重叠，ZeRO/FSDP 也能通过 reduce-scatter/all-gather 改变通信形态。DP 跨节点是常见选择，但仍需要高带宽网络。
+
+因此，一个经验性 rank mapping 原则是：
+
+[
+\text{通信频率越高、延迟越敏感的 group，越应该放在更近的拓扑范围内。}
+]
+
+按优先级粗略排序：
+
+[
+\text{TP}
+
+>
+
+\text{PP adjacent stages}
+
+>
+
+\text{DP}.
+]
+
+但这不是绝对。若 PP activation 很大、micro-batch 很多，PP 也可能成为主要瓶颈。若 ZeRO-3/FSDP 频繁 all-gather 参数，DP 维通信也会非常重。真正配置时需要结合 profiler、NCCL tests 和训练 step breakdown。
+
+\section{计算、显存与通信的三角权衡}
+\label{sec:compute-memory-communication-triangle}
+
+3D 并行配置的本质，是在计算、显存与通信之间做权衡。一个配置可能显存很省，但通信太重；另一个配置计算效率高，但单卡显存放不下；还有一个配置通信少，但 pipeline bubble 大。
+
+我们可以把三者画成一个三角形：
+
+[
+\text{Compute}
+\leftrightarrow
+\text{Memory}
+\leftrightarrow
+\text{Communication}.
+]
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+vertex/.style={circle, draw, minimum size=1.25cm, align=center},
+arrow/.style={-{Latex[length=2.2mm]}, thick}
+]
+
+```
+\node[font=\bfseries] at (0,3.2) {3D 并行的 Compute-Memory-Communication 三角权衡};
+
+\node[vertex, fill=blue!8] (compute) at (0,1.7) {Compute\\效率};
+\node[vertex, fill=green!10] (memory) at (-4.0,-1.2) {Memory\\显存};
+\node[vertex, fill=orange!14] (comm) at (4.0,-1.2) {Communication\\通信};
+
+\draw[arrow] (memory) -- node[left, align=center] {切分模型\\降低显存} (compute);
+\draw[arrow] (compute) -- node[right, align=center] {GEMM 变小\\通信增加} (comm);
+\draw[arrow] (comm) -- node[below, align=center] {通信 buffer\\拓扑限制} (memory);
+
+\node[align=left, text width=10.5cm] at (0,-2.7) {
+  DP、TP、PP 的配置不是单目标优化。TP 增大可降低层内显存但增加高频通信；
+  PP 增大可降低层数相关显存但增加 bubble 和 activation send/recv；
+  DP 增大可提升数据吞吐但增加梯度同步压力。
+};
+```
+
+\end{tikzpicture}
+\caption{计算、显存与通信的三角权衡}
+\label{fig:compute-memory-communication-triangle}
+\end{figure}
+
+\subsection{显存占用估算}
+\label{subsec:memory-estimation}
+
+训练显存可以拆成五部分：
+
+[
+M_{\mathrm{total}}
+==================
+
+M_{\mathrm{params}}
++
+M_{\mathrm{grads}}
++
+M_{\mathrm{optimizer}}
++
+M_{\mathrm{activations}}
++
+M_{\mathrm{buffers}}.
+]
+
+对于一个 dense Transformer，如果暂时忽略 embedding/lm head 和不均匀层切分，模型层参数在 TP 和 PP 下的每卡占用近似为：
+
+[
+M_{\mathrm{params,perGPU}}
+\approx
+\frac{N_{\mathrm{params}}\cdot s_{\mathrm{param}}}
+{P_{\mathrm{TP}}P_{\mathrm{PP}}}.
+]
+
+这里的解释是：TP 切分层内矩阵，PP 切分层数。DP 不减少每个副本中的参数占用，除非使用 ZeRO/FSDP。
+
+梯度与参数 shard 对应，若不使用 ZeRO/FSDP：
+
+[
+M_{\mathrm{grads,perGPU}}
+\approx
+\frac{N_{\mathrm{params}}\cdot s_{\mathrm{grad}}}
+{P_{\mathrm{TP}}P_{\mathrm{PP}}}.
+]
+
+AdamW 优化器状态通常包括 master weight、一阶矩和二阶矩。如果它们随 TP/PP shard 保存，则：
+
+[
+M_{\mathrm{optimizer,perGPU}}
+\approx
+\frac{N_{\mathrm{params}}\cdot s_{\mathrm{optim}}}
+{P_{\mathrm{TP}}P_{\mathrm{PP}}}.
+]
+
+如果使用 ZeRO-1 在 DP 维切分 optimizer state，则优化器状态进一步除以 $P_{\mathrm{DP}}$：
+
+[
+M_{\mathrm{optimizer,perGPU}}^{\mathrm{ZeRO1}}
+\approx
+\frac{N_{\mathrm{params}}\cdot s_{\mathrm{optim}}}
+{P_{\mathrm{TP}}P_{\mathrm{PP}}P_{\mathrm{DP}}}.
+]
+
+如果使用 ZeRO-2，梯度也可在 DP 维切分；ZeRO-3 则参数也可在 DP 维切分。但 ZeRO-3 与 TP/PP 组合后通信更加复杂，后续 ZeRO 章节会专门讨论。
+
+激活显存的估算更复杂。对一个 Transformer 层，隐藏状态激活基础大小为：
+
+[
+B_{\mathrm{micro}}S H s_{\mathrm{act}}.
+]
+
+若每个 PP stage 有 $L/P_{\mathrm{PP}}$ 层，则每个 stage 的激活显存粗略与：
+
+[
+M_{\mathrm{act,stage}}
+\propto
+N_{\mathrm{live\ microbatches}}
+\cdot
+\frac{L}{P_{\mathrm{PP}}}
+\cdot
+B_{\mathrm{micro}}S Hs_{\mathrm{act}}
+]
+
+相关。其中 $N_{\mathrm{live\ microbatches}}$ 与 pipeline schedule 有关。GPipe 中它可能接近 $M$；1F1B 中通常显著更低。
+
+TP 对激活显存的影响取决于是否使用 sequence parallel。若仅使用 TP，一些中间激活沿 hidden 维切分，但 residual stream 可能仍 replicated。使用 sequence parallel 后，部分激活可进一步除以 $P_{\mathrm{TP}}$。
+
+因此，真实估算可以写成：
+
+[
+M_{\mathrm{act}}
+================
+
+M_{\mathrm{act,sharded}}
++
+M_{\mathrm{act,replicated}}
++
+M_{\mathrm{act,temp}}.
+]
+
+如果粗略引入一个激活切分因子 $q_{\mathrm{act}}$：
+
+[
+M_{\mathrm{act,perGPU}}
+\approx
+\frac{
+c_{\mathrm{act}}
+\cdot
+N_{\mathrm{live\ microbatches}}
+\cdot
+\frac{L}{P_{\mathrm{PP}}}
+\cdot
+B_{\mathrm{micro}}S Hs_{\mathrm{act}}
+}
+{q_{\mathrm{act}}},
+]
+
+其中 $c_{\mathrm{act}}$ 表示每层实际保存激活相对 hidden state 的倍数，$q_{\mathrm{act}}$ 可能为 $1$、$P_{\mathrm{TP}}$ 或介于两者之间。
+
+下面给出一个简化显存估算代码，用于配置初筛。
+
+\begin{lstlisting}[language=Python,caption={3D 并行训练显存的粗略估算器},label={lst:3d-memory-estimator}]
+def estimate_3d_memory_gb(
+num_params,
+num_layers,
+hidden_size,
+seq_len,
+micro_batch_size,
+tp_size,
+pp_size,
+dp_size,
+live_microbatches,
+param_bytes=2,      # BF16 parameters
+grad_bytes=2,       # BF16 gradients
+master_bytes=4,     # FP32 master weights
+adam_m_bytes=4,     # FP32 Adam m
+adam_v_bytes=4,     # FP32 Adam v
+act_bytes=2,        # BF16 activations
+activation_factor=8.0,
+activation_shard_factor=1.0,
+zero_stage=0,
+buffer_gb=4.0,
+):
+"""
+A rough estimator for screening configurations.
+It is not a replacement for real profiler-based measurement.
+"""
+
+```
+# Parameters are sharded by TP and PP.
+param_shard = num_params / (tp_size * pp_size)
+
+param_mem = param_shard * param_bytes
+grad_mem = param_shard * grad_bytes
+
+optim_bytes = master_bytes + adam_m_bytes + adam_v_bytes
+optim_mem = param_shard * optim_bytes
+
+# ZeRO effects along DP dimension.
+if zero_stage >= 1:
+    optim_mem /= dp_size
+if zero_stage >= 2:
+    grad_mem /= dp_size
+if zero_stage >= 3:
+    param_mem /= dp_size
+
+layers_per_stage = num_layers / pp_size
+hidden_act = micro_batch_size * seq_len * hidden_size * act_bytes
+
+act_mem = (
+    live_microbatches
+    * layers_per_stage
+    * hidden_act
+    * activation_factor
+    / activation_shard_factor
+)
+
+total = param_mem + grad_mem + optim_mem + act_mem + buffer_gb * (1024 ** 3)
+
+return {
+    "params_gb": param_mem / (1024 ** 3),
+    "grads_gb": grad_mem / (1024 ** 3),
+    "optimizer_gb": optim_mem / (1024 ** 3),
+    "activations_gb": act_mem / (1024 ** 3),
+    "buffers_gb": buffer_gb,
+    "total_gb": total / (1024 ** 3),
+}
+```
+
+memory = estimate_3d_memory_gb(
+num_params=70e9,
+num_layers=80,
+hidden_size=8192,
+seq_len=4096,
+micro_batch_size=1,
+tp_size=8,
+pp_size=4,
+dp_size=8,
+live_microbatches=4,
+activation_shard_factor=8,  # assume sequence parallel roughly helps
+zero_stage=1,
+)
+
+for k, v in memory.items():
+print(k, round(v, 2))
+\end{lstlisting}
+
+这段代码只能用于直觉估算。真实显存还会受到 allocator fragmentation、kernel workspace、CUDA graph、NCCL buffer、FlashAttention workspace、recompute 策略、模型具体结构、MoE、embedding/lm head、vocab parallel cross entropy 等影响。
+
+\subsection{通信量估算}
+\label{subsec:communication-estimation}
+
+3D 并行中的通信可以分为三类：
+
+[
+C_{\mathrm{comm}}
+=================
+
+C_{\mathrm{DP}}
++
+C_{\mathrm{TP}}
++
+C_{\mathrm{PP}}.
+]
+
+\textbf{DP 通信}主要是梯度同步或 ZeRO/FSDP 的状态同步。如果不使用 ZeRO，DDP 每 step 需要同步参数梯度。假设每个 DP replica 内部经过 TP/PP 后，每个 rank 持有的参数 shard 大小为：
+
+[
+G_{\mathrm{rank}}
+=================
+
+\frac{N_{\mathrm{params}}s_{\mathrm{grad}}}
+{P_{\mathrm{TP}}P_{\mathrm{PP}}}.
+]
+
+普通 all-reduce 的每 rank 通信量可粗略按 Ring AllReduce 估算：
+
+[
+V_{\mathrm{DP}}
+\approx
+\frac{2(P_{\mathrm{DP}}-1)}{P_{\mathrm{DP}}}
+G_{\mathrm{rank}}.
+]
+
+若使用 ZeRO-2 或 ZeRO-3，通信形态会变成 reduce-scatter、all-gather 和参数预取，不能简单用 DDP all-reduce 代替。
+
+\textbf{TP 通信}发生在每层内部。Megatron 风格每层至少有 attention output projection 后一次 all-reduce、FFN down projection 后一次 all-reduce。每次 all-reduce 的张量大小大致为：
+
+[
+B_{\mathrm{micro}}S Hs_{\mathrm{act}}.
+]
+
+如果每个 stage 有 $L/P_{\mathrm{PP}}$ 层，每个 micro-batch 在本 stage 触发约 $n_{\mathrm{tp_collectives_per_layer}}$ 次 TP collective，则每个 step TP 通信量与：
+
+[
+M
+\cdot
+\frac{L}{P_{\mathrm{PP}}}
+\cdot
+n_{\mathrm{tp}}
+\cdot
+B_{\mathrm{micro}}S Hs_{\mathrm{act}}
+]
+
+相关。再乘以 all-reduce 的通信放大系数：
+
+[
+\frac{2(P_{\mathrm{TP}}-1)}{P_{\mathrm{TP}}}.
+]
+
+因此：
+
+[
+V_{\mathrm{TP}}
+\approx
+M
+\cdot
+\frac{L}{P_{\mathrm{PP}}}
+\cdot
+n_{\mathrm{tp}}
+\cdot
+\frac{2(P_{\mathrm{TP}}-1)}{P_{\mathrm{TP}}}
+\cdot
+B_{\mathrm{micro}}S Hs_{\mathrm{act}}.
+]
+
+\textbf{PP 通信}是 stage 边界传递 activation 和 activation gradient。每条边界每个 micro-batch forward 发送一次激活，backward 发送一次梯度：
+
+[
+V_{\mathrm{PP,boundary}}
+\approx
+2M B_{\mathrm{micro}}S Hs_{\mathrm{act}}.
+]
+
+每个 rank 只和相邻 stage 通信，不一定经过所有边界。因此每 rank PP 通信取决于它是否在中间 stage、首 stage 还是尾 stage。中间 stage 既接收又发送，边界通信更多；首尾 stage 少一侧。
+
+通信估算的重点不是得到一个完美数字，而是判断哪个维度最可能成为瓶颈：
+
+[
+\text{TP 高频，偏低延迟和高带宽节点内通信；}
+]
+[
+\text{PP 与 micro-batch 和激活大小相关，偏点对点通信；}
+]
+[
+\text{DP 与参数/梯度大小相关，偏大块 collective 通信。}
+]
+
+\begin{table}[H]
+\centering
+\small
+\caption{DP、TP、PP 通信模式对比}
+\label{tab:dp-tp-pp-communication-comparison}
+\begin{tabular}{p{0.16\textwidth}p{0.25\textwidth}p{0.24\textwidth}p{0.25\textwidth}}
+\toprule
+\textbf{并行维度} & \textbf{通信对象} & \textbf{常见操作} & \textbf{性能敏感点} \
+\midrule
+DP
+& 梯度、参数 shard、优化器状态
+& all-reduce, reduce-scatter, all-gather
+& 跨节点带宽、bucket overlap、ZeRO stage。 \
+\midrule
+TP
+& 层内激活、partial output、sequence shard
+& all-reduce, all-gather, reduce-scatter
+& 频率高，强依赖节点内 NVLink/NVSwitch。 \
+\midrule
+PP
+& stage 边界激活与激活梯度
+& send/recv
+& micro-batch 数、hidden/seq 大小、stage 拓扑。 \
+\midrule
+MoE EP
+& token dispatch 和 expert output
+& all-to-all
+& 负载均衡、网络拥塞、expert placement。 \
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{计算效率估算}
+\label{subsec:compute-efficiency-estimation}
+
+大模型训练常用 MFU，Model FLOPs Utilization，衡量有效模型计算占硬件峰值计算的比例：
+
+[
+\mathrm{MFU}
+============
+
+\frac{\mathrm{Model\ FLOPs\ per\ step}}
+{\mathrm{Step\ time}\cdot \mathrm{Peak\ FLOPs\ of\ GPUs}}.
+]
+
+如果模型每个 token 的训练 FLOPs 粗略为 $6N$，每 step 训练 token 数为：
+
+[
+T_{\mathrm{tokens/step}}
+========================
+
+B_{\mathrm{global}}S,
+]
+
+则每 step 模型 FLOPs 为：
+
+[
+F_{\mathrm{step}}
+\approx
+6N B_{\mathrm{global}}S.
+]
+
+若使用 $W$ 张 GPU，每张 GPU 峰值为 $F_{\mathrm{peak}}$，step time 为 $T_{\mathrm{step}}$，则：
+
+[
+\mathrm{MFU}
+\approx
+\frac{6N B_{\mathrm{global}}S}
+{T_{\mathrm{step}} W F_{\mathrm{peak}}}.
+]
+
+MFU 下降可能来自：
+
+\begin{itemize}
+\item TP size 太大导致 GEMM 太小；
+\item PP bubble 占比高；
+\item DP 通信暴露；
+\item 数据加载阻塞；
+\item checkpoint 阻塞；
+\item kernel fusion 不足，小 kernel 太多；
+\item activation checkpointing 重计算太多；
+\item straggler 或节点性能不一致；
+\item 通信与计算资源争抢。
+\end{itemize}
+
+Pipeline bubble 对计算效率的影响可以单独估算。若使用 $M$ 个 micro-batches、$P_{\mathrm{PP}}$ 个 stages，简单近似：
+
+[
+\eta_{\mathrm{pipe}}
+\approx
+\frac{M}{M+P_{\mathrm{PP}}-1}.
+]
+
+例如 $P_{\mathrm{PP}}=8$，$M=8$：
+
+[
+\eta_{\mathrm{pipe}}
+====================
+
+# \frac{8}{8+8-1}
+
+\frac{8}{15}
+\approx 53.3%.
+]
+
+这说明 micro-batch 数与 PP size 相当时，bubble 仍然很大。若 $M=64$：
+
+[
+\eta_{\mathrm{pipe}}
+====================
+
+# \frac{64}{64+8-1}
+
+\frac{64}{71}
+\approx 90.1%.
+]
+
+但 $M$ 变大意味着 gradient accumulation 变大，global batch size 也变大，可能影响训练动力学。因此 pipeline efficiency 不能孤立优化。
+
+\begin{lstlisting}[language=Python,caption={MFU 与 Pipeline Efficiency 的简化估算},label={lst:mfu-pipeline-efficiency-estimator}]
+def estimate_mfu(
+num_params,
+global_batch_size,
+seq_len,
+step_time_sec,
+num_gpus,
+peak_flops_per_gpu,
+):
+# Dense Transformer training FLOPs rough estimate.
+flops_per_step = 6 * num_params * global_batch_size * seq_len
+peak_flops_per_step = step_time_sec * num_gpus * peak_flops_per_gpu
+return flops_per_step / peak_flops_per_step
+
+def pipeline_efficiency(num_microbatches, pp_size):
+return num_microbatches / (num_microbatches + pp_size - 1)
+
+for m in [4, 8, 16, 32, 64]:
+print(m, round(pipeline_efficiency(m, pp_size=8), 3))
+\end{lstlisting}
+
+\subsection{不同规模模型的并行策略选择}
+\label{subsec:parallel-strategy-for-different-model-sizes}
+
+并行策略没有唯一最优答案。下面给出一组工程直觉，用于初始配置选择。
+
+\textbf{小模型，例如 1B 到 7B。}如果单卡可以放下模型和训练状态，优先使用 DDP 或 FSDP。TP/PP 可能降低单卡计算效率，除非 batch 或序列足够大。常见策略：
+
+[
+P_{\mathrm{TP}}=1,\quad
+P_{\mathrm{PP}}=1,\quad
+P_{\mathrm{DP}}=W.
+]
+
+如果显存不足，可以使用 ZeRO/FSDP、activation checkpointing 或 LoRA/QLoRA 等方法。
+
+\textbf{中等模型，例如 7B 到 30B。}可能需要 TP 或 ZeRO。若节点内 8 卡互联较好，可尝试：
+
+[
+P_{\mathrm{TP}}=2\ \text{or}\ 4,
+\quad
+P_{\mathrm{PP}}=1,
+\quad
+P_{\mathrm{DP}}=\frac{W}{P_{\mathrm{TP}}}.
+]
+
+如果层数较多、显存仍不足，可引入 PP：
+
+[
+P_{\mathrm{TP}}=4,
+\quad
+P_{\mathrm{PP}}=2,
+\quad
+P_{\mathrm{DP}}=\frac{W}{8}.
+]
+
+\textbf{大模型，例如 30B 到 100B。}通常需要 TP+PP+DP。TP 放在节点内，PP 跨节点或跨节点组，DP 复制多个 3D replica。典型方向：
+
+[
+P_{\mathrm{TP}}=4\ \text{or}\ 8,
+\quad
+P_{\mathrm{PP}}=4\ \text{or}\ 8,
+\quad
+P_{\mathrm{DP}}=\frac{W}{P_{\mathrm{TP}}P_{\mathrm{PP}}}.
+]
+
+\textbf{超大模型，例如 100B 以上。}通常需要 3D 并行加 ZeRO、activation checkpointing、sequence parallel、distributed checkpoint 和拓扑感知调度。TP 可能取节点内最大高速互联规模，例如 8；PP 取决于层数和显存；DP size 由总 GPU 数和 global batch 需求决定。
+
+\begin{table}[H]
+\centering
+\small
+\caption{不同模型规模下的并行策略直觉}
+\label{tab:parallel-strategy-by-model-size}
+\begin{tabular}{p{0.18\textwidth}p{0.25\textwidth}p{0.24\textwidth}p{0.23\textwidth}}
+\toprule
+\textbf{模型规模} & \textbf{优先策略} & \textbf{常见配置方向} & \textbf{主要风险} \
+\midrule
+1B--7B
+& DDP / FSDP
+& TP=1, PP=1，扩大 DP
+& 显存、数据加载、小 batch 通信。 \
+\midrule
+7B--30B
+& TP 或 ZeRO/FSDP
+& TP=2/4，PP 可为 1/2
+& TP 通信、GEMM 变小、ZeRO 通信。 \
+\midrule
+30B--100B
+& TP+PP+DP
+& TP=4/8，PP=2/4/8
+& pipeline bubble、stage 均衡、rank mapping。 \
+\midrule
+100B+
+& 3D + ZeRO + checkpointing
+& TP 节点内，PP 跨节点，DP 多副本
+& 通信、checkpoint、故障恢复、长时间稳定性。 \
+\bottomrule
+\end{tabular}
+\end{table}
+
+这些只是初始猜测。真实项目必须通过 profile 和试跑验证。一个配置是否好，不看理论是否优雅，而看：
+
+\begin{itemize}
+\item 单卡显存是否有安全余量；
+\item MFU 是否合理；
+\item step time 是否稳定；
+\item pipeline bubble 是否可接受；
+\item NCCL 时间占比是否过高；
+\item checkpoint 是否能在可接受时间内完成；
+\item 故障恢复是否可靠；
+\item global batch 和学习率是否满足训练 recipe。
+\end{itemize}
+
+\section{大模型训练配置推导}
+\label{sec:large-model-training-config-derivation}
+
+3D 并行配置推导是 AI Infra 工程师的核心能力之一。给定模型规模、GPU 数量、单卡显存、节点拓扑和目标 global batch，需要反推出 TP、PP、DP、micro-batch、gradient accumulation 等参数。
+
+\subsection{global batch size}
+\label{subsec:global-batch-size}
+
+在 3D 并行中，global batch size 由数据并行、副本内 micro-batch 和梯度累积共同决定：
+
+[
+B_{\mathrm{global}}
+===================
+
+B_{\mathrm{micro}}
+\cdot
+M
+\cdot
+P_{\mathrm{DP}}.
+]
+
+其中：
+
+\begin{itemize}
+\item $B_{\mathrm{micro}}$ 是每个 pipeline micro-batch 的 batch size；
+\item $M$ 是每个 optimizer step 的 micro-batch 数；
+\item $P_{\mathrm{DP}}$ 是数据并行副本数。
+\end{itemize}
+
+如果按 token 数计算：
+
+[
+T_{\mathrm{global}}
+===================
+
+B_{\mathrm{global}}
+\cdot
+S
+=
+
+B_{\mathrm{micro}}
+\cdot
+M
+\cdot
+P_{\mathrm{DP}}
+\cdot
+S.
+]
+
+在语言模型训练中，常用 tokens per step 描述 batch，因为序列长度直接影响计算量。若使用 sequence packing，实际每个 sample 的有效 token 可能不同，此时需要按 non-padding token 数统计。
+
+\subsection{micro batch size}
+\label{subsec:micro-batch-size}
+
+Micro-batch size 是 3D 并行中非常敏感的参数。它影响：
+
+\begin{itemize}
+\item 单个 micro-batch 激活显存；
+\item GEMM shape 和 Tensor Core 利用率；
+\item pipeline bubble 摊薄方式；
+\item gradient accumulation steps；
+\item global batch size；
+\item data loader 和 sequence packing。
+\end{itemize}
+
+通常显存越紧，$B_{\mathrm{micro}}$ 越小。很多大模型训练中，micro-batch size 甚至可能为 $1$。这并不意味着 global batch size 小，因为可以通过更大的 $M$ 和 $P_{\mathrm{DP}}$ 累积到目标 global batch。
+
+但是，$B_{\mathrm{micro}}=1$ 也可能带来问题：
+
+\begin{itemize}
+\item GEMM 的 $M$ 维，即 token 数 $B_{\mathrm{micro}}S$，可能较小；
+\item pipeline micro-batch 数需要增加，调度开销上升；
+\item 如果序列长度也不大，GPU 利用率会下降；
+\item Batch 维相关的数据增强或采样统计变弱。
+\end{itemize}
+
+因此配置时通常先从显存允许的最大 micro-batch 试起，再根据 global batch 需求调 gradient accumulation。
+
+\subsection{gradient accumulation}
+\label{subsec:gradient-accumulation-in-3d}
+
+在 PP 中，micro-batch 数 $M$ 既是 gradient accumulation 的一部分，也是 pipeline 填充效率的关键。为了达到目标 global batch：
+
+[
+M
+=
+
+\frac{B_{\mathrm{global}}}
+{B_{\mathrm{micro}}P_{\mathrm{DP}}}.
+]
+
+同时为了降低 pipeline bubble，希望：
+
+[
+M \gg P_{\mathrm{PP}}.
+]
+
+这两个条件可能冲突。如果 $P_{\mathrm{DP}}$ 很大，给定 global batch 下 $M$ 可能变小，导致 pipeline bubble 大。反过来，如果为了提高 pipeline efficiency 增大 $M$，global batch 可能过大，需要调整学习率或训练 recipe。
+
+例如：
+
+[
+B_{\mathrm{global}}=1024,
+\quad
+B_{\mathrm{micro}}=1,
+\quad
+P_{\mathrm{DP}}=64.
+]
+
+则：
+
+[
+M=\frac{1024}{1\times 64}=16.
+]
+
+若：
+
+[
+P_{\mathrm{PP}}=16,
+]
+
+则 pipeline efficiency 近似为：
+
+[
+\eta_{\mathrm{pipe}}
+====================
+
+# \frac{16}{16+16-1}
+
+\frac{16}{31}
+\approx 51.6%.
+]
+
+这很低。可以考虑：
+
+\begin{itemize}
+\item 减小 DP size，增大 $M$；
+\item 减小 PP size；
+\item 增大 global batch；
+\item 增大 micro-batch；
+\item 使用 interleaved pipeline；
+\item 调整并行切分，使 PP bubble 降低。
+\end{itemize}
+
+\subsection{TP size、PP size、DP size}
+\label{subsec:tp-pp-dp-size}
+
+选择 TP、PP、DP size 时，可以按以下顺序思考。
+
+\textbf{第一步：选择 TP size。}
+
+TP size 主要受以下因素约束：
+
+\begin{itemize}
+\item hidden size 是否能整除 TP size；
+\item attention heads 是否能整除 TP size；
+\item GQA 中 kv heads 是否能合理切分；
+\item TP group 是否能放进节点内高速互联；
+\item 单层矩阵是否太大，需要更多 TP；
+\item TP 后 GEMM 是否仍然足够大。
+\end{itemize}
+
+常见策略是 TP size 选择节点内 GPU 数的因子，例如 2、4、8。对于 8 卡 NVSwitch 节点，TP=8 是常见上限。若 TP 跨节点，需要非常谨慎。
+
+\textbf{第二步：选择 PP size。}
+
+PP size 主要受以下因素约束：
+
+\begin{itemize}
+\item 模型层数 $L$ 是否能较均匀切分；
+\item 每个 stage 的参数和激活显存是否放得下；
+\item PP bubble 是否可接受；
+\item micro-batch 数是否足够大；
+\item stage 间通信是否会跨慢链路；
+\item embedding/lm head 是否造成首尾 stage 不均。
+\end{itemize}
+
+一般来说，PP size 越大，每个 stage 层数越少，显存越省；但 bubble 和调度复杂度越高。PP size 也不宜超过层数的合理切分粒度。
+
+\textbf{第三步：由总 GPU 数反推 DP size。}
+
+当 $P_{\mathrm{TP}}$ 和 $P_{\mathrm{PP}}$ 确定后：
+
+[
+P_{\mathrm{DP}}
+===============
+
+\frac{W}{P_{\mathrm{TP}}P_{\mathrm{PP}}}.
+]
+
+DP size 决定可并行处理多少数据副本，也影响 global batch 和梯度同步规模。若 DP size 太小，global batch 可能不足或训练吞吐不足；若 DP size 太大，在固定 global batch 下 micro-batch 数可能太小，pipeline bubble 上升。
+
+\subsection{从 GPU 数量反推并行配置}
+\label{subsec:derive-parallel-config-from-gpu-count}
+
+下面给出一个配置推导流程。假设：
+
+\begin{itemize}
+\item 总 GPU 数 $W=256$；
+\item 每节点 8 张 GPU；
+\item 模型有 $L=80$ 层；
+\item hidden size $H=8192$；
+\item attention heads $n_h=64$；
+\item 目标 global batch size $B_{\mathrm{global}}=1024$；
+\item 序列长度 $S=4096$；
+\item 初始设 micro-batch size $B_{\mathrm{micro}}=1$。
+\end{itemize}
+
+\textbf{候选配置 A：}
+
+[
+P_{\mathrm{TP}}=8,\quad
+P_{\mathrm{PP}}=4.
+]
+
+则：
+
+[
+P_{\mathrm{DP}}
+===============
+
+# \frac{256}{8\times 4}
+
+8.
+
+]
+
+Gradient accumulation micro-batch 数为：
+
+[
+M
+=
+
+# \frac{1024}{1\times 8}
+
+128.
+
+]
+
+Pipeline efficiency 近似为：
+
+[
+\eta_{\mathrm{pipe}}
+====================
+
+# \frac{128}{128+4-1}
+
+\frac{128}{131}
+\approx 97.7%.
+]
+
+这个配置 pipeline bubble 很低。TP=8 可放在每个节点内；PP=4 意味着一个 DP replica 需要：
+
+[
+8\times 4=32
+]
+
+张 GPU，也就是 4 个节点。总共 256 GPU 可形成 8 个 DP replicas。
+
+\textbf{候选配置 B：}
+
+[
+P_{\mathrm{TP}}=4,\quad
+P_{\mathrm{PP}}=8.
+]
+
+则：
+
+[
+P_{\mathrm{DP}}
+===============
+
+# \frac{256}{4\times 8}
+
+8.
+
+]
+
+Micro-batch 数仍为：
+
+[
+M=128.
+]
+
+Pipeline efficiency：
+
+[
+\eta_{\mathrm{pipe}}
+====================
+
+# \frac{128}{128+8-1}
+
+\frac{128}{135}
+\approx 94.8%.
+]
+
+这个配置 TP 通信更少，单个 TP group 只用 4 张 GPU；PP 更深，每个 stage 层数约 $10$。如果显存允许，这可能比 TP=8 更好，因为 GEMM 更大、TP 通信更少。但 PP stage 间通信和调度稍多。
+
+\textbf{候选配置 C：}
+
+[
+P_{\mathrm{TP}}=8,\quad
+P_{\mathrm{PP}}=8.
+]
+
+则：
+
+[
+P_{\mathrm{DP}}
+===============
+
+# \frac{256}{8\times 8}
+
+4.
+
+]
+
+Micro-batch 数：
+
+[
+M
+=
+
+# \frac{1024}{1\times 4}
+
+256.
+
+]
+
+Pipeline efficiency：
+
+[
+\eta_{\mathrm{pipe}}
+====================
+
+# \frac{256}{256+8-1}
+
+\frac{256}{263}
+\approx 97.3%.
+]
+
+这个配置显存更省，但每个 DP replica 需要 64 GPU，只有 4 个 DP replicas。它适合模型更大、显存更紧的情况，但 TP 和 PP 都较高，通信和调度复杂度更大。
+
+下面给出一个枚举候选配置的脚本。
+
+\begin{lstlisting}[language=Python,caption={从 GPU 数量枚举 3D 并行候选配置},label={lst:enumerate-3d-configs}]
+def divisors(n):
+return [x for x in range(1, n + 1) if n % x == 0]
+
+def enumerate_3d_configs(
+world_size,
+gpus_per_node,
+num_layers,
+num_heads,
+hidden_size,
+global_batch_size,
+micro_batch_size,
+preferred_tp_values=(1, 2, 4, 8),
+):
+configs = []
+
+```
+for tp in preferred_tp_values:
+    if world_size % tp != 0:
+        continue
+    if num_heads % tp != 0:
+        continue
+    if hidden_size % tp != 0:
+        continue
+
+    # Prefer TP within a node.
+    if tp > gpus_per_node:
+        continue
+
+    remaining = world_size // tp
+
+    for pp in divisors(remaining):
+        if num_layers % pp != 0:
+            continue
+
+        dp = remaining // pp
+        if dp <= 0:
+            continue
+
+        denom = micro_batch_size * dp
+        if global_batch_size % denom != 0:
+            continue
+
+        microbatches = global_batch_size // denom
+        pipe_eff = microbatches / (microbatches + pp - 1)
+
+        configs.append({
+            "tp": tp,
+            "pp": pp,
+            "dp": dp,
+            "microbatches": microbatches,
+            "layers_per_stage": num_layers // pp,
+            "pipeline_efficiency": pipe_eff,
+            "gpus_per_replica": tp * pp,
+        })
+
+# Sort by high pipeline efficiency, then smaller TP/PP complexity.
+configs.sort(
+    key=lambda c: (
+        -c["pipeline_efficiency"],
+        c["tp"] * c["pp"],
+        c["pp"],
+    )
+)
+return configs
+```
+
+configs = enumerate_3d_configs(
+world_size=256,
+gpus_per_node=8,
+num_layers=80,
+num_heads=64,
+hidden_size=8192,
+global_batch_size=1024,
+micro_batch_size=1,
+)
+
+for cfg in configs[:10]:
+print(cfg)
+\end{lstlisting}
+
+这个脚本只做基本整除和 pipeline efficiency 检查。真实系统还需要把显存估算、通信估算、节点拓扑、ZeRO stage、checkpoint 策略和训练 recipe 一起纳入搜索。
+
+\section{故障恢复与 checkpoint}
+\label{sec:fault-tolerance-and-checkpoint}
+
+大模型训练通常持续数天、数周甚至更久。随着 GPU 数量增加，故障概率也会增加。假设单个节点在训练期间发生故障的概率为 $p$，节点数为 $N_{\mathrm{nodes}}$，整个作业无故障概率近似为：
+
+[
+(1-p)^{N_{\mathrm{nodes}}}.
+]
+
+当节点数很大时，即使单节点故障概率很低，整个作业也很可能遇到故障。因此，大规模训练系统必须具备 checkpoint 和恢复能力。
+
+Checkpoint 不只是保存模型权重。一个完整训练 checkpoint 通常包括：
+
+\begin{itemize}
+\item 模型参数；
+\item 优化器状态；
+\item 梯度缩放器状态；
+\item 学习率 scheduler 状态；
+\item global step；
+\item consumed samples 或 consumed tokens；
+\item tokenizer 和数据状态；
+\item RNG states；
+\item 并行配置和 rank mapping；
+\item ZeRO/FSDP/TP/PP shard metadata；
+\item dataloader 或 dataset cursor；
+\item 训练配置文件与代码版本信息。
+\end{itemize}
+
+如果少保存其中某些状态，训练可能“能恢复”，但不是严格恢复。比如 scheduler step 错了，学习率会跳；consumed tokens 错了，数据会重复或跳过；RNG state 错了，dropout 和数据 shuffle 不一致；rank mapping metadata 错了，sharded 权重可能加载到错误 rank。
+
+\subsection{distributed checkpoint}
+\label{subsec:distributed-checkpoint}
+
+单机小模型常由 rank 0 保存完整 checkpoint。但 3D 并行训练中，这通常不可行。原因包括：
+
+\begin{itemize}
+\item 单个 rank 不一定拥有完整模型；
+\item TP/PP/ZeRO/FSDP 后参数和优化器状态是分片的；
+\item checkpoint 体积可能达到 TB 级；
+\item rank 0 聚合完整状态会造成显存和内存峰值；
+\item 单点写入会造成 IO 瓶颈；
+\item 恢复时重新广播完整状态代价巨大。
+\end{itemize}
+
+Distributed checkpoint 的思想是：每个 rank 或每组 rank 保存自己负责的 shard，形成一个分布式 checkpoint 目录。目录中包含：
+
+\begin{itemize}
+\item 每个 shard 的数据文件；
+\item 描述全局张量如何切分的 metadata；
+\item rank 到 shard 的映射；
+\item tensor 名称、shape、dtype、offset；
+\item 训练状态元数据。
+\end{itemize}
+
+恢复时，每个 rank 根据当前并行配置和 metadata 读取自己需要的 shard。如果恢复配置与保存配置相同，读取较简单；如果 TP/PP/DP size 改变，则需要做 resharding。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+rank/.style={draw, rounded corners=3pt, minimum width=1.45cm, minimum height=0.65cm, align=center, fill=blue!6},
+file/.style={draw, rounded corners=2pt, minimum width=1.35cm, minimum height=0.5cm, align=center, fill=orange!14},
+meta/.style={draw, rounded corners=3pt, minimum width=2.2cm, minimum height=0.65cm, align=center, fill=green!10},
+arrow/.style={-{Latex[length=2.1mm]}, thick}
+]
+
+```
+\node[font=\bfseries] at (0,3.35) {分布式 Checkpoint：每个 rank 保存自己的 shard};
+
+\foreach \i/\x in {0/-4.8,1/-2.4,2/0,3/2.4,4/4.8} {
+  \node[rank] (r\i) at (\x,1.55) {Rank \i};
+  \node[file] (f\i) at (\x,0.45) {shard \i};
+  \draw[arrow] (r\i) -- (f\i);
+}
+
+\node[meta] (meta) at (0,-0.8) {metadata.json\\tensor layout};
+\foreach \i in {0,1,2,3,4} {
+  \draw[arrow] (f\i) -- (meta);
+}
+
+\node[align=left, text width=10.6cm] at (0,-2.25) {
+  分布式 checkpoint 不聚合到单个 rank，而是保存 shard 与 metadata。
+  metadata 描述每个全局张量如何被 TP、PP、DP、ZeRO 等维度切分。
+};
+```
+
+\end{tikzpicture}
+\caption{分布式 checkpoint 保存流程}
+\label{fig:distributed-checkpoint-flow}
+\end{figure}
+
+\subsection{sharded checkpoint}
+\label{subsec:sharded-checkpoint}
+
+Sharded checkpoint 是分布式训练中的常见格式。以一个线性层权重为例：
+
+[
+\mat{W}\in\mathbb{R}^{H_{\mathrm{in}}\times H_{\mathrm{out}}}.
+]
+
+如果它在 TP 维做 column parallel，rank $t$ 保存：
+
+[
+\mat{W}_t
+=========
+
+\mat{W}*{:,\ t\frac{H*{\mathrm{out}}}{P_{\mathrm{TP}}}:(t+1)\frac{H_{\mathrm{out}}}{P_{\mathrm{TP}}}}.
+]
+
+Checkpoint metadata 需要记录：
+
+\begin{itemize}
+\item tensor name；
+\item global shape；
+\item shard shape；
+\item shard offset；
+\item dtype；
+\item parallel dimension；
+\item owning rank；
+\item file path。
+\end{itemize}
+
+一个简化 metadata 可以写成：
+
+\begin{lstlisting}[language=Python,caption={Sharded checkpoint metadata 的简化示意},label={lst:sharded-checkpoint-metadata}]
+metadata = {
+"global_step": 120000,
+"consumed_tokens": 503316480000,
+"parallel_config": {
+"tp_size": 8,
+"pp_size": 4,
+"dp_size": 8,
+"zero_stage": 1,
+},
+"tensors": {
+"layers.0.attention.qkv.weight": [
+{
+"rank": 0,
+"global_shape": [8192, 24576],
+"local_shape": [8192, 3072],
+"offset": [0, 0],
+"dtype": "bfloat16",
+"file": "rank_00000_model.pt",
+},
+{
+"rank": 1,
+"global_shape": [8192, 24576],
+"local_shape": [8192, 3072],
+"offset": [0, 3072],
+"dtype": "bfloat16",
+"file": "rank_00001_model.pt",
+},
+]
+}
+}
+\end{lstlisting}
+
+如果后续想把 TP size 从 8 改为 4，需要把原来的 8 个 column shards 重新拼接再切成 4 个 shards。这就是 checkpoint resharding。它要求 metadata 足够完整，否则无法安全转换。
+
+Sharded checkpoint 的优点是：
+
+\begin{itemize}
+\item 保存时无需聚合完整模型；
+\item 每个 rank 并行写入，IO 吞吐更高；
+\item 与 ZeRO/FSDP/TP/PP 的分片状态自然匹配；
+\item 大模型 checkpoint 可扩展到 TB 级。
+\end{itemize}
+
+缺点是：
+
+\begin{itemize}
+\item 文件数量多；
+\item metadata 更复杂；
+\item resharding 困难；
+\item 部分 shard 损坏会影响整体恢复；
+\item 需要与对象存储或并行文件系统良好配合。
+\end{itemize}
+
+\subsection{optimizer state checkpoint}
+\label{subsec:optimizer-state-checkpoint}
+
+仅保存模型参数不足以恢复训练。AdamW 的优化器状态包括：
+
+[
+m_t,\quad v_t,\quad \theta_{\mathrm{master}}.
+]
+
+如果不保存这些状态，只用模型权重恢复，等价于重新初始化优化器。训练可能继续下降，但 loss 曲线、收敛路径和最终结果都会改变。
+
+优化器状态 checkpoint 的挑战是体积大。对于 AdamW，优化器状态通常比参数本身大得多。若模型参数为 $N$，优化器状态可能为：
+
+[
+12N\ \mathrm{bytes}
+]
+
+甚至更多，取决于是否保存 master weight、dtype 和 ZeRO stage。对于 70B 模型，优化器状态可以达到数百 GB 甚至更高。
+
+使用 ZeRO 或 FSDP 时，优化器状态通常在 DP 维切分。Checkpoint 时每个 DP rank 只保存自己负责的 optimizer shard。恢复时必须保证：
+
+[
+\text{optimizer shard}
+\leftrightarrow
+\text{parameter shard}
+]
+
+正确对应。如果参数 resharding 了，优化器状态也要同步 reshard，否则会出现状态错配。
+
+下面给出一个简化的 checkpoint 保存流程。
+
+\begin{lstlisting}[language=Python,caption={保存模型与优化器 shard 的简化伪代码},label={lst:save-sharded-checkpoint-pseudocode}]
+def save_sharded_checkpoint(
+model,
+optimizer,
+scheduler,
+step,
+consumed_tokens,
+rank,
+checkpoint_dir,
+parallel_context,
+):
+# Each rank saves only local shards.
+model_state = collect_local_model_shards(model)
+optim_state = collect_local_optimizer_shards(optimizer)
+
+```
+rank_state = {
+    "model": model_state,
+    "optimizer": optim_state,
+    "scheduler": scheduler.state_dict(),
+    "step": step,
+    "consumed_tokens": consumed_tokens,
+    "rng_state": get_rng_state(),
+    "parallel_context": parallel_context.local_metadata(),
+}
+
+path = f"{checkpoint_dir}/rank_{rank:05d}.pt"
+torch.save(rank_state, path)
+
+# Rank 0 writes global metadata after all ranks finish writing shards.
+torch.distributed.barrier()
+
+if rank == 0:
+    metadata = build_global_checkpoint_metadata(
+        model=model,
+        optimizer=optimizer,
+        step=step,
+        consumed_tokens=consumed_tokens,
+        parallel_context=parallel_context,
+    )
+    write_json(metadata, f"{checkpoint_dir}/metadata.json")
+
+torch.distributed.barrier()
+```
+
+\end{lstlisting}
+
+真实 checkpoint 系统还需要处理原子性。不能让训练在 metadata 写完但部分 shard 没写完时误认为 checkpoint 可用。常见做法是：
+
+\begin{itemize}
+\item 写入临时目录；
+\item 所有 rank 完成后写 success marker；
+\item 最后原子 rename 或更新 latest 指针；
+\item 恢复时只读取带完整 marker 的 checkpoint。
+\end{itemize}
+
+\subsection{checkpoint 与训练吞吐的冲突}
+\label{subsec:checkpoint-vs-throughput}
+
+Checkpoint 会中断或拖慢训练。设每隔 $K$ steps 保存一次 checkpoint，每次 checkpoint 花费 $T_{\mathrm{ckpt}}$，训练 step time 为 $T_{\mathrm{step}}$，则摊销开销为：
+
+[
+\rho_{\mathrm{ckpt}}
+====================
+
+\frac{T_{\mathrm{ckpt}}}{KT_{\mathrm{step}}}.
+]
+
+如果每 1000 steps 保存一次，每步 2 秒，checkpoint 花 10 分钟：
+
+[
+\rho_{\mathrm{ckpt}}
+====================
+
+# \frac{600}{1000\times 2}
+
+30%.
+]
+
+这非常高。为了降低影响，可以：
+
+\begin{itemize}
+\item 降低 checkpoint 频率；
+\item 使用异步 checkpoint；
+\item 使用分布式并行写入；
+\item 只保存必要状态，减少临时 checkpoint 体积；
+\item 周期性保存 full checkpoint，期间保存 lightweight checkpoint；
+\item 使用高吞吐并行文件系统或对象存储；
+\item 将 checkpoint 写入与训练计算 overlap。
+\end{itemize}
+
+但 checkpoint 频率不能无限降低。故障后需要回退到最近 checkpoint。如果 checkpoint 间隔太长，一次故障会损失大量 GPU 时间。设平均故障间隔为 MTBF，checkpoint 间隔为 $K T_{\mathrm{step}}$，每次故障平均损失约为半个 checkpoint 间隔：
+
+[
+T_{\mathrm{lost}}
+\approx
+\frac{1}{2}K T_{\mathrm{step}}.
+]
+
+因此 checkpoint 策略需要在吞吐开销和故障损失之间平衡。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+axis/.style={-{Latex[length=2.1mm]}, thick},
+train/.style={draw, rounded corners=2pt, minimum width=1.0cm, minimum height=0.45cm, align=center, fill=blue!12},
+ckpt/.style={draw, rounded corners=2pt, minimum width=0.75cm, minimum height=0.45cm, align=center, fill=orange!16},
+fail/.style={draw, star, star points=5, minimum size=0.8cm, fill=red!20}
+]
+
+```
+\node[font=\bfseries] at (0,3.1) {Checkpoint 间隔与故障回退成本};
+
+\draw[axis] (-5.5,1.2) -- (5.5,1.2) node[right] {time};
+
+\foreach \i/\x in {0/-4.5,1/-3.3,2/-2.1,3/-0.9,4/0.3,5/1.5,6/2.7,7/3.9} {
+  \node[train] at (\x,1.2) {train};
+}
+
+\foreach \x in {-5.1,-1.5,2.1} {
+  \node[ckpt] at (\x,2.0) {ckpt};
+  \draw[dashed] (\x,1.55) -- (\x,1.2);
+}
+
+\node[fail] at (4.2,1.95) {};
+\node[align=center] at (4.2,2.65) {failure};
+
+\draw[red!70, thick, <->] (2.1,0.45) -- (4.2,0.45);
+\node[red!70, align=center] at (3.15,0.05) {lost work\\since last checkpoint};
+
+\node[align=left, text width=10.5cm] at (0,-1.35) {
+  checkpoint 太频繁会降低吞吐；太稀疏会在故障后损失更多训练时间。
+  大规模训练必须根据故障率、checkpoint 时长和训练成本选择合适间隔。
+};
+```
+
+\end{tikzpicture}
+\caption{checkpoint 间隔与故障恢复损失}
+\label{fig:checkpoint-interval-failure-cost}
+\end{figure}
+
+\section{3D 并行配置实战检查清单}
+\label{sec:3d-parallel-config-checklist}
+
+为了把本章内容落到工程实践，下面给出一个 3D 并行配置检查清单。
+
+\subsection{模型结构检查}
+\label{subsec:model-structure-checklist}
+
+配置前需要确认：
+
+\begin{itemize}
+\item hidden size 是否能整除 TP size；
+\item attention heads 是否能整除 TP size；
+\item kv heads 是否能整除 TP size 或支持对应 GQA 切分；
+\item FFN intermediate size 是否能整除 TP size；
+\item vocabulary size 是否需要 padding 到 TP 友好的倍数；
+\item layer 数是否能被 PP size 合理切分；
+\item embedding/lm head 是否共享权重；
+\item 是否有 MoE 层，expert 数是否能与 expert parallel 匹配；
+\item 是否使用 sequence parallel；
+\item 是否使用 activation checkpointing。
+\end{itemize}
+
+\subsection{硬件拓扑检查}
+\label{subsec:hardware-topology-checklist}
+
+需要确认：
+
+\begin{itemize}
+\item 每节点 GPU 数；
+\item 节点内 NVLink/NVSwitch/PCIe 拓扑；
+\item 每节点 NIC 数；
+\item GPU 到 NIC 的亲和性；
+\item 跨节点网络带宽；
+\item 是否多 rail；
+\item rank mapping 是否让 TP group 尽量节点内；
+\item PP 相邻 stage 是否落在合理网络距离；
+\item DP group 是否均匀分布；
+\item NCCL 是否识别正确拓扑。
+\end{itemize}
+
+\subsection{训练配置检查}
+\label{subsec:training-config-checklist}
+
+需要确认：
+
+\begin{itemize}
+\item $W=P_{\mathrm{DP}}P_{\mathrm{TP}}P_{\mathrm{PP}}$；
+\item $B_{\mathrm{global}}=B_{\mathrm{micro}}MP_{\mathrm{DP}}$；
+\item $M$ 是否足够大以降低 pipeline bubble；
+\item micro-batch size 是否能放入显存；
+\item global batch 是否符合训练 recipe；
+\item 学习率是否按 global batch 调整；
+\item warmup steps 是否按 token 或 step 正确设置；
+\item gradient clipping 是否在正确维度上执行；
+\item mixed precision 与 loss scaling 是否配置正确；
+\item activation checkpointing 粒度是否合理。
+\end{itemize}
+
+\subsection{运行时检查}
+\label{subsec:runtime-checklist}
+
+训练启动后，需要观察：
+
+\begin{itemize}
+\item 每张 GPU 显存峰值是否有余量；
+\item 每个 rank step time 是否一致；
+\item pipeline stage 是否负载均衡；
+\item TP collective 是否占比过高；
+\item DP gradient sync 是否被 backward 隐藏；
+\item PP send/recv 是否出现等待；
+\item dataloader 是否阻塞；
+\item loss 是否稳定下降；
+\item gradient norm 是否异常；
+\item 是否出现 NaN/inf；
+\item checkpoint 是否成功写入并可恢复；
+\item tokens per second 和 MFU 是否达到预期。
+\end{itemize}
+
+\section{本章小结}
+\label{sec:chapter10-summary}
+
+本章把数据并行、张量并行和流水线并行组合起来，系统介绍了 3D 并行策略。
+
+\begin{itemize}
+\item \textbf{3D 并行} 将 DP、TP、PP 三个维度正交组合，总 GPU 数满足 $W=P_{\mathrm{DP}}P_{\mathrm{TP}}P_{\mathrm{PP}}$。
+\item \textbf{DP 切分数据}，不同副本处理不同 batch 分片，并同步梯度或分片状态。
+\item \textbf{TP 切分层内张量}，例如 attention heads、QKV projection、FFN 中间维度，通信频率最高，通常应限制在节点内高速互联范围。
+\item \textbf{PP 切分模型层}，不同 stages 负责不同层段，通过 micro-batches 填充流水线，通信主要是相邻 stage 的 activation send/recv。
+\item \textbf{group 划分} 是 3D 并行的实现基础。每个 rank 同时属于 TP group、PP group 和 DP group。
+\item \textbf{rank mapping} 直接影响通信路径。高频通信的 group 应优先映射到更近、更快的物理拓扑。
+\item \textbf{显存估算} 需要同时考虑参数、梯度、优化器状态、激活和 buffer，并区分哪些状态被 TP/PP/DP/ZeRO 切分。
+\item \textbf{通信估算} 需要分开看 DP、TP、PP：DP 主要同步梯度，TP 高频层内 collective，PP 传递 stage 边界激活。
+\item \textbf{计算效率} 受 GEMM shape、pipeline bubble、通信重叠、数据加载、checkpoint 和 straggler 影响，MFU 是重要观察指标。
+\item \textbf{训练配置推导} 要满足 global batch、micro-batch、gradient accumulation、TP/PP/DP 整除关系和硬件拓扑约束。
+\item \textbf{Distributed checkpoint} 是大规模训练可靠性的核心。checkpoint 需要保存模型、优化器、scheduler、RNG、consumed tokens、parallel metadata 和 shard layout。
+\item \textbf{Checkpoint 策略} 需要在训练吞吐和故障回退成本之间平衡。频率太高会拖慢训练，频率太低会在故障后损失大量工作。
+\end{itemize}
+
+至此，我们已经建立了大模型训练最核心的并行框架：DP 解决数据扩展，TP 解决层内矩阵过大，PP 解决层数和整体模型过大，3D 并行则把三者组合为可扩展的训练系统。下一章将进入 ZeRO 优化器与 DeepSpeed，进一步分析如何在数据并行维度切分 optimizer state、gradient 和 parameter，从而显著降低每卡显存占用，并理解 ZeRO Stage 1、Stage 2、Stage 3 的通信与显存权衡。

@@ -1,0 +1,903 @@
+\chapter{GPU 架构底座}
+\label{chap:gpu-architecture}
+
+在前面的章节中，我们已经从模型结构、分布式训练、推理服务和调度系统的角度理解了 AI Infrastructure 的核心问题：模型越来越大，序列越来越长，请求越来越多，而系统仍然必须在有限的硬件资源上完成训练与推理。到了第五篇，我们开始进入 AI Infra 的物理世界：GPU、显存、互联网络、RDMA、Kubernetes 调度，以及这些底层资源如何共同决定一个大模型系统的上限。
+
+本章讨论 GPU 架构底座。这里的“底座”并不是指某一种具体型号的 GPU，而是指现代 AI GPU 反复出现的一组基础结构：SM、CUDA Core、Tensor Core、Register File、Shared Memory、L1/L2 Cache、HBM，以及围绕它们建立起来的性能分析方法。对于 AI Infra 工程师来说，理解 GPU 架构的目标不是记住某张产品规格表，而是能够回答下面这些工程问题：
+
+\begin{itemize}
+  \item 为什么同样是矩阵乘法，某些 kernel 可以接近峰值吞吐，而某些 kernel 只有很低利用率？
+  \item 为什么 decode 阶段的 LLM 推理经常是 memory-bound，而训练中的大 GEMM 更容易是 compute-bound？
+  \item 为什么 batch size、sequence length、hidden size、head dimension 的改变会影响 GPU 利用率？
+  \item 为什么有些优化需要减少 HBM 读写，而不是减少理论 FLOPs？
+  \item 当 profiler 显示 occupancy 不高、memory throughput 不高、SM efficiency 也不高时，应该从哪里开始排查？
+\end{itemize}
+
+如果说前几章讨论的是“模型如何被切分、调度和服务”，那么本章讨论的是“每一次矩阵乘法、每一次 attention、每一次归约最终如何落到 GPU 硬件上”。这也是后续理解 NVLink、NVSwitch、RDMA 与 AI 集群调度的前置知识。
+
+\section{GPU 硬件结构总览}
+\label{sec:gpu-hardware-overview}
+
+GPU 的设计目标与 CPU 明显不同。CPU 强调低延迟、复杂控制流、强大的分支预测和较大的缓存层级；GPU 强调高吞吐、海量线程、数据并行以及对大规模向量和矩阵运算的持续供给。对深度学习来说，GPU 的价值并不只在于“核心多”，而在于它把大量算术单元、寄存器、片上 SRAM、显存带宽和矩阵专用计算单元组织成了适合张量计算的执行机器。
+
+从抽象上看，一个现代数据中心 GPU 可以被分成几个层级：
+
+\begin{enumerate}
+  \item GPU 芯片整体，包含多个 GPC、TPC 或类似的高层组织单元，不同架构命名不同；
+  \item 多个 SM，即 Streaming Multiprocessor，是 CUDA 程序最重要的执行单元；
+  \item SM 内部包含 warp scheduler、dispatch unit、CUDA Core、Tensor Core、Load/Store Unit、Special Function Unit、Register File、Shared Memory / L1 Cache 等；
+  \item 多个 SM 共享更大的 L2 Cache；
+  \item GPU 通过显存控制器访问 HBM；
+  \item GPU 通过 PCIe、NVLink 等互联接口与 CPU、其他 GPU 或网络设备交互。
+\end{enumerate}
+
+对于本书的目标读者来说，最重要的不是画出某一代 GPU 的精确芯片平面图，而是建立一个稳定的 mental model：一个 CUDA kernel 启动后，线程块被调度到 SM；线程块中的线程被组织成 warp；warp 中的指令由 SM 内部的调度器发射到不同执行单元；数据在 register、shared memory、L2 cache 和 HBM 之间移动；性能最终受计算吞吐、内存带宽、访存模式、并行度、同步开销与指令调度共同影响。
+
+\begin{figure}[H]
+  \centering
+  \begin{tikzpicture}[
+    font=\small,
+    node distance=0.8cm,
+    box/.style={draw, rounded corners, minimum width=2.6cm, minimum height=0.9cm, align=center},
+    smallbox/.style={draw, rounded corners, minimum width=2.2cm, minimum height=0.75cm, align=center},
+    arrow/.style={-{Stealth[length=2mm]}, thick}
+  ]
+    \node[box, minimum width=12cm, minimum height=7.3cm] (gpu) {};
+    \node[anchor=north west] at ($(gpu.north west)+(0.2,-0.2)$) {GPU Device};
+
+    \node[box, minimum width=8.5cm, minimum height=4.6cm, anchor=north] (sms) at ($(gpu.north)+(0,-0.8)$) {};
+    \node[anchor=north west] at ($(sms.north west)+(0.2,-0.2)$) {多个 SM};
+
+    \node[smallbox] (sm0) at ($(sms.center)+(-2.8,0.9)$) {SM 0};
+    \node[smallbox] (sm1) at ($(sms.center)+(0,0.9)$) {SM 1};
+    \node[smallbox] (sm2) at ($(sms.center)+(2.8,0.9)$) {SM 2};
+
+    \node[smallbox] (sm3) at ($(sms.center)+(-2.8,-0.9)$) {SM 3};
+    \node[smallbox] (sm4) at ($(sms.center)+(0,-0.9)$) {SM 4};
+    \node[smallbox] (smn) at ($(sms.center)+(2.8,-0.9)$) {$\cdots$};
+
+    \node[box, minimum width=9.2cm] (l2) at ($(gpu.south)+(0,2.0)$) {L2 Cache};
+    \node[box, minimum width=9.2cm] (hbm) at ($(gpu.south)+(0,0.8)$) {HBM / Global Memory};
+
+    \draw[arrow] (sms.south) -- (l2.north);
+    \draw[arrow] (l2.south) -- (hbm.north);
+
+    \node[box, minimum width=2.4cm] (pcie) at ($(gpu.east)+(-1.7,-1.0)$) {PCIe /\\NVLink};
+    \draw[arrow] (hbm.east) -- (pcie.west);
+  \end{tikzpicture}
+  \caption{GPU 结构的工程抽象：多个 SM 共享 L2 Cache，并通过显存控制器访问 HBM。}
+  \label{fig:gpu-device-overview}
+\end{figure}
+
+\subsection{SM：GPU 的基本执行单元}
+\label{subsec:sm}
+
+SM 是 Streaming Multiprocessor 的缩写。对 CUDA 程序而言，SM 可以理解为“真正执行线程块的地方”。当我们启动一个 kernel 时，会指定 grid 和 block 的形状。一个 grid 中包含多个 block，每个 block 被分配到某一个 SM 上执行。一个 SM 可以同时驻留多个 block，前提是这些 block 所需的线程数、寄存器数量、shared memory 数量和硬件限制允许。
+
+SM 内部并不是一个简单的大核心，而是一组协同工作的子单元。典型结构包括：
+
+\begin{itemize}
+  \item \textbf{Warp Scheduler}：负责选择就绪的 warp，并将指令发射出去。
+  \item \textbf{CUDA Core}：执行标量或向量化的整数、浮点运算，是传统 CUDA 计算的主要执行单元。
+  \item \textbf{Tensor Core}：执行矩阵乘加相关指令，是深度学习训练与推理的关键硬件。
+  \item \textbf{Load/Store Unit}：负责访存指令，包括从 global memory、shared memory、local memory 等位置读写数据。
+  \item \textbf{Special Function Unit}：负责某些特殊函数或近似函数，例如指数、倒数、三角函数等，具体能力取决于架构。
+  \item \textbf{Register File}：每个线程最常用、最快的私有存储空间。
+  \item \textbf{Shared Memory / L1 Cache}：线程块内共享的片上存储空间，常用于 tiling、数据复用和访存合并。
+\end{itemize}
+
+从软件角度看，SM 的核心特征是“大量 warp 的交错执行”。一个 warp 遇到 global memory load 时，可能需要较长时间才能拿到数据。GPU 并不会像 CPU 那样主要依赖复杂的乱序执行和大缓存来隐藏延迟，而是切换到其他就绪 warp 执行。只要 SM 上有足够多的活跃 warp，访存延迟就可能被隐藏。
+
+这也是 occupancy 概念的来源。Occupancy 通常表示一个 SM 上实际活跃 warp 数量与理论最大活跃 warp 数量的比例。高 occupancy 有助于隐藏延迟，但并不等于高性能。对于一些高度优化的 GEMM kernel，单个线程块可能使用大量 register 和 shared memory，导致 occupancy 不高，但每个 warp 的计算效率和数据复用非常好，最终仍然可以获得高吞吐。反过来，一个 occupancy 很高的 kernel 如果访存完全不合并、指令依赖严重或共享内存 bank conflict 很多，性能仍可能很差。
+
+\begin{figure}[H]
+  \centering
+  \begin{tikzpicture}[
+    font=\small,
+    node distance=0.55cm,
+    box/.style={draw, rounded corners, minimum width=2.4cm, minimum height=0.72cm, align=center},
+    wide/.style={draw, rounded corners, minimum width=7.8cm, minimum height=0.75cm, align=center},
+    arrow/.style={-{Stealth[length=2mm]}, thick}
+  ]
+    \node[draw, rounded corners, minimum width=10.8cm, minimum height=7.2cm] (sm) {};
+    \node[anchor=north west] at ($(sm.north west)+(0.2,-0.2)$) {SM 内部抽象结构};
+
+    \node[wide] (scheduler) at ($(sm.north)+(0,-1.0)$) {Warp Scheduler / Dispatch};
+    \node[box] (cuda) at ($(scheduler.south)+(-3.2,-1.0)$) {CUDA Core};
+    \node[box] (tensor) at ($(scheduler.south)+(0,-1.0)$) {Tensor Core};
+    \node[box] (lsu) at ($(scheduler.south)+(3.2,-1.0)$) {Load / Store};
+
+    \node[box] (sfu) at ($(cuda.south)+(0,-1.0)$) {SFU};
+    \node[box] (reg) at ($(tensor.south)+(0,-1.0)$) {Register File};
+    \node[box] (shared) at ($(lsu.south)+(0,-1.0)$) {Shared Memory\\L1 Cache};
+
+    \node[wide] (l2) at ($(sm.south)+(0,0.75)$) {连接到 L2 Cache / HBM};
+
+    \draw[arrow] (scheduler.south) -- (cuda.north);
+    \draw[arrow] (scheduler.south) -- (tensor.north);
+    \draw[arrow] (scheduler.south) -- (lsu.north);
+    \draw[arrow] (cuda.south) -- (sfu.north);
+    \draw[arrow] (tensor.south) -- (reg.north);
+    \draw[arrow] (lsu.south) -- (shared.north);
+    \draw[arrow] (shared.south) -- (l2.north);
+  \end{tikzpicture}
+  \caption{SM 内部的抽象结构：调度器将 warp 指令发射到计算单元、访存单元和片上存储结构。}
+  \label{fig:sm-internal-abstract}
+\end{figure}
+
+\subsection{CUDA Core：通用并行计算单元}
+\label{subsec:cuda-core}
+
+CUDA Core 是 GPU 上执行常规算术指令的重要单元。早期深度学习训练中，大量矩阵乘法和卷积最终会被映射为 CUDA Core 上的浮点乘加运算。随着 Tensor Core 的出现，主流深度学习 GEMM 的峰值吞吐更多来自 Tensor Core，但 CUDA Core 仍然非常重要，因为并不是所有计算都能转化为规整的矩阵乘加。
+
+例如，下面这些操作常常依赖 CUDA Core、Load/Store Unit、SFU 或其他非 Tensor Core 路径：
+
+\begin{itemize}
+  \item LayerNorm / RMSNorm 中的均值、方差或平方和归约；
+  \item Softmax 中的 max、exp、sum、除法；
+  \item 采样中的 top-k、top-p、random sampling；
+  \item embedding lookup、position embedding、RoPE 变换；
+  \item 激活函数，如 GELU、SiLU、ReLU；
+  \item 各类 elementwise operator 和数据重排；
+  \item attention 中除矩阵乘法之外的 mask、scale、概率归一化和写回。
+\end{itemize}
+
+这意味着 AI Infra 工程师不能只关注 Tensor Core 峰值。一个 Transformer block 看似由大 GEMM 主导，但在小 batch、长序列、decode 或低精度推理场景中，非 GEMM 部分可能成为瓶颈。尤其在 LLM serving 中，每一步 decode 只生成一个 token，大 GEMM 的矩阵形状可能变得“瘦长”或 batch 太小，导致 Tensor Core 利用率下降，而访存、调度和小 kernel 启动开销变得突出。
+
+\subsection{Tensor Core：深度学习吞吐的关键}
+\label{subsec:tensor-core}
+
+Tensor Core 是为矩阵乘加设计的专用计算单元。深度学习中的大部分线性层、attention projection、FFN up/down projection、卷积、部分 batched GEMM 都可以映射到矩阵乘法：
+
+\[
+  \mat{C} = \mat{A}\mat{B} + \mat{C}.
+\]
+
+更底层地看，Tensor Core 通常执行的是小 tile 上的矩阵乘加。例如把一个大矩阵乘法拆成许多小的 $m \times n \times k$ tile，每个 tile 由 warp 或 warp group 协同执行。具体 tile 形状和支持的数据类型会随 GPU 架构变化，但抽象规律稳定：Tensor Core 通过一次指令完成一小块矩阵的乘加，并把结果累加到寄存器中的 accumulator。
+
+在 AI 训练和推理中，Tensor Core 的价值体现在三点：
+
+\begin{enumerate}
+  \item \textbf{提升矩阵乘法吞吐}：相比使用通用 CUDA Core 做逐元素乘加，Tensor Core 可以在单位周期内完成更多乘加操作。
+  \item \textbf{支持混合精度}：输入可以是 FP16、BF16、TF32、FP8 或整数低精度格式，累加通常使用更高精度或专门设计的累加路径。
+  \item \textbf{推动软件栈重构}：cuBLAS、cuDNN、CUTLASS、Triton、PyTorch Inductor、FlashAttention 等优化都围绕 tile 化、数据复用和 Tensor Core 指令展开。
+\end{enumerate}
+
+不过 Tensor Core 并不会自动让所有算子变快。要有效利用 Tensor Core，矩阵形状、数据类型、内存布局、对齐方式、tile 大小和调度策略都必须合适。常见问题包括：
+
+\begin{itemize}
+  \item 矩阵维度太小，无法提供足够并行度；
+  \item $M$、$N$、$K$ 维度不符合高效 tile 的对齐习惯；
+  \item 输入数据类型无法走 Tensor Core 快路径；
+  \item 数据布局导致额外 transpose、copy 或不合并访存；
+  \item kernel 被内存带宽限制，即使 Tensor Core 很快也吃不饱。
+\end{itemize}
+
+\subsection{Register File：最快但最稀缺的存储}
+\label{subsec:register-file}
+
+Register 是每个线程私有的最快存储空间。一个 CUDA kernel 中的局部变量、临时 accumulator、索引变量和部分编译器生成的中间值都会占用寄存器。寄存器访问速度极快，但数量有限。一个 kernel 如果每个线程使用过多寄存器，会降低每个 SM 能同时驻留的 warp 或 block 数量，从而降低 occupancy。
+
+寄存器压力是 GPU kernel 优化中的常见主题。比如在一个 tiled GEMM 中，每个线程可能需要在寄存器中维护多个 accumulator，用于保存当前 tile 的部分结果。accumulator 越多，计算复用越好，但寄存器占用越高。寄存器不够时，编译器可能将部分变量 spill 到 local memory。所谓 local memory 并不是片上本地存储，而通常位于 global memory 地址空间中，访问代价很高。一旦发生严重 register spilling，kernel 性能可能急剧下降。
+
+因此，在性能分析时，register 的关键问题不是“越多越好”或“越少越好”，而是平衡：
+
+\begin{itemize}
+  \item 寄存器多，可以保存更多中间结果，提高计算密度和数据复用；
+  \item 寄存器少，可以让更多 warp 同时驻留，提高延迟隐藏能力；
+  \item 一旦寄存器使用超过阈值导致 spilling，性能通常会明显恶化；
+  \item 不同 kernel 的最优点不同，必须结合 profiler 和实际输入 shape 判断。
+\end{itemize}
+
+\subsection{Shared Memory / L1 Cache：片上数据复用}
+\label{subsec:shared-memory-l1}
+
+Shared Memory 是线程块内共享的片上存储空间，延迟和带宽通常远优于 HBM。它最常见的用途是 tiling：把 global memory 中的一小块数据加载到 shared memory，然后让线程块内多个线程重复使用，从而减少 HBM 访问次数。
+
+以矩阵乘法为例，计算 $\mat{C} = \mat{A}\mat{B}$ 时，$\mat{A}$ 的一个 tile 会被多个输出元素复用，$\mat{B}$ 的一个 tile 也会被多个输出元素复用。如果每次乘加都直接从 HBM 读取 $\mat{A}$ 和 $\mat{B}$，带宽需求会非常高。更好的方法是：
+
+\begin{enumerate}
+  \item 线程块协同从 HBM 读取 $\mat{A}$ 和 $\mat{B}$ 的 tile；
+  \item 将 tile 放入 shared memory；
+  \item 线程从 shared memory 读取数据，在寄存器中累加；
+  \item 处理下一个 $K$ 方向 tile；
+  \item 最后将结果写回 HBM。
+\end{enumerate}
+
+Shared Memory 的优势来自可控性。L1 Cache 由硬件缓存策略控制，而 Shared Memory 由程序显式管理。高性能 GEMM、FlashAttention、卷积、归约等 kernel 都会利用 shared memory 组织数据复用。
+
+但是 shared memory 也有代价：
+
+\begin{itemize}
+  \item 容量有限，使用过多会降低每个 SM 可驻留 block 数；
+  \item 需要显式同步，例如 \texttt{\_\_syncthreads()}；
+  \item 访问模式不当会造成 bank conflict；
+  \item 复杂 tiling 增加代码复杂度和调试难度。
+\end{itemize}
+
+对 AI Infra 工程师而言，不一定要手写所有底层 kernel，但必须知道为什么 FlashAttention 这类算法强调“不要物化完整 attention matrix”，为什么 GEMM library 需要复杂的 tile scheduler，为什么长上下文 attention 的瓶颈常常不是数学公式本身，而是 Q、K、V、score、probability、output 在不同存储层级之间移动的方式。
+
+\subsection{HBM：大容量高带宽显存}
+\label{subsec:hbm}
+
+HBM 是现代数据中心 GPU 的主要显存。它提供高带宽和较大容量，承载模型参数、梯度、优化器状态、激活、KV Cache、临时 buffer 等。在 AI Infra 中，HBM 同时是“容量资源”和“带宽资源”。
+
+容量维度上，HBM 决定了单卡能放下多大的模型、batch、sequence length 和 KV Cache。训练阶段，一个参数可能对应参数本身、梯度、优化器一阶矩、二阶矩以及混合精度 master weight。推理阶段，模型权重通常占固定显存，而 KV Cache 随 batch size 和上下文长度增长。前面第 12 章讨论过 KV Cache 的显存估算，本章从硬件角度补充一点：即使 HBM 容量足够，如果 decode 阶段每生成一个 token 都要反复从 HBM 读取大量历史 K/V，那么 HBM 带宽也会成为限制。
+
+带宽维度上，HBM 决定了 memory-bound kernel 的上限。如果一个 kernel 每做少量计算就要读写大量数据，那么即使 Tensor Core 理论峰值很高，也无法发挥出来。典型例子包括：
+
+\begin{itemize}
+  \item embedding lookup：读取为主，计算很少；
+  \item LayerNorm / RMSNorm：多次读写和归约，算术强度有限；
+  \item decode attention：每个新 token 需要扫描历史 K/V；
+  \item 小 batch GEMM：计算规模不足，无法摊薄数据搬运开销；
+  \item 大量 elementwise kernel：每个元素只做一两次运算，却要读写 HBM。
+\end{itemize}
+
+因此，GPU 性能优化的一个重要原则是：不要只看 FLOPs，要看数据从哪里来、到哪里去、被复用了几次。很多“算法优化”本质上是“IO 优化”。
+
+\section{Tensor Core 与矩阵计算}
+\label{sec:tensor-core-matrix}
+
+深度学习工作负载的核心是矩阵计算。无论是 Transformer 中的 QKV projection、attention output projection、FFN 的 up projection 和 down projection，还是 MoE 中每个 expert 的 MLP，本质上都包含大量 GEMM。Tensor Core 的出现，使得 AI GPU 的峰值算力越来越依赖矩阵乘加硬件，而不是传统标量浮点单元。
+
+\subsection{MMA 指令}
+\label{subsec:mma}
+
+MMA 是 Matrix Multiply-Accumulate 的缩写，即矩阵乘加。抽象形式如下：
+
+\[
+  \mat{D} = \mat{A}\mat{B} + \mat{C}.
+\]
+
+其中 $\mat{A}$ 和 $\mat{B}$ 是输入 tile，$\mat{C}$ 是累加器中的旧值，$\mat{D}$ 是新的累加结果。在 GPU 的底层指令语义中，MMA 通常不是由单个线程独立完成，而是由一个 warp 或一组线程协同完成。每个线程持有 tile 的一部分 fragment，硬件将这些 fragment 送入 Tensor Core，完成小矩阵乘加，然后把结果分布式地返回给线程寄存器。
+
+这与普通 for-loop 形式的矩阵乘法有明显差异。普通写法可能是：
+
+\begin{lstlisting}[language=C++,caption={概念上的标量矩阵乘法},label={lst:scalar-gemm-concept}]
+for (int m = 0; m < M; ++m) {
+  for (int n = 0; n < N; ++n) {
+    float acc = 0.0f;
+    for (int k = 0; k < K; ++k) {
+      acc += A[m][k] * B[k][n];
+    }
+    C[m][n] = acc;
+  }
+}
+\end{lstlisting}
+
+而高性能 GPU GEMM 会把它重写为多层 tiling：
+
+\begin{itemize}
+  \item grid 层：不同 thread block 负责 $\mat{C}$ 的不同大 tile；
+  \item block 层：一个线程块协同加载 $\mat{A}$、$\mat{B}$ 的 tile；
+  \item warp 层：warp 负责更小的矩阵 tile；
+  \item instruction 层：MMA 指令在 Tensor Core 上执行小 tile 乘加；
+  \item register 层：每个线程保存 accumulator fragment。
+\end{itemize}
+
+\begin{figure}[H]
+  \centering
+  \begin{tikzpicture}[
+    font=\small,
+    cell/.style={draw, minimum width=0.48cm, minimum height=0.48cm},
+    arrow/.style={-{Stealth[length=2mm]}, thick},
+    labelnode/.style={align=center}
+  ]
+    \node[labelnode] at (-2.2,2.1) {$\mat{A}$ tile};
+    \foreach \i in {0,1,2,3} {
+      \foreach \j in {0,1,2,3} {
+        \node[cell] at (-3+\j*0.48,1.3-\i*0.48) {};
+      }
+    }
+
+    \node[labelnode] at (1.2,2.1) {$\mat{B}$ tile};
+    \foreach \i in {0,1,2,3} {
+      \foreach \j in {0,1,2,3} {
+        \node[cell] at (0.4+\j*0.48,1.3-\i*0.48) {};
+      }
+    }
+
+    \node[draw, rounded corners, minimum width=2.6cm, minimum height=1.2cm, align=center] (tc) at (-0.1,-1.0) {Tensor Core\\MMA};
+
+    \node[labelnode] at (3.7,2.1) {Accumulator\\fragment};
+    \foreach \i in {0,1,2,3} {
+      \foreach \j in {0,1,2,3} {
+        \node[cell] at (3+\j*0.48,1.3-\i*0.48) {};
+      }
+    }
+
+    \draw[arrow] (-2.05,-0.65) -- (tc.west);
+    \draw[arrow] (1.35,-0.65) -- (tc.east);
+    \draw[arrow] (tc.north east) -- (3.25,0.05);
+
+    \node[align=center] at (-0.1,-2.2) {小 tile 乘加：$\mat{D}_{tile} = \mat{A}_{tile}\mat{B}_{tile} + \mat{C}_{tile}$};
+  \end{tikzpicture}
+  \caption{Tensor Core tile 计算示意：大 GEMM 被拆成许多小 tile，每个 tile 通过 MMA 指令完成矩阵乘加。}
+  \label{fig:tensor-core-tile}
+\end{figure}
+
+\subsection{FP16、BF16、TF32 与 FP8}
+\label{subsec:precision-formats}
+
+AI GPU 支持多种数值格式。不同格式的目标不是单纯追求“精度越高越好”，而是在精度、吞吐、显存和带宽之间取得平衡。
+
+\begin{table}[H]
+  \centering
+  \caption{常见深度学习数值格式的工程取舍}
+  \label{tab:numeric-format-tradeoff}
+  \begin{tabular}{p{2.0cm}p{3.2cm}p{4.2cm}p{4.2cm}}
+    \toprule
+    格式 & 主要用途 & 优势 & 风险或限制 \\
+    \midrule
+    FP32 & 高精度训练、累加、调试基线 & 动态范围和精度较好，数值稳定 & 显存和带宽开销大，Tensor Core 快路径未必最高效 \\
+    TF32 & FP32 输入场景下的加速矩阵乘 & 兼顾 FP32 易用性与 Tensor Core 加速 & 精度低于完整 FP32，需关注数值敏感任务 \\
+    FP16 & 混合精度训练和推理 & 显存占用低，吞吐高 & 动态范围较小，可能需要 loss scaling \\
+    BF16 & 大模型训练常用格式 & 动态范围接近 FP32，训练稳定性好 & 有效尾数少于 FP16，某些细粒度数值误差更大 \\
+    FP8 & 新一代低精度训练和推理 & 显存和带宽进一步降低，吞吐潜力高 & 需要良好的 scaling、校准和框架支持 \\
+    INT8/INT4 & 推理量化 & 权重体积和带宽压力显著下降 & 精度损失、kernel 支持和量化策略复杂 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+训练中常见的 mixed precision 策略是：前向和反向的大矩阵乘法使用 FP16 或 BF16，部分归约和累加使用 FP32 或更高稳定性的路径，优化器状态根据框架和策略可能保留 FP32 或采用分片、低精度、offload 等方式。推理中则更加激进，常见策略包括 FP16/BF16 权重、INT8/INT4 weight-only quantization，以及部分场景下的 FP8 推理。
+
+从硬件映射角度看，数值格式影响三个方面：
+
+\begin{enumerate}
+  \item \textbf{Tensor Core 指令路径}：不同数据类型对应不同的 MMA 指令和吞吐上限。
+  \item \textbf{HBM 带宽需求}：同样元素数量下，低精度格式需要搬运的字节更少。
+  \item \textbf{寄存器和 shared memory 压力}：tile 中可容纳的元素数量、对齐方式和 fragment 布局会改变。
+\end{enumerate}
+
+需要强调的是，低精度不是免费的。以量化推理为例，INT4 权重可以显著减少 HBM 读取量，但计算前可能需要 dequantize；如果 dequantize 开销、数据重排开销或 kernel 不够优化，实际收益可能低于理论显存节省比例。这也是第 15 章中反复强调“量化技术必须与 kernel 实现结合”的原因。
+
+\subsection{Tile-based GEMM}
+\label{subsec:tile-based-gemm}
+
+Tile-based GEMM 是高性能矩阵乘法的核心思想。假设要计算：
+
+\[
+  \mat{C}_{M \times N} = \mat{A}_{M \times K}\mat{B}_{K \times N}.
+\]
+
+朴素矩阵乘法中，每个 $\mat{C}[m,n]$ 都要遍历 $K$ 维，重复读取 $\mat{A}$ 和 $\mat{B}$。如果直接从 HBM 读取，每个元素的复用很差。Tile-based GEMM 则把 $\mat{C}$ 分成多个二维 tile，每个 thread block 负责一个或多个 tile。对于每个 $\mat{C}$ tile，它沿 $K$ 方向分多轮读取 $\mat{A}$ tile 和 $\mat{B}$ tile，并在寄存器中累加结果。
+
+其性能优势来自三个层次的数据复用：
+
+\begin{itemize}
+  \item \textbf{HBM 到 shared memory 的复用}：一个 $\mat{A}$ tile 被同一线程块中的多个输出列复用，一个 $\mat{B}$ tile 被多个输出行复用；
+  \item \textbf{shared memory 到 register 的复用}：线程从 shared memory 读取 fragment，并在多个 MMA 中复用；
+  \item \textbf{register accumulator 的复用}：中间结果长期保留在寄存器中，直到最终写回 HBM。
+\end{itemize}
+
+\begin{lstlisting}[language=C++,caption={高度简化的 tiled GEMM 伪代码},label={lst:tiled-gemm-pseudo}]
+for each output tile C_tile assigned to a thread block:
+  initialize accumulator fragments in registers
+
+  for k_tile in range(0, K, TILE_K):
+    load A_tile from HBM to shared memory
+    load B_tile from HBM to shared memory
+    synchronize threads
+
+    for each mma step inside the tile:
+      load A_fragment from shared memory to registers
+      load B_fragment from shared memory to registers
+      accumulator = mma(A_fragment, B_fragment, accumulator)
+
+    synchronize threads
+
+  store accumulator fragments from registers to HBM
+\end{lstlisting}
+
+实际高性能 GEMM 比这个伪代码复杂得多。它可能包含多级 pipeline、double buffering、asynchronous copy、warp specialization、split-K、persistent thread block、stream-K、epilogue fusion 等优化。但核心目标始终一致：让 Tensor Core 持续有数据可算，并尽量减少对 HBM 的重复访问。
+
+\subsection{深度学习算子的硬件映射}
+\label{subsec:operator-hardware-mapping}
+
+Transformer 中的主要算子可以粗略映射到不同硬件瓶颈上：
+
+\begin{table}[H]
+  \centering
+  \caption{Transformer 常见算子的硬件映射}
+  \label{tab:transformer-operator-hardware}
+  \begin{tabular}{p{3.0cm}p{3.8cm}p{4.2cm}p{3.2cm}}
+    \toprule
+    算子 & 主要硬件路径 & 常见瓶颈 & 优化方向 \\
+    \midrule
+    QKV Projection & Tensor Core GEMM & 小 batch 或维度不对齐导致利用率不足 & 合并 QKV、选择合适 layout、使用高性能 GEMM \\
+    Attention Score & Tensor Core 或 CUDA Core，取决于形状和实现 & 长序列下中间矩阵和 HBM IO & FlashAttention、tiling、避免物化 score \\
+    Softmax & CUDA Core / SFU / Load Store & 归约、指数函数、访存 & online softmax、融合 kernel \\
+    Attention Output & Tensor Core GEMM & KV 读取、概率矩阵读取 & 与 attention 融合、减少 HBM 写回 \\
+    FFN Up / Down & Tensor Core GEMM & 通常是计算主导，但受 shape 影响 & 高效 GEMM、activation fusion \\
+    LayerNorm / RMSNorm & CUDA Core + Load Store & memory-bound、归约开销 & fusion、向量化读写、减少中间结果 \\
+    RoPE & CUDA Core + Load Store & elementwise 访存 & 与 Q/K projection 或 attention 融合 \\
+    Sampling & CUDA Core + Load Store & top-k/top-p 排序或筛选 & 专用 kernel、减少 CPU/GPU 同步 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+这里最重要的工程直觉是：不同算子对 GPU 的压力完全不同。大 GEMM 希望 Tensor Core 满载；norm 和 elementwise 希望减少 HBM 读写；softmax 希望高效归约并避免数值不稳定；attention 希望避免 $O(S^2)$ 中间矩阵写回 HBM；sampling 希望减少小 kernel 和 CPU/GPU 同步。一个端到端 LLM 系统的性能，是这些算子共同作用的结果。
+
+\section{GPU Memory Hierarchy}
+\label{sec:gpu-memory-hierarchy}
+
+GPU 的内存层级决定了大量 AI workload 的真实性能。一个 kernel 的理论 FLOPs 很容易计算，但它是否真的快，往往取决于数据是否能停留在靠近计算单元的位置。如果每一步计算都需要从 HBM 重新读取数据，性能就会受 HBM 带宽限制；如果数据能在 register 或 shared memory 中被多次复用，则更容易接近 Tensor Core 或 CUDA Core 的计算上限。
+
+\subsection{Register}
+\label{subsec:memory-register}
+
+Register 是每个线程私有的片上存储。它的典型用途包括：
+
+\begin{itemize}
+  \item 保存循环索引和地址计算结果；
+  \item 保存输入 fragment；
+  \item 保存 MMA accumulator；
+  \item 保存归约中的局部结果；
+  \item 保存临时变量和编译器生成的中间值。
+\end{itemize}
+
+在矩阵乘法中，register 的关键角色是保存 accumulator。假设一个线程负责输出 tile 中的多个元素，那么这些元素的部分和可以一直保存在寄存器中，直到 $K$ 维遍历完成后再写回 HBM。这样每个输出元素只写一次 HBM，而不是每次乘加都读写 HBM。
+
+不过 register 是稀缺资源。编译器通常会在编译报告或 profiler 中显示每个线程使用的寄存器数量。若寄存器使用过多，会影响 active warps per SM；若发生 spilling，会产生 local memory 访问。优化时常见做法包括减少临时变量生命周期、调整 unroll 因子、改变 tile shape、拆分 kernel 或使用编译参数限制寄存器数。但限制寄存器并不总是好事，因为它可能降低单线程计算复用或导致更多指令。
+
+\subsection{Shared Memory}
+\label{subsec:memory-shared}
+
+Shared Memory 是线程块内共享的片上 SRAM。它既可以作为显式管理的缓存，也可以作为线程之间交换数据的区域。典型使用场景包括：
+
+\begin{itemize}
+  \item GEMM 中缓存 $\mat{A}$ 和 $\mat{B}$ 的 tile；
+  \item FlashAttention 中缓存 $\mat{Q}$、$\mat{K}$、$\mat{V}$ tile；
+  \item reduction 中保存 partial sum；
+  \item stencil、卷积或局部窗口计算中复用邻域数据；
+  \item transpose 中重排数据以实现合并访存。
+\end{itemize}
+
+Shared Memory 的一个常见坑是 bank conflict。Shared Memory 通常被组织成多个 bank。如果同一个 warp 中多个线程访问落在同一 bank 的不同地址，访问可能被串行化，从而降低带宽。对于矩阵 tile，常见优化包括 padding、改变 layout、使用向量化 load/store、调整线程映射方式等。
+
+另一个问题是同步。线程块内多个线程协同加载 shared memory 后，通常需要 \texttt{\_\_syncthreads()} 保证所有数据已经写入，然后才能继续计算。同步本身有成本，而且会限制线程执行的灵活性。高性能 kernel 会尽量通过 double buffering、asynchronous copy 和更细粒度的 warp-level 协同减少同步开销。
+
+\subsection{L2 Cache}
+\label{subsec:memory-l2}
+
+L2 Cache 是多个 SM 共享的缓存层级。与 shared memory 不同，L2 由硬件管理，程序通常不能像管理 shared memory 一样精确控制它。不过，L2 对很多 AI workload 仍然非常重要：
+
+\begin{itemize}
+  \item 多个 SM 可能重复读取相同模型权重；
+  \item batch 内多个请求可能共享部分 prefix 或权重访问路径；
+  \item 某些算子之间存在 producer-consumer 局部性；
+  \item atomic、跨 block 数据交换或全局归约可能受 L2 行为影响；
+  \item GPU 间通信和 DMA 路径在某些架构下也会与 L2 一致性策略相关。
+\end{itemize}
+
+在 LLM 推理中，模型权重很大，通常无法完全留在 L2 中。但对小模型、局部层、重复访问的 scale/zero point、metadata、block table 等数据，L2 命中率仍可能显著影响性能。对于 PagedAttention 这类系统，block table 和 KV block 的访问局部性也会影响 cache 行为。
+
+\subsection{HBM}
+\label{subsec:memory-hbm}
+
+HBM 是 GPU 的主显存，容量大、带宽高，但与片上存储相比延迟仍然高。绝大多数深度学习张量最终都位于 HBM，包括：
+
+\begin{itemize}
+  \item 模型权重；
+  \item optimizer state；
+  \item activation；
+  \item gradient；
+  \item KV Cache；
+  \item logits、采样中间结果；
+  \item 各类临时 workspace。
+\end{itemize}
+
+HBM 优化的核心是减少不必要读写，提高合并访存，并增加每个字节被读取后的计算量。下面给出一个非常简单但重要的算术强度例子。
+
+对两个 FP16 向量做逐元素加法：
+
+\[
+  c_i = a_i + b_i.
+\]
+
+每个元素需要读取 $a_i$ 和 $b_i$，写出 $c_i$。如果忽略 cache，每个元素大约搬运 $2 + 2 + 2 = 6$ 字节，只做一次加法。算术强度大约是：
+
+\[
+  I \approx \frac{1\ \text{FLOP}}{6\ \text{Bytes}}.
+\]
+
+这个 kernel 几乎一定是 memory-bound。相比之下，矩阵乘法中 $\mat{A}$ 和 $\mat{B}$ 的元素可以被多次复用，算术强度高得多，更可能接近 compute-bound。
+
+\begin{figure}[H]
+  \centering
+  \begin{tikzpicture}[
+    font=\small,
+    box/.style={draw, rounded corners, minimum width=8.5cm, minimum height=0.8cm, align=center},
+    arrow/.style={-{Stealth[length=2mm]}, thick}
+  ]
+    \node[box] (reg) at (0,4.0) {Register：线程私有，最快，容量最小};
+    \node[box] (shm) at (0,2.8) {Shared Memory / L1：线程块内共享，显式复用};
+    \node[box] (l2) at (0,1.6) {L2 Cache：多个 SM 共享，硬件管理};
+    \node[box] (hbm) at (0,0.4) {HBM / Global Memory：容量最大，带宽高但延迟高};
+    \node[box] (host) at (0,-0.8) {Host Memory / Storage：CPU 内存、NVMe、网络存储};
+
+    \draw[arrow] (reg.south) -- (shm.north);
+    \draw[arrow] (shm.south) -- (l2.north);
+    \draw[arrow] (l2.south) -- (hbm.north);
+    \draw[arrow] (hbm.south) -- (host.north);
+
+    \node[align=left] at (6.2,4.0) {快\\小\\近计算};
+    \node[align=left] at (6.2,-0.8) {慢\\大\\远计算};
+    \draw[arrow] (5.7,-0.45) -- (5.7,3.65);
+  \end{tikzpicture}
+  \caption{GPU 内存层级：越靠近计算单元，访问越快但容量越小；越远离计算单元，容量越大但访问代价越高。}
+  \label{fig:gpu-memory-hierarchy-inline}
+\end{figure}
+
+\subsection{Roofline Model}
+\label{subsec:roofline}
+
+Roofline model 是理解 GPU 性能瓶颈的经典工具。它把 kernel 性能分解为两个上限：
+
+\begin{itemize}
+  \item \textbf{计算上限}：硬件峰值计算吞吐，例如某种精度下的 Tensor Core 峰值；
+  \item \textbf{带宽上限}：内存带宽乘以算术强度。
+\end{itemize}
+
+算术强度定义为：
+
+\[
+  I = \frac{\text{FLOPs}}{\text{Bytes moved}}.
+\]
+
+在 roofline 图中，横轴是算术强度，纵轴是实际可达到的计算吞吐。低算术强度区域受内存带宽限制，性能大致等于：
+
+\[
+  P \leq B \cdot I,
+\]
+
+其中 $B$ 是内存带宽。高算术强度区域受计算峰值限制，性能大致满足：
+
+\[
+  P \leq P_{\text{peak}}.
+\]
+
+最终上限可以写成：
+
+\[
+  P \leq \min(P_{\text{peak}}, B \cdot I).
+\]
+
+这条式子虽然简单，却能解释大量 AI Infra 问题：
+
+\begin{itemize}
+  \item 大 GEMM 算术强度高，通常更接近 compute-bound；
+  \item elementwise 算子算术强度低，通常 memory-bound；
+  \item FlashAttention 的核心收益不是降低 attention 的理论 FLOPs 数量，而是减少 HBM IO；
+  \item KV Cache decode 要反复读取历史 K/V，容易受 HBM 带宽限制；
+  \item 量化推理减少每个权重元素的字节数，本质上提高了有效算术强度。
+\end{itemize}
+
+\begin{figure}[H]
+  \centering
+  \begin{tikzpicture}[
+    font=\small,
+    arrow/.style={-{Stealth[length=2mm]}, thick}
+  ]
+    \draw[arrow] (0,0) -- (9,0) node[right] {算术强度 $I$};
+    \draw[arrow] (0,0) -- (0,5.5) node[above] {性能 $P$};
+
+    \draw[thick] (0.6,0.5) -- (4.6,4.2) -- (8.4,4.2);
+    \node[align=center] at (2.2,2.6) {memory-bound\\$P \approx B \cdot I$};
+    \node[align=center] at (6.6,4.55) {compute-bound\\$P \approx P_{\text{peak}}$};
+
+    \draw[dashed] (4.6,0) -- (4.6,4.2);
+    \node[below] at (4.6,0) {ridge point};
+
+    \filldraw (1.2,1.05) circle (2pt);
+    \node[align=left, right] at (1.3,1.05) {LayerNorm\\Elementwise};
+
+    \filldraw (2.6,2.35) circle (2pt);
+    \node[align=left, right] at (2.7,2.35) {Decode Attention};
+
+    \filldraw (6.4,4.05) circle (2pt);
+    \node[align=left, below] at (6.4,3.8) {Large GEMM};
+
+    \filldraw (5.2,3.9) circle (2pt);
+    \node[align=left, below] at (5.2,3.55) {FFN GEMM};
+  \end{tikzpicture}
+  \caption{Roofline model 示意：低算术强度 kernel 受内存带宽限制，高算术强度 kernel 受计算峰值限制。}
+  \label{fig:roofline-model}
+\end{figure}
+
+Roofline model 不是精确预测器。真实性能还会受到指令调度、cache 命中率、访存合并、bank conflict、同步、warp divergence、kernel launch overhead、通信和框架调度影响。但它提供了一个非常实用的第一判断：一个 kernel 到底应该优先优化计算，还是优先优化 IO？
+
+\section{Profiling 与性能分析}
+\label{sec:profiling-performance}
+
+性能优化不能只靠猜。GPU 程序的执行路径非常复杂，框架层、编译器层、kernel 层、驱动层和硬件层都会影响最终表现。Profiler 的作用是把“感觉 GPU 没跑满”转化为可观察、可定位、可验证的问题。
+
+在 AI Infra 工作中，常见的性能分析分为两类：
+
+\begin{itemize}
+  \item \textbf{系统级 timeline 分析}：关注一次训练 step 或一次推理请求中，CPU、GPU、通信、kernel、memory copy 的时间关系。
+  \item \textbf{kernel 级指标分析}：关注单个 kernel 内部的 occupancy、warp stall、memory throughput、SM utilization、Tensor Core utilization、register usage、shared memory usage 等。
+\end{itemize}
+
+前者适合判断“时间花在哪里”，后者适合判断“这个 kernel 为什么慢”。
+
+\subsection{Nsight Systems}
+\label{subsec:nsight-systems}
+
+Nsight Systems 适合做系统级 profiling。它展示 CPU thread、CUDA API、GPU kernel、memory copy、NCCL communication、NVTX range 等事件在时间轴上的分布。对 AI Infra 工程师来说，它特别适合回答下面这些问题：
+
+\begin{itemize}
+  \item GPU 是否存在明显空洞？
+  \item CPU 是否在频繁阻塞 GPU？
+  \item kernel launch 是否过多、过碎？
+  \item H2D / D2H memory copy 是否出现在关键路径上？
+  \item NCCL 通信是否与计算重叠？
+  \item prefill 和 decode 是否被合理调度？
+  \item 不同 stream 之间是否存在不必要同步？
+\end{itemize}
+
+例如，在分布式训练中，如果 Nsight Systems timeline 显示 backward 结束后才开始 all-reduce，说明通信没有与反向计算充分重叠；如果大量小 kernel 之间有明显空隙，可能是 CPU launch overhead 或框架调度开销；如果 GPU 长时间空闲而 CPU 忙于 dataloader，瓶颈可能在数据输入 pipeline，而不是模型 kernel。
+
+在 LLM serving 中，Nsight Systems 可以帮助观察 prefill、decode、KV Cache copy、sampling、network IO 之间的关系。如果每个 token decode 都伴随大量 CPU/GPU 同步，那么即使单个 kernel 很快，端到端 TPOT 也可能很差。
+
+\begin{figure}[H]
+  \centering
+  \begin{tikzpicture}[
+    font=\small,
+    lane/.style={draw, minimum width=11.5cm, minimum height=0.75cm, anchor=west},
+    task/.style={draw, rounded corners, minimum height=0.45cm, anchor=west, align=center},
+    arrow/.style={-{Stealth[length=2mm]}, thick}
+  ]
+    \node[lane] (cpu) at (0,3.0) {};
+    \node[anchor=west] at (0.1,3.0) {CPU};
+
+    \node[lane] (gpu0) at (0,2.0) {};
+    \node[anchor=west] at (0.1,2.0) {GPU stream 0};
+
+    \node[lane] (gpu1) at (0,1.0) {};
+    \node[anchor=west] at (0.1,1.0) {GPU stream 1};
+
+    \node[lane] (comm) at (0,0.0) {};
+    \node[anchor=west] at (0.1,0.0) {NCCL / Copy};
+
+    \node[task, minimum width=1.3cm] at (1.4,3.0) {launch};
+    \node[task, minimum width=1.3cm] at (3.1,3.0) {launch};
+    \node[task, minimum width=1.3cm] at (5.0,3.0) {sync};
+    \node[task, minimum width=1.3cm] at (7.2,3.0) {launch};
+
+    \node[task, minimum width=2.1cm] at (1.6,2.0) {GEMM};
+    \node[task, minimum width=1.5cm] at (3.9,2.0) {Norm};
+    \node[task, minimum width=2.0cm] at (7.3,2.0) {Attention};
+
+    \node[task, minimum width=1.8cm] at (5.4,1.0) {Sampling};
+    \node[task, minimum width=2.8cm] at (4.6,0.0) {AllReduce / Copy};
+
+    \draw[arrow] (5.0,2.65) -- (5.0,2.25);
+    \draw[arrow] (6.0,0.35) -- (6.0,0.75);
+  \end{tikzpicture}
+  \caption{系统级 timeline 的抽象示例：通过观察 CPU、GPU、通信和同步关系定位端到端瓶颈。}
+  \label{fig:profiling-timeline-abstract}
+\end{figure}
+
+\subsection{Nsight Compute}
+\label{subsec:nsight-compute}
+
+Nsight Compute 适合做单 kernel 深度分析。它不像 Nsight Systems 那样关注全局时间线，而是深入一个 kernel 内部，分析其资源使用和硬件效率。常见指标包括：
+
+\begin{itemize}
+  \item \textbf{Achieved Occupancy}：实际活跃 warp 与理论最大 warp 的比例；
+  \item \textbf{SM Throughput}：SM 执行单元忙碌程度；
+  \item \textbf{Memory Throughput}：内存子系统带宽利用率；
+  \item \textbf{L1/L2 Hit Rate}：缓存命中情况；
+  \item \textbf{Warp Stall Reasons}：warp 等待的主要原因，例如等待内存、等待依赖、等待同步；
+  \item \textbf{Register Usage}：每线程寄存器数量；
+  \item \textbf{Shared Memory Usage}：每 block 使用的 shared memory；
+  \item \textbf{Tensor Core Utilization}：矩阵乘加单元利用程度。
+\end{itemize}
+
+单独看某一个指标很容易误判。比如 occupancy 低不一定是问题，memory throughput 低也不一定说明内存不是瓶颈。如果 kernel 因为非合并访存、依赖链或分支导致无法发出足够请求，那么实际 memory throughput 可能不高，但 warp stall 却显示大量等待内存。这时瓶颈仍然可能是访存模式，而不是带宽已经打满。
+
+一个实用的分析顺序是：
+
+\begin{enumerate}
+  \item 先从 Nsight Systems 找到耗时最长或最可疑的 kernel；
+  \item 用 Nsight Compute 分析该 kernel 的资源使用；
+  \item 判断它更像 compute-bound、memory-bound、latency-bound 还是 launch/sync-bound；
+  \item 对应地修改 shape、layout、fusion、tiling、并行度或调度策略；
+  \item 再次 profiling 验证。
+\end{enumerate}
+
+\subsection{Kernel Timeline}
+\label{subsec:kernel-timeline}
+
+Kernel timeline 是最直观的性能入口。它告诉我们一次训练 step 或推理请求中，到底执行了哪些 GPU kernel，它们的顺序是什么，耗时是多少，是否存在空隙，是否与通信重叠。
+
+在 PyTorch 或类似框架中，一个高层算子可能对应多个底层 kernel。例如 LayerNorm 可能包含 reduction、normalize、scale、bias；attention 可能包含 QK GEMM、mask、softmax、dropout、PV GEMM；采样可能包含 logits processor、top-k、top-p、random sampling 等。如果没有 fusion，这些小 kernel 会频繁读写 HBM，并产生 kernel launch overhead。
+
+Kernel timeline 中常见的坏味道包括：
+
+\begin{itemize}
+  \item \textbf{大量短小 kernel}：每个 kernel 只运行几微秒，launch overhead 和 HBM 往返显著；
+  \item \textbf{GPU 空洞}：kernel 之间存在明显间隔，可能是 CPU 调度、同步或数据准备问题；
+  \item \textbf{通信孤岛}：NCCL kernel 与计算完全不重叠；
+  \item \textbf{意外 memory copy}：H2D、D2H 或 D2D copy 出现在关键路径；
+  \item \textbf{同步过密}：频繁 cudaDeviceSynchronize 或隐式同步破坏流水。
+\end{itemize}
+
+对于 LLM serving，kernel timeline 还可以揭示 prefill 与 decode 的差异。Prefill 阶段通常包含较大的 GEMM 和 attention，GPU 更容易被喂饱；decode 阶段每轮只处理一个新 token，更容易出现小 GEMM、KV Cache 读取和调度开销。Continuous batching、PagedAttention、prefix caching、speculative decoding 等优化，本质上都试图改善这些 timeline 特征。
+
+\subsection{Occupancy、Memory Throughput 与 SM Efficiency}
+\label{subsec:key-metrics}
+
+GPU 性能分析中经常出现三个指标：occupancy、memory throughput 和 SM efficiency。它们都重要，但都不能孤立解释性能。
+
+\subsubsection{Occupancy}
+
+Occupancy 反映 SM 上活跃 warp 的数量。影响 occupancy 的因素包括：
+
+\begin{itemize}
+  \item 每个 block 的线程数；
+  \item 每个线程使用的寄存器数；
+  \item 每个 block 使用的 shared memory；
+  \item 架构允许的最大 block、warp、register 和 shared memory 限制。
+\end{itemize}
+
+高 occupancy 可以帮助隐藏内存延迟，但高 occupancy 不保证高吞吐。对于 compute-bound GEMM，较低 occupancy 也可能因为 Tensor Core 利用率高而表现很好。对于 latency-bound 或 memory-bound kernel，提升 occupancy 可能有效，但前提是有足够独立 warp 可以发出访存请求。
+
+\subsubsection{Memory Throughput}
+
+Memory throughput 表示 kernel 实际使用的内存带宽。它需要结合理论峰值和算子特征解读：
+
+\begin{itemize}
+  \item 如果 memory-bound kernel 已接近带宽上限，继续优化计算指令意义不大；
+  \item 如果 memory-bound kernel 带宽很低，可能是访存不合并、请求粒度差、cache miss、warp divergence 或依赖导致；
+  \item 如果 compute-bound kernel memory throughput 不高，可能是正常现象，因为瓶颈在计算；
+  \item 如果大量中间结果写回 HBM，fusion 或 tiling 可能比减少 FLOPs 更有效。
+\end{itemize}
+
+\subsubsection{SM Efficiency}
+
+SM efficiency 或 SM utilization 表示 SM 忙碌程度。它低可能有多种原因：
+
+\begin{itemize}
+  \item kernel 太小，无法覆盖所有 SM；
+  \item block 数量不足；
+  \item 每个 block 资源占用过高，导致活跃 warp 少；
+  \item warp 经常等待内存、同步或依赖；
+  \item CPU launch 间隔导致 GPU 空闲；
+  \item 多 GPU 通信或数据加载让 GPU 等待。
+\end{itemize}
+
+因此，看到 SM utilization 低时，不能立刻说“需要提高 occupancy”或“需要增大 batch”。正确做法是先确定低利用率发生在单 kernel 内部，还是 kernel 之间的空隙。如果是前者，用 Nsight Compute；如果是后者，用 Nsight Systems。
+
+\subsection{从 Profiler 判断瓶颈}
+\label{subsec:diagnose-bottleneck}
+
+下面给出一个面向 AI Infra 的简化诊断表。它不是绝对规则，但可以作为排查起点。
+
+\begin{longtable}{p{4.0cm}p{5.0cm}p{5.0cm}}
+  \caption{Profiler 现象与可能瓶颈}
+  \label{tab:profiler-diagnosis} \\
+  \toprule
+  现象 & 可能原因 & 优先排查方向 \\
+  \midrule
+  \endfirsthead
+  \toprule
+  现象 & 可能原因 & 优先排查方向 \\
+  \midrule
+  \endhead
+  GPU timeline 中有大空洞 & CPU 调度、dataloader、同步、通信等待 & 检查 CPU thread、CUDA API、数据输入、隐式同步 \\
+  大量很短的小 kernel & 算子未融合、框架 eager 开销、elementwise 过多 & 使用 fusion、graph capture、编译器或手写 fused kernel \\
+  GEMM 耗时高但 Tensor Core 利用低 & shape 不适合、dtype 不对、layout 不佳、batch 太小 & 检查矩阵维度、对齐、数据类型、是否走 Tensor Core 路径 \\
+  Memory throughput 接近峰值 & memory-bound & 减少 HBM 读写、做 fusion、提高数据复用、量化 \\
+  Memory throughput 不高但 warp stall memory 高 & 访存延迟、非合并访存、请求不足 & 改善 coalescing、增加并行度、调整 layout、使用 shared memory \\
+  Occupancy 很低 & register/shared memory 过多，block 配置不合理 & 检查寄存器、shared memory、block size，但不要盲目追求高 occupancy \\
+  L2 hit rate 异常低 & 访问局部性差、working set 太大、随机访问 & 调整数据布局、分块、重排访问、减少 metadata 随机访问 \\
+  NCCL 与 backward 不重叠 & bucket 设置、调度顺序、依赖关系问题 & 调整 bucket、检查 DDP/ZeRO 配置、观察 stream 关系 \\
+  Decode TPOT 高 & KV Cache 读取、batch 太小、小 GEMM、采样开销 & Continuous batching、PagedAttention、speculative decoding、kernel fusion \\
+  Prefill TTFT 高 & 长 prompt attention、GEMM、调度排队 & FlashAttention、chunked prefill、prefix caching、admission control \\
+  \bottomrule
+\end{longtable}
+
+为了让诊断更具体，我们考虑两个常见案例。
+
+\subsubsection{案例一：训练中大 GEMM 没有打满}
+
+假设某个 Transformer FFN 的 up projection 很慢，profiler 显示 GEMM kernel 占据大量时间，但 Tensor Core utilization 不高。此时可能原因包括：
+
+\begin{itemize}
+  \item 输入 dtype 是 FP32，未启用 TF32 或混合精度；
+  \item $M$ 维过小，例如 micro batch size 太小且 sequence length 不大；
+  \item hidden size 或 intermediate size 不满足高效对齐；
+  \item tensor layout 导致额外 transpose 或 copy；
+  \item 使用了非最优 backend；
+  \item kernel 被其他 stream 或资源竞争影响。
+\end{itemize}
+
+排查路径可以是：确认 dtype 和 matmul precision；打印实际矩阵 shape；用单独 benchmark 测试相同 shape 的 GEMM；比较 cuBLAS、Triton 或框架编译后的 kernel；观察是否存在额外 copy；调整 micro batch 或 gradient accumulation 策略。
+
+\subsubsection{案例二：推理 decode 随 batch 增加后仍不快}
+
+LLM decode 阶段常见现象是：增大 batch 后吞吐上升，但 TPOT 也变差；某些 batch 规模后吞吐不再提升。这可能是因为：
+
+\begin{itemize}
+  \item KV Cache 读取带宽成为瓶颈；
+  \item 请求长度差异导致 cache 访问不规则；
+  \item batch 中短请求被长请求拖累；
+  \item attention kernel 对 paged KV 的访问局部性不足；
+  \item sampling 或 logits processing 成为 CPU/GPU 同步瓶颈；
+  \item memory allocator 或 block manager 开销上升。
+\end{itemize}
+
+这时不能只看 GEMM。应该同时观察 attention kernel、KV Cache 读写、scheduler、sampling、CPU timeline 和 GPU 空洞。优化方向可能包括 PagedAttention、prefix caching、chunked prefill、continuous batching、speculative decoding、量化 KV Cache 或调度策略调整。
+
+\section{GPU 架构对 AI Infra 设计的影响}
+\label{sec:gpu-architecture-ai-infra}
+
+理解 GPU 架构不是为了写出所有底层 kernel，而是为了在系统设计时做出正确取舍。本节从训练、推理和集群调度三个角度总结 GPU 架构的影响。
+
+\subsection{对训练系统的影响}
+\label{subsec:gpu-training-impact}
+
+训练系统关心 step time、吞吐、显存、通信和稳定性。GPU 架构影响训练系统的方式包括：
+
+\begin{itemize}
+  \item \textbf{Tensor Core 决定大 GEMM 上限}：模型 hidden size、FFN intermediate size、head dimension 等最好与高效矩阵 tile 友好。
+  \item \textbf{HBM 容量决定并行策略}：单卡放不下模型或 optimizer state 时，需要 ZeRO、TP、PP 或 offload。
+  \item \textbf{HBM 带宽影响非 GEMM 算子}：norm、dropout、activation、optimizer update 都可能成为大规模训练中的隐性开销。
+  \item \textbf{Register 和 shared memory 影响自定义 kernel}：FlashAttention、fused optimizer、fused norm 都需要在片上资源间权衡。
+  \item \textbf{L2 和通信路径影响 overlap}：梯度同步、reduce-scatter、all-gather 与计算重叠时，数据路径和 stream 调度都很重要。
+\end{itemize}
+
+例如，在 3D 并行中，TP 会引入更多 intra-node 通信，PP 会改变 micro-batch 时间线，DP 会引入梯度同步。GPU 本身的计算速度越快，通信和调度空洞就越容易显得突出。这也是为什么大规模训练不是简单地“堆更多 GPU”，而是要让计算、显存和通信平衡。
+
+\subsection{对推理系统的影响}
+\label{subsec:gpu-serving-impact}
+
+推理系统关心 TTFT、TPOT、吞吐、SLA 和成本。GPU 架构对推理的影响更加复杂，因为推理 workload 的形状变化非常大。
+
+Prefill 阶段通常类似训练中的前向计算，序列长度较长，GEMM 和 attention 规模较大，更容易利用 Tensor Core。Decode 阶段每次只生成一个 token，虽然 batch 可以通过 continuous batching 增大，但每个请求的历史上下文长度不同，KV Cache 访问成为关键问题。
+
+因此，推理优化常围绕以下方向展开：
+
+\begin{itemize}
+  \item \textbf{提高 batch 的有效性}：continuous batching 让 decode 阶段聚合更多请求，增加并行度；
+  \item \textbf{降低 KV Cache IO}：PagedAttention、prefix caching、KV Cache quantization 等减少显存浪费或带宽压力；
+  \item \textbf{减少小 kernel 和同步}：融合 RoPE、norm、activation、sampling 等操作；
+  \item \textbf{选择合适精度}：FP16/BF16、FP8、INT8、INT4 在不同模型和 SLA 下取舍；
+  \item \textbf{分离 prefill 与 decode}：针对 compute-heavy prefill 和 memory-heavy decode 使用不同资源池。
+\end{itemize}
+
+一个成熟的 LLM serving 系统，本质上是对 GPU 计算单元、HBM 容量、HBM 带宽、kernel launch、cache 管理和调度策略的综合优化。
+
+\subsection{对集群调度的影响}
+\label{subsec:gpu-scheduling-impact}
+
+Kubernetes 或其他调度系统看到的资源往往是“几张 GPU”，但真实性能取决于更细粒度的硬件结构：
+
+\begin{itemize}
+  \item GPU 型号不同，HBM 容量、带宽、Tensor Core 能力不同；
+  \item 同一节点内 GPU 拓扑不同，P2P 通信性能不同；
+  \item MIG 或 GPU sharing 会改变 SM、显存、L2、带宽隔离方式；
+  \item 多租户推理会产生 cache、带宽和 kernel 调度干扰；
+  \item 训练作业的 TP/PP/DP rank mapping 需要匹配 GPU 拓扑。
+\end{itemize}
+
+因此，AI 集群调度不能只做数量匹配，还要做拓扑感知、带宽感知、显存感知和 workload 感知。例如，一个 8 GPU TP 作业最好被放在 NVLink/NVSwitch 拓扑良好的单节点或紧密 GPU group 中；一个 memory-bound 推理服务即使 SM utilization 不高，也可能已经耗尽 HBM 带宽；多个 decode-heavy 服务混部时，显存带宽可能比显存容量更早成为瓶颈。
+
+\section{本章小结}
+\label{sec:gpu-architecture-summary}
+
+本章从 AI Infra 工程视角介绍了 GPU 架构底座。我们没有追求某一代 GPU 的完整硬件规格，而是建立了几个跨架构稳定的核心概念：
+
+\begin{itemize}
+  \item SM 是 CUDA kernel 的基本执行场所，warp 调度、CUDA Core、Tensor Core、Load/Store Unit、Register File 和 Shared Memory 共同决定 kernel 表现。
+  \item Tensor Core 是深度学习矩阵计算的关键，但只有在合适的数据类型、矩阵形状、tile 策略和内存布局下才能发挥高吞吐。
+  \item Register、Shared Memory、L2 Cache、HBM 构成了 GPU 的内存层级。性能优化经常不是减少数学计算，而是减少数据在 HBM 与片上存储之间的往返。
+  \item Roofline model 提供了判断 compute-bound 与 memory-bound 的第一性工具。大 GEMM 通常算术强度高，而 norm、elementwise、decode attention、KV Cache 访问常常受内存带宽限制。
+  \item Nsight Systems 适合分析端到端 timeline，Nsight Compute 适合分析单 kernel。性能优化应从 profiler 证据出发，而不是只凭经验猜测。
+  \item GPU 架构直接影响训练并行策略、推理服务设计和集群调度。AI Infra 工程师需要把模型 shape、kernel 行为、显存容量、显存带宽、GPU 拓扑和调度系统放在一起思考。
+\end{itemize}
+
+下一章将继续沿着硬件路径向外扩展：当一台机器中有多张 GPU 时，它们如何通信？PCIe、NVLink 和 NVSwitch 的差异是什么？为什么单机多卡拓扑会影响 tensor parallel、pipeline parallel 和 NCCL collective 的性能？这些问题将进入第 18 章：NVLink 与 NVSwitch。

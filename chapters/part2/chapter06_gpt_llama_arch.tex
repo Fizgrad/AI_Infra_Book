@@ -1,0 +1,1322 @@
+\chapter{GPT、LLaMA 与现代 Decoder-only 架构}
+\label{chap:gpt-llama-arch}
+
+\section{Decoder-only LLM 总览}
+\label{sec:decoder-only-llm-overview}
+
+前两章分别回答了两个问题：Transformer 为什么适合大规模并行训练，大语言模型范式又是如何从语言建模演进到 Chat LM 的。本章进一步落到具体架构：现代 Decoder-only LLM 到底由哪些模块组成？GPT 风格模型与 LLaMA 风格模型有何差异？为什么 RMSNorm、RoPE、SwiGLU、GQA、MoE 这些组件会成为现代模型设计中的高频词？这些架构选择又如何影响训练和推理基础设施？
+
+一个 Decoder-only LLM 可以被抽象为如下函数：
+[
+f_{\theta}:
+(x_1,x_2,\ldots,x_S)
+\rightarrow
+p(x_{S+1}\mid x_{\le S}).
+]
+它接收一段 token 序列，输出下一个 token 的概率分布。训练时，它对序列中每个位置并行做 next-token prediction；推理时，它不断把新生成的 token 追加到上下文中，逐步生成完整回答。
+
+从结构上看，现代 Decoder-only LLM 通常包含四个主要部分：
+
+\begin{itemize}
+\item \textbf{Token Embedding}：把离散 token id 映射为连续向量；
+\item \textbf{Transformer Decoder Blocks}：堆叠多层 causal self-attention 与 FFN；
+\item \textbf{Final Norm}：在输出 logits 前对 hidden state 做归一化；
+\item \textbf{LM Head}：把 hidden state 投影到词表维度，得到 logits。
+\end{itemize}
+
+其整体计算可以写作：
+[
+\mat{X}*0=\operatorname{Embed}(\mat{T})+\operatorname{PosEnc},
+]
+[
+\mat{X}*{\ell+1}
+================
+
+\operatorname{DecoderBlock}*{\ell}(\mat{X}*{\ell}),
+\quad
+\ell=0,1,\ldots,L-1,
+]
+[
+\mat{H}=\operatorname{Norm}(\mat{X}*L),
+]
+[
+\mat{Z}=\mat{H}\mat{W}*{\mathrm{lm}},
+]
+其中：
+[
+\mat{Z}\in\mathbb{R}^{B\times S\times V}
+]
+是 logits，$V$ 是词表大小。
+
+\subsection{token embedding}
+\label{subsec:token-embedding}
+
+Tokenizer 将文本切分为 token，并把每个 token 映射为整数 id。设词表大小为 $V$，隐藏维度为 $H$，embedding table 为：
+[
+\mat{E}\in\mathbb{R}^{V\times H}.
+]
+输入 token ids：
+[
+\mat{T}\in\mathbb{N}^{B\times S}
+]
+经过查表得到：
+[
+\tensor{X}*{b,s,:}=\mat{E}*{T_{b,s},:}.
+]
+因此：
+[
+\tensor{X}\in\mathbb{R}^{B\times S\times H}.
+]
+
+Embedding 查表在数学上可以看作 one-hot 向量乘矩阵：
+[
+\vect{x}_{b,s}
+==============
+
+\vect{o}*{T*{b,s}}^{\mathsf{T}}\mat{E}.
+]
+但工程上不会真的构造 one-hot，因为这样会产生巨大稀疏矩阵。框架通常使用 gather 操作直接读取 embedding table 的对应行。
+
+从 Infra 角度看，embedding 层有几个值得注意的特点：
+
+\begin{itemize}
+\item \textbf{参数量与词表大小成正比}：embedding 参数量为 $VH$；
+\item \textbf{访问模式偏随机}：不同 token id 对应 embedding table 中不同位置，缓存局部性不如 GEMM；
+\item \textbf{可与 LM Head 共享权重}：某些模型使用 tied embedding，即 $\mat{W}_{\mathrm{lm}}=\mat{E}^{\mathsf{T}}$；
+\item \textbf{分布式训练中可做 vocabulary parallel}：当 $V$ 很大时，可将词表维切分到多个 GPU。
+\end{itemize}
+
+例如，当 $V=128000$，$H=8192$ 时，仅 embedding 参数量就是：
+[
+128000\times 8192\approx 1.05\times 10^9.
+]
+这约为 $1$B 参数。对于大词表多语言模型，embedding 和 lm head 的系统成本不可忽视。
+
+\subsection{transformer blocks}
+\label{subsec:transformer-blocks}
+
+Decoder-only 模型的主体是堆叠的 Transformer blocks。一个现代 Pre-Norm block 通常写为：
+[
+\mat{U}_{\ell}
+==============
+
+\mat{X}*{\ell}
++
+\operatorname{CausalSelfAttention}
+\left(
+\operatorname{Norm}*1(\mat{X}*{\ell})
+\right),
+]
+[
+\mat{X}*{\ell+1}
+================
+
+\mat{U}_{\ell}
++
+\operatorname{FFN}
+\left(
+\operatorname{Norm}*2(\mat{U}*{\ell})
+\right).
+]
+
+这里的 Norm 可以是 LayerNorm 或 RMSNorm；Attention 可以是 MHA、MQA、GQA 或更复杂的注意力变体；FFN 可以是 GELU MLP、SwiGLU MLP 或 MoE FFN。不同模型族的差异，往往就体现在这些选择上。
+
+Transformer blocks 的工程成本主要来自：
+
+\begin{itemize}
+\item Attention 中的 QKV projection、attention score、softmax、weighted sum 和 output projection；
+\item FFN 中的 up/gate/down projection；
+\item Norm、residual add、activation 等 memory-bound 小算子；
+\item 训练时保存的激活；
+\item 分布式训练中的 tensor parallel、sequence parallel、pipeline parallel 和数据并行通信。
+\end{itemize}
+
+\subsection{lm head}
+\label{subsec:lm-head}
+
+LM Head 将最终 hidden state 投影到词表维度：
+[
+\mat{Z}_{b,s,:}
+===============
+
+\mat{H}*{b,s,:}\mat{W}*{\mathrm{lm}},
+]
+其中：
+[
+\mat{W}_{\mathrm{lm}}\in\mathbb{R}^{H\times V}.
+]
+logits：
+[
+\mat{Z}\in\mathbb{R}^{B\times S\times V}
+]
+再经过 softmax 得到 token 概率。
+
+LM Head 的参数量为：
+[
+HV.
+]
+如果使用 tied embedding，则：
+[
+\mat{W}_{\mathrm{lm}}=\mat{E}^{\mathsf{T}},
+]
+可以减少参数量，并在某些情况下提升泛化。
+
+但 LM Head 的主要问题不只是参数量，而是 logits 张量很大。训练中，如果 $B=8$、$S=4096$、$V=128000$，logits 元素数为：
+[
+8\times 4096\times 128000\approx 4.19\times 10^9.
+]
+即使使用 BF16，也超过 $8$GB。实际系统通常会使用 fused cross entropy、vocabulary parallelism、logits chunking 或 selective logits 计算来降低显存峰值。
+
+\subsection{logits 与采样}
+\label{subsec:logits-and-sampling}
+
+推理时，我们通常只关心最后一个位置的 logits：
+[
+\vect{z}=\mat{Z}_{B,S,:}\in\mathbb{R}^{V}.
+]
+通过 softmax 得到概率：
+[
+p_i=\frac{\exp(z_i/T)}{\sum_j\exp(z_j/T)},
+]
+其中 $T$ 是 temperature。之后可以使用 greedy、top-$k$、top-$p$、min-$p$、typical sampling 等策略采样下一个 token。
+
+采样策略不是模型结构的一部分，但它强烈影响服务行为。低 temperature 更确定，高 temperature 更随机；top-$p$ 限制候选 token 集合，减少长尾低概率 token 的影响；repetition penalty 可以缓解重复输出。
+
+从 serving infra 角度看，采样阶段通常不是主要 FLOPs 来源，但会影响：
+
+\begin{itemize}
+\item 每个请求生成长度；
+\item stop condition；
+\item batch 内请求退出时机；
+\item tail latency；
+\item continuous batching 的动态调度。
+\end{itemize}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+box/.style={draw, rounded corners=3pt, minimum width=2.05cm, minimum height=0.75cm, align=center},
+block/.style={draw, rounded corners=3pt, minimum width=2.2cm, minimum height=0.68cm, align=center, fill=blue!6},
+arrow/.style={-{Latex[length=2.3mm]}, thick}
+]
+
+```
+\node[font=\bfseries] at (0,4.0) {Decoder-only LLM 整体结构};
+
+\node[box, fill=orange!12] (ids) at (-5.1,2.2) {Token IDs\\$B\times S$};
+\node[box, fill=green!10] (emb) at (-2.6,2.2) {Embedding\\$B,S,H$};
+
+\node[block] (b1) at (0.0,2.2) {Decoder\\Block 1};
+\node[block] (b2) at (0.0,1.25) {Decoder\\Block 2};
+\node[block] (dots) at (0.0,0.3) {$\cdots$};
+\node[block] (bL) at (0.0,-0.65) {Decoder\\Block $L$};
+
+\node[box, fill=purple!10] (norm) at (2.7,-0.65) {Final Norm};
+\node[box, fill=yellow!16] (lm) at (5.1,-0.65) {LM Head\\$H\rightarrow V$};
+\node[box, fill=red!10] (logits) at (5.1,-1.75) {Logits\\$B,S,V$};
+
+\draw[arrow] (ids) -- (emb);
+\draw[arrow] (emb) -- (b1);
+\draw[arrow] (b1) -- (b2);
+\draw[arrow] (b2) -- (dots);
+\draw[arrow] (dots) -- (bL);
+\draw[arrow] (bL) -- (norm);
+\draw[arrow] (norm) -- (lm);
+\draw[arrow] (lm) -- (logits);
+
+\node[align=left, text width=10.7cm] at (0,-3.05) {
+  Decoder-only LLM 的主体是重复堆叠的 causal decoder block。
+  训练时对所有位置计算 logits 与 loss；推理 decode 阶段通常只取最后位置 logits，并将采样 token 追加到上下文。
+};
+```
+
+\end{tikzpicture}
+\caption{Decoder-only LLM 的端到端结构}
+\label{fig:decoder-only-llm-overall}
+\end{figure}
+
+\section{GPT 架构细节}
+\label{sec:gpt-architecture-details}
+
+GPT 风格架构可以看作现代 Decoder-only LLM 的起点。虽然不同版本细节不同，但核心思想相对稳定：token embedding、位置 embedding、堆叠 causal self-attention block、最终 lm head，以及 next-token prediction 训练目标。
+
+\subsection{learned positional embedding}
+\label{subsec:gpt-learned-positional-embedding}
+
+早期 GPT 模型使用 learned absolute positional embedding。设最大上下文长度为 $S_{\max}$，位置 embedding 表为：
+[
+\mat{P}\in\mathbb{R}^{S_{\max}\times H}.
+]
+第 $s$ 个位置的输入为：
+[
+\vect{x}*s=\mat{E}*{t_s,:}+\mat{P}_{s,:}.
+]
+
+这种方法简单直接，模型可以学习每个绝对位置的表示。但它有明显限制：如果推理时序列长度超过训练时最大位置，模型没有对应的位置 embedding。即便可以通过插值或扩展，也不一定保持稳定。
+
+从系统角度看，learned positional embedding 成本很小，参数量为：
+[
+S_{\max}H.
+]
+相比 Transformer block 中的 $O(H^2)$ 参数，它通常不是主要参数来源。但它影响上下文长度扩展能力。后来的 LLaMA 风格模型更多使用 RoPE，因为它更自然地将相对位置信息注入 Q/K，并在长上下文扩展中有更丰富的调整方式。
+
+\subsection{causal self-attention}
+\label{subsec:gpt-causal-self-attention}
+
+GPT 的核心是 causal self-attention：
+[
+\mat{O}
+=======
+
+\softmax
+\left(
+\frac{\mat{Q}\mat{K}^{\mathsf{T}}+\mat{M}}{\sqrt{d_h}}
+\right)
+\mat{V},
+]
+其中 mask $\mat{M}$ 满足：
+[
+M_{ij}=
+\begin{cases}
+0, & j\le i,\
+-\infty, & j>i.
+\end{cases}
+]
+它保证第 $i$ 个位置不能看到未来 token。
+
+在训练中，causal mask 允许所有位置并行计算，同时保持自回归约束。这个性质非常关键：如果训练也必须逐 token 递推，那么大模型训练成本会高得难以接受。
+
+在推理中，causal self-attention 以另一种方式工作。假设已经生成了 $S$ 个 token，并缓存了历史 K/V：
+[
+\mat{K}*{cache}\in\mathbb{R}^{S\times d_h},
+\quad
+\mat{V}*{cache}\in\mathbb{R}^{S\times d_h}.
+]
+生成第 $S+1$ 个 token 时，只需要计算新 token 的 query：
+[
+\vect{q}*{new},
+]
+并与历史 key 做 attention：
+[
+\vect{o}*{new}
+==============
+
+\softmax
+\left(
+\frac{\vect{q}*{new}\mat{K}*{cache}^{\mathsf{T}}}{\sqrt{d_h}}
+\right)
+\mat{V}_{cache}.
+]
+这就是 KV Cache 的基础。它避免了每一步重复计算历史 token 的 K/V，但引入了显存和带宽压力。
+
+\subsection{residual stream}
+\label{subsec:gpt-residual-stream}
+
+GPT 架构中，residual connection 把每一层的输出加回主干 hidden state：
+[
+\mat{X}_{\ell+1}
+================
+
+\mat{X}*{\ell}
++
+F*{\ell}(\mat{X}_{\ell}).
+]
+这个贯穿层间的主干表示常被称为 residual stream。Attention 和 MLP 每层都向 residual stream 写入增量信息。
+
+从训练稳定性角度看，residual stream 提供了梯度传播的捷径。若没有 residual connection，深层网络会更难训练。若有 residual connection，梯度可以沿恒等路径传播：
+[
+\frac{\partial \mat{X}*{\ell+1}}{\partial \mat{X}*{\ell}}
+=========================================================
+
+\mat{I}
++
+\frac{\partial F_{\ell}}{\partial \mat{X}_{\ell}}.
+]
+其中 $\mat{I}$ 保证了一个直接通路。
+
+从系统角度看，residual add 本身是 elementwise 操作，计算量不大，但会读写完整激活张量：
+[
+B\times S\times H.
+]
+因此，高性能实现中常将 residual add 与 LayerNorm/RMSNorm 融合，减少 HBM 往返。
+
+\subsection{GPT 风格 block 的工程实现}
+\label{subsec:gpt-style-block-engineering}
+
+GPT 风格 block 可抽象为：
+[
+\mat{X}'=\mat{X}+\operatorname{Attention}(\operatorname{Norm}(\mat{X})),
+]
+[
+\mat{Y}=\mat{X}'+\operatorname{MLP}(\operatorname{Norm}(\mat{X}')).
+]
+
+下面给出一个教学版 GPT block。它使用 LayerNorm、MHA 和 GELU MLP，接近早期 GPT 风格。为突出结构，代码没有使用 FlashAttention、KV Cache 或 fused kernel。
+
+\begin{lstlisting}[language=Python,caption={教学版 GPT 风格 Decoder Block},label={lst:gpt-style-block}]
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class GPTAttention(nn.Module):
+def **init**(self, hidden_size, num_heads):
+super().**init**()
+assert hidden_size % num_heads == 0
+self.hidden_size = hidden_size
+self.num_heads = num_heads
+self.head_dim = hidden_size // num_heads
+
+```
+    self.qkv = nn.Linear(hidden_size, 3 * hidden_size)
+    self.out_proj = nn.Linear(hidden_size, hidden_size)
+
+def forward(self, x):
+    B, S, H = x.shape
+
+    qkv = self.qkv(x)
+    q, k, v = qkv.chunk(3, dim=-1)
+
+    q = q.view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
+    k = k.view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
+    v = v.view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
+
+    scores = q @ k.transpose(-2, -1)
+    scores = scores / math.sqrt(self.head_dim)
+
+    mask = torch.triu(torch.ones(S, S, device=x.device, dtype=torch.bool), diagonal=1)
+    scores = scores.masked_fill(mask, float("-inf"))
+
+    probs = F.softmax(scores, dim=-1)
+    out = probs @ v
+
+    out = out.transpose(1, 2).contiguous().view(B, S, H)
+    return self.out_proj(out)
+```
+
+class GPTMLP(nn.Module):
+def **init**(self, hidden_size, intermediate_size):
+super().**init**()
+self.fc1 = nn.Linear(hidden_size, intermediate_size)
+self.fc2 = nn.Linear(intermediate_size, hidden_size)
+
+```
+def forward(self, x):
+    return self.fc2(F.gelu(self.fc1(x)))
+```
+
+class GPTBlock(nn.Module):
+def **init**(self, hidden_size, num_heads, intermediate_size):
+super().**init**()
+self.ln1 = nn.LayerNorm(hidden_size)
+self.attn = GPTAttention(hidden_size, num_heads)
+self.ln2 = nn.LayerNorm(hidden_size)
+self.mlp = GPTMLP(hidden_size, intermediate_size)
+
+```
+def forward(self, x):
+    x = x + self.attn(self.ln1(x))
+    x = x + self.mlp(self.ln2(x))
+    return x
+```
+
+\end{lstlisting}
+
+这段代码的工程问题非常典型：
+
+\begin{itemize}
+\item 每次 forward 构造 causal mask；
+\item 显式物化 attention score；
+\item softmax 和两个 matmul 没有融合；
+\item transpose 后调用 \texttt{contiguous()}，可能引入额外拷贝；
+\item LayerNorm、residual add、GELU 分散为多个小 kernel；
+\item 没有 KV Cache，无法高效自回归 decode。
+\end{itemize}
+
+真实 GPT 推理和训练框架会使用更高效实现。例如使用 PyTorch SDPA、FlashAttention、fused bias-GELU、fused LayerNorm、tensor parallel linear，以及更适合推理的 KV Cache layout。
+
+\section{LLaMA 架构细节}
+\label{sec:llama-architecture-details}
+
+LLaMA 风格架构代表了现代开源 Decoder-only LLM 的一类重要设计。它继承了 GPT 的 causal decoder 主体，但在归一化、位置编码、FFN 和 attention head 共享上采用了更现代的选择：
+
+\begin{itemize}
+\item 使用 RMSNorm 而非标准 LayerNorm；
+\item 使用 RoPE 而非 learned absolute positional embedding；
+\item 使用 SwiGLU 或类似门控 FFN；
+\item 在一些版本中使用 GQA，以降低推理 KV Cache 成本；
+\item 通常采用 Pre-Norm 结构。
+\end{itemize}
+
+这些变化看似是模型细节，但对训练稳定性、推理显存、kernel 实现和分布式并行都有重要影响。
+
+\subsection{RMSNorm}
+\label{subsec:llama-rmsnorm}
+
+RMSNorm 定义为：
+[
+\RMSNorm(\vect{x})
+==================
+
+\gamma
+\frac{\vect{x}}
+{\sqrt{
+\frac{1}{H}\sum_{i=1}^{H}x_i^2+\epsilon
+}}.
+]
+它与 LayerNorm 的区别在于不减均值。LayerNorm 为：
+[
+\LayerNorm(\vect{x})
+====================
+
+\gamma
+\frac{\vect{x}-\mu}
+{\sqrt{\sigma^2+\epsilon}}
++
+\beta.
+]
+
+RMSNorm 的参数通常只有缩放项 $\gamma$，没有 bias。相比 LayerNorm，它计算更简单，少了一次均值计算和减均值步骤。对于每个 token 的 hidden 向量，它需要：
+
+\begin{itemize}
+\item 计算平方和 reduction；
+\item 求均值；
+\item rsqrt；
+\item 逐元素缩放。
+\end{itemize}
+
+虽然 RMSNorm 参数量很小，但它位于每一层的 attention 和 FFN 前面，调用频繁。若实现不佳，容易在 GPU 时间线上形成大量 memory-bound 小 kernel。因此生产系统常使用 fused RMSNorm kernel。
+
+\begin{lstlisting}[language=Python,caption={RMSNorm 的简洁实现},label={lst:llama-rmsnorm}]
+import torch
+import torch.nn as nn
+
+class RMSNorm(nn.Module):
+def **init**(self, hidden_size, eps=1e-6):
+super().**init**()
+self.weight = nn.Parameter(torch.ones(hidden_size))
+self.eps = eps
+
+```
+def forward(self, x):
+    # x: [batch, seq, hidden]
+    # Keep reduction in higher precision if needed in real systems.
+    variance = x.pow(2).mean(dim=-1, keepdim=True)
+    x = x * torch.rsqrt(variance + self.eps)
+    return self.weight * x
+```
+
+\end{lstlisting}
+
+实际实现中，RMSNorm 常会考虑：
+
+\begin{itemize}
+\item 输入 dtype 为 BF16/FP16 时，是否使用 FP32 accumulation；
+\item hidden size 是否满足向量化加载；
+\item 是否融合 residual add；
+\item 是否支持 tensor parallel 下的 sequence parallel；
+\item backward 是否保存 RMS 或重计算。
+\end{itemize}
+
+\subsection{RoPE}
+\label{subsec:llama-rope}
+
+RoPE 将位置信息注入到 Query 和 Key 中。对于 head 内的向量维度，每两个维度作为一个二维平面进行旋转：
+[
+\begin{bmatrix}
+x'*{2i}\
+x'*{2i+1}
+\end{bmatrix}
+=============
+
+\begin{bmatrix}
+\cos\theta_{pos,i} & -\sin\theta_{pos,i}\
+\sin\theta_{pos,i} & \cos\theta_{pos,i}
+\end{bmatrix}
+\begin{bmatrix}
+x_{2i}\
+x_{2i+1}
+\end{bmatrix}.
+]
+
+在 attention 中，RoPE 通常应用于：
+[
+\mat{Q},\mat{K},
+]
+而不应用于 $\mat{V}$。原因是位置关系主要通过 query-key 点积影响 attention score：
+[
+\mat{S}=\mat{Q}\mat{K}^{\mathsf{T}}.
+]
+
+RoPE 对推理有一个重要工程细节：decode 阶段每一步新 token 的 position id 必须正确。对于多轮对话、prefix cache、paged KV Cache、speculative decoding 或 chunked prefill，position id 管理会变得复杂。如果位置错位，即使模型权重正确，输出也会异常。
+
+下面是一个带 position ids 的 RoPE 简化实现：
+
+\begin{lstlisting}[language=Python,caption={带 position ids 的 RoPE 应用示意},label={lst:rope-with-position-ids}]
+def rotate_half(x):
+x_even = x[..., 0::2]
+x_odd = x[..., 1::2]
+return torch.stack((-x_odd, x_even), dim=-1).flatten(-2)
+
+def apply_rope_with_position_ids(q, k, cos_cache, sin_cache, position_ids):
+"""
+q, k: [batch, heads, seq, head_dim]
+cos_cache, sin_cache: [max_seq, head_dim]
+position_ids: [batch, seq]
+"""
+# Gather cos/sin according to actual positions.
+cos = cos_cache[position_ids]  # [batch, seq, head_dim]
+sin = sin_cache[position_ids]
+
+```
+cos = cos[:, None, :, :]      # [batch, 1, seq, head_dim]
+sin = sin[:, None, :, :]
+
+q = q * cos + rotate_half(q) * sin
+k = k * cos + rotate_half(k) * sin
+return q, k
+```
+
+\end{lstlisting}
+
+RoPE 的长上下文扩展通常涉及 base、频率或位置缩放策略。无论采用哪种策略，Infra 系统都要保证训练、微调、推理、KV Cache 和 batch 调度对 position ids 的理解一致。
+
+\subsection{SwiGLU}
+\label{subsec:llama-swiglu}
+
+LLaMA 风格模型通常使用 SwiGLU FFN。其形式为：
+[
+\operatorname{FFN}(\mat{X})
+===========================
+
+\left[
+\operatorname{SiLU}(\mat{X}\mat{W}_g)
+\odot
+(\mat{X}\mat{W}_u)
+\right]\mat{W}_d.
+]
+
+其中 gate projection 和 up projection 可以合并为一个 fused projection：
+[
+[\mat{G},\mat{U}]
+=================
+
+\mat{X}\mat{W}_{gu},
+]
+然后：
+[
+\mat{Y}
+=======
+
+\left[
+\operatorname{SiLU}(\mat{G})
+\odot
+\mat{U}
+\right]\mat{W}_d.
+]
+
+这样做可以把两次读取输入 $\mat{X}$ 的 GEMM 合并为一次更大的 GEMM，提高硬件效率。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+box/.style={draw, rounded corners=3pt, minimum width=1.6cm, minimum height=0.7cm, align=center},
+arrow/.style={-{Latex[length=2.3mm]}, thick},
+mult/.style={draw, circle, minimum size=0.6cm, fill=yellow!18}
+]
+
+```
+\node[font=\bfseries] at (0,3.1) {LLaMA 风格 SwiGLU FFN};
+
+\node[box, fill=blue!6] (x) at (-5.4,0.6) {$X$};
+
+\node[box, fill=orange!12, minimum width=2.3cm] (fused) at (-3.2,0.6) {Fused\\Gate+Up Proj};
+\node[box, fill=green!10] (splitg) at (-1.0,1.35) {$G$};
+\node[box, fill=green!10] (splitu) at (-1.0,-0.15) {$U$};
+
+\node[box, fill=purple!10] (silu) at (0.8,1.35) {SiLU};
+\node[mult] (mul) at (2.2,0.6) {$\odot$};
+\node[box, fill=orange!12] (down) at (3.8,0.6) {Down\\Proj};
+\node[box, fill=blue!6] (out) at (5.5,0.6) {$Y$};
+
+\draw[arrow] (x) -- (fused);
+\draw[arrow] (fused) -- (splitg);
+\draw[arrow] (fused) -- (splitu);
+\draw[arrow] (splitg) -- (silu);
+\draw[arrow] (silu) -- (mul);
+\draw[arrow] (splitu) -- (mul);
+\draw[arrow] (mul) -- (down);
+\draw[arrow] (down) -- (out);
+
+\node[align=left, text width=10.5cm] at (0,-1.6) {
+  Gate 与 Up projection 常合并为一个大 GEMM，然后在 hidden 维切分。
+  这能减少 kernel launch 与输入读取，是模型结构和硬件效率共同设计的例子。
+};
+```
+
+\end{tikzpicture}
+\caption{SwiGLU 中 gate/up projection 的融合实现直觉}
+\label{fig:llama-swiglu-fused-proj}
+\end{figure}
+
+SwiGLU 的参数量取决于中间维度 $H_{\mathrm{mid}}$。其主要参数为：
+[
+2HH_{\mathrm{mid}}+H_{\mathrm{mid}}H=3HH_{\mathrm{mid}}.
+]
+为了与标准 FFN 的 $8H^2$ 参数量接近，通常会选择：
+[
+H_{\mathrm{mid}}\approx \frac{8}{3}H,
+]
+再按硬件友好的倍数对齐。例如为了 Tensor Core、tensor parallel 和内存对齐，实际中间维度常会被 round 到某个整数倍。
+
+\subsection{GQA}
+\label{subsec:llama-gqa}
+
+Grouped-Query Attention，简称 GQA，是现代 LLM 推理优化的重要结构。设 query head 数为 $n_q$，key/value head 数为 $n_{kv}$，若：
+[
+1<n_{kv}<n_q,
+]
+则每组 query heads 共享一组 key/value。
+
+KV Cache 显存与 $n_{kv}$ 成正比。对于 $L$ 层模型，batch size 为 $B$，上下文长度为 $S$，head dim 为 $d_h$，每个元素 $s_{\mathrm{dtype}}$ bytes，KV Cache 粗略为：
+[
+M_{\mathrm{KV}}
+===============
+
+2\cdot L\cdot B\cdot S\cdot n_{kv}\cdot d_h\cdot s_{\mathrm{dtype}}.
+]
+其中前面的 $2$ 分别表示 K 和 V。
+
+如果从 MHA 的 $n_{kv}=n_q$ 改为 GQA 的 $n_{kv}=n_q/g$，则 KV Cache 大小约减少 $g$ 倍。对于推理 decode 阶段，这不仅减少显存，还减少读取 KV Cache 的带宽。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+q/.style={draw, rounded corners=2pt, fill=blue!10, minimum width=0.42cm, minimum height=0.38cm},
+kv/.style={draw, rounded corners=2pt, fill=orange!16, minimum width=0.9cm, minimum height=0.45cm, align=center},
+arrow/.style={-{Latex[length=1.8mm]}, thick}
+]
+
+```
+\node[font=\bfseries] at (0,3.0) {GQA：多个 Query Heads 共享一组 K/V};
+
+\foreach \i in {0,...,7} {
+  \node[q] (q\i) at ({-3.2+0.55*\i},1.55) {$Q$};
+}
+
+\node[kv] (kv1) at (-2.35,0.55) {K/V 1};
+\node[kv] (kv2) at (-0.15,0.55) {K/V 2};
+\node[kv] (kv3) at (2.05,0.55) {K/V 3};
+
+\foreach \i in {0,1,2} {
+  \draw[arrow] (q\i) -- (kv1);
+}
+\foreach \i in {3,4,5} {
+  \draw[arrow] (q\i) -- (kv2);
+}
+\foreach \i in {6,7} {
+  \draw[arrow] (q\i) -- (kv3);
+}
+
+\node[align=left, text width=9.8cm] at (0,-1.25) {
+  Query heads 保持较高数量以维持表达能力，K/V heads 减少以降低 KV Cache。
+  GQA 是服务系统友好的模型结构选择，尤其适合长上下文和大 batch decode。
+};
+```
+
+\end{tikzpicture}
+\caption{Grouped-Query Attention 中 Query 与 K/V head 的映射}
+\label{fig:gqa-query-kv-sharing}
+\end{figure}
+
+GQA 也带来实现细节。attention kernel 需要把多个 query heads 映射到同一个 kv head：
+[
+h_{kv}=\left\lfloor \frac{h_q}{g}\right\rfloor,
+]
+其中：
+[
+g=\frac{n_q}{n_{kv}}.
+]
+如果 kernel layout 设计不当，会造成不连续访存或额外 broadcast。高性能 serving 框架通常会对 GQA/MQA 做专门优化。
+
+\subsection{LLaMA 与 GPT 的差异}
+\label{subsec:llama-vs-gpt}
+
+GPT 风格和 LLaMA 风格都属于 Decoder-only Transformer，但现代 LLaMA 风格在若干组件上做了不同选择。下面给出一个概览表。
+
+\begin{table}[H]
+\centering
+\small
+\caption{GPT 风格与 LLaMA 风格 Decoder-only 架构对比}
+\label{tab:gpt-vs-llama}
+\begin{tabular}{p{0.22\textwidth}p{0.32\textwidth}p{0.34\textwidth}}
+\toprule
+\textbf{组件} & \textbf{GPT 风格常见设计} & \textbf{LLaMA 风格常见设计} \
+\midrule
+位置编码
+& Learned absolute positional embedding
+& RoPE，将位置信息注入 Q/K \
+\midrule
+归一化
+& LayerNorm
+& RMSNorm \
+\midrule
+FFN
+& GELU MLP
+& SwiGLU 门控 FFN \
+\midrule
+Attention
+& MHA 为主
+& MHA/GQA，现代版本常使用 GQA \
+\midrule
+Bias
+& 一些实现使用 bias
+& 常见实现中许多线性层不使用 bias \
+\midrule
+推理效率
+& 依赖具体实现
+& GQA、RoPE cache、RMSNorm 等更贴近现代 serving 优化 \
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+box/.style={draw, rounded corners=3pt, minimum width=1.8cm, minimum height=0.62cm, align=center},
+arrow/.style={-{Latex[length=2.1mm]}, thick}
+]
+
+```
+\node[font=\bfseries] at (0,3.5) {GPT Block vs LLaMA Block};
+
+% GPT
+\node[font=\bfseries] at (-3.5,2.75) {GPT 风格};
+\node[box, fill=blue!6] (gx) at (-3.5,2.0) {$X$};
+\node[box, fill=green!10] (gln1) at (-3.5,1.2) {LayerNorm};
+\node[box, fill=orange!12] (gattn) at (-3.5,0.4) {MHA\\Causal Attn};
+\node[box, fill=green!10] (gln2) at (-3.5,-0.4) {LayerNorm};
+\node[box, fill=purple!10] (gmlp) at (-3.5,-1.2) {GELU MLP};
+
+\draw[arrow] (gx) -- (gln1);
+\draw[arrow] (gln1) -- (gattn);
+\draw[arrow] (gattn) -- (gln2);
+\draw[arrow] (gln2) -- (gmlp);
+
+\node[align=center, text width=3.2cm] at (-3.5,-2.25) {
+  learned position embedding\\
+  LayerNorm + GELU
+};
+
+% LLaMA
+\node[font=\bfseries] at (3.5,2.75) {LLaMA 风格};
+\node[box, fill=blue!6] (lx) at (3.5,2.0) {$X$};
+\node[box, fill=green!10] (lrms1) at (3.5,1.2) {RMSNorm};
+\node[box, fill=orange!12] (lattn) at (3.5,0.4) {GQA/MHA\\RoPE Attn};
+\node[box, fill=green!10] (lrms2) at (3.5,-0.4) {RMSNorm};
+\node[box, fill=purple!10] (lmlp) at (3.5,-1.2) {SwiGLU MLP};
+
+\draw[arrow] (lx) -- (lrms1);
+\draw[arrow] (lrms1) -- (lattn);
+\draw[arrow] (lattn) -- (lrms2);
+\draw[arrow] (lrms2) -- (lmlp);
+
+\node[align=center, text width=3.4cm] at (3.5,-2.25) {
+  RoPE\\
+  RMSNorm + SwiGLU\\
+  GQA for serving
+};
+
+\draw[dashed, thick] (0,-2.65) -- (0,2.85);
+
+\node[align=left, text width=10.4cm] at (0,-3.35) {
+  二者都属于 Decoder-only Transformer。差异不在整体范式，而在位置编码、归一化、FFN 和 K/V head 共享等细节。
+};
+```
+
+\end{tikzpicture}
+\caption{GPT Block 与 LLaMA Block 的结构差异}
+\label{fig:gpt-vs-llama-block}
+\end{figure}
+
+\section{MoE 架构简介}
+\label{sec:moe-architecture-intro}
+
+Dense Transformer 中，每个 token 都经过相同的 FFN 参数。MoE，即 Mixture-of-Experts，则把 FFN 替换为多个专家网络，并由 router 为每个 token 选择少数专家。它的目标是提升模型总容量，同时控制每个 token 的实际计算量。
+
+\subsection{Expert、Router 与 Top-k Routing}
+\label{subsec:expert-router-topk}
+
+设一层 MoE 有 $E$ 个 experts：
+[
+{F_1,F_2,\ldots,F_E}.
+]
+每个 expert 通常是一个 FFN。给定 token hidden state $\vect{x}$，router 计算每个 expert 的得分：
+[
+\vect{r}=\vect{x}\mat{W}_r,
+\quad
+\vect{r}\in\mathbb{R}^{E}.
+]
+然后选择 top-$k$ 个 expert：
+[
+\mathcal{E}_k(\vect{x})=\operatorname{TopK}(\vect{r}).
+]
+输出为：
+[
+\operatorname{MoE}(\vect{x})
+============================
+
+\sum_{e\in \mathcal{E}_k(\vect{x})}
+\alpha_e F_e(\vect{x}),
+]
+其中 $\alpha_e$ 是 router softmax 后的权重。
+
+Top-1 routing 只选择一个 expert，计算最省但容量利用可能不平衡；Top-2 routing 选择两个 expert，通常更稳定但计算和通信更多。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+token/.style={draw, rounded corners=2pt, minimum width=0.9cm, minimum height=0.5cm, align=center, fill=blue!6},
+router/.style={draw, rounded corners=3pt, minimum width=1.65cm, minimum height=0.75cm, align=center, fill=orange!14},
+expert/.style={draw, rounded corners=3pt, minimum width=1.45cm, minimum height=0.65cm, align=center, fill=green!10},
+arrow/.style={-{Latex[length=2.2mm]}, thick},
+faint/.style={-{Latex[length=2.0mm]}, thick, gray!45}
+]
+
+```
+\node[font=\bfseries] at (0,3.2) {MoE Router 与 Expert 分发};
+
+\node[token] (x) at (-5.2,0.8) {$x$};
+\node[router] (r) at (-3.2,0.8) {Router\\Top-$k$};
+\draw[arrow] (x) -- (r);
+
+\foreach \i/\y in {1/2.0,2/1.1,3/0.2,4/-0.7,5/-1.6} {
+  \node[expert] (e\i) at (-0.6,\y) {Expert \i};
+}
+
+\draw[arrow] (r) -- node[above,sloped,font=\scriptsize] {selected} (e1);
+\draw[arrow] (r) -- node[above,sloped,font=\scriptsize] {selected} (e3);
+\draw[faint] (r) -- (e2);
+\draw[faint] (r) -- (e4);
+\draw[faint] (r) -- (e5);
+
+\node[router, fill=purple!10] (combine) at (2.0,0.8) {Weighted\\Combine};
+\draw[arrow] (e1.east) -- (combine);
+\draw[arrow] (e3.east) -- (combine);
+
+\node[token, fill=yellow!16] (out) at (4.3,0.8) {$y$};
+\draw[arrow] (combine) -- (out);
+
+\node[align=left, text width=10.4cm] at (0,-2.55) {
+  MoE 的核心是条件计算：每个 token 只激活少数 experts。
+  这让模型拥有很大的总参数量，但每个 token 的计算量只与 top-$k$ experts 有关。
+};
+```
+
+\end{tikzpicture}
+\caption{MoE 中 Router、Expert 与 Top-$k$ 路由}
+\label{fig:moe-router-topk}
+\end{figure}
+
+\subsection{稀疏激活与计算效率}
+\label{subsec:sparse-activation-compute-efficiency}
+
+Dense FFN 中，每个 token 都经过同一个大 FFN：
+[
+y=F(x).
+]
+MoE 中，每个 token 只经过少数专家：
+[
+y=\sum_{e\in\mathcal{E}_k(x)}\alpha_e F_e(x).
+]
+
+如果有 $E$ 个 experts，每个 expert 参数量为 $P_e$，则总 expert 参数量为：
+[
+P_{\mathrm{total}}=E P_e.
+]
+但每个 token 激活的参数量约为：
+[
+P_{\mathrm{active}}=kP_e.
+]
+当 $k\ll E$ 时：
+[
+P_{\mathrm{active}}\ll P_{\mathrm{total}}.
+]
+
+这就是 MoE 的吸引力：模型容量可以很大，但每 token FLOPs 不必等比例增长。对于同等计算预算，MoE 可能拥有更强的知识容量或任务分化能力。
+
+但 MoE 并非免费。Router 需要学习负载均衡，否则所有 token 都可能挤向少数 experts。常见做法是加入 auxiliary load balancing loss。若某些 experts 过载，而另一些空闲，就会出现：
+
+\begin{itemize}
+\item 计算负载不均；
+\item GPU 间通信不均；
+\item token dropping 或 padding waste；
+\item 训练不稳定；
+\item 推理 tail latency 上升。
+\end{itemize}
+
+\subsection{MoE 的通信挑战}
+\label{subsec:moe-communication-challenge}
+
+在单 GPU 上，MoE 可以看作动态选择不同 FFN。但在多 GPU 训练中，experts 往往分布在不同 GPU 上。token 需要根据 router 结果发送到对应 expert 所在 GPU，expert 计算后再把结果发回原位置。这通常需要 all-to-all 通信。
+
+MoE 通信流程可以抽象为：
+
+\begin{enumerate}
+\item 每个 GPU 上的 token 经过 router，得到目标 expert；
+\item 根据 expert placement，将 token dispatch 到对应 GPU；
+\item 每个 GPU 对收到的 token 按 expert 分组并执行 FFN；
+\item 将 expert 输出 combine 回原 token 顺序；
+\item 继续后续 Transformer block。
+\end{enumerate}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+gpu/.style={draw, rounded corners=4pt, minimum width=2.2cm, minimum height=1.2cm, align=center, fill=blue!6},
+expert/.style={draw, rounded corners=2pt, minimum width=0.8cm, minimum height=0.35cm, align=center, fill=green!12},
+arrow/.style={-{Latex[length=2.0mm]}, thick}
+]
+
+```
+\node[font=\bfseries] at (0,3.1) {MoE Expert Parallel 中的 All-to-All 通信};
+
+\foreach \i/\x in {0/-4.5,1/-1.5,2/1.5,3/4.5} {
+  \node[gpu] (g\i) at (\x,1.2) {GPU \i};
+  \node[expert] at (\x,1.55) {Expert};
+  \node[expert] at (\x,0.95) {Expert};
+}
+
+\foreach \i/\x in {0/-4.5,1/-1.5,2/1.5,3/4.5} {
+  \node[gpu, fill=orange!10] (o\i) at (\x,-1.1) {Output\\tokens};
+}
+
+\foreach \i in {0,...,3} {
+  \foreach \j in {0,...,3} {
+    \draw[arrow, opacity=0.35] (g\i.south) -- (o\j.north);
+  }
+}
+
+\node[align=left, text width=10.4cm] at (0,-2.55) {
+  MoE 的 token dispatch 和 combine 通常产生 all-to-all 通信。
+  在跨节点训练中，网络拓扑、带宽、expert placement 和负载均衡会直接决定吞吐。
+};
+```
+
+\end{tikzpicture}
+\caption{MoE Expert Parallel 中的 token dispatch 与 all-to-all 通信}
+\label{fig:moe-all-to-all}
+\end{figure}
+
+与 dense Transformer 中常见的 all-reduce、all-gather、reduce-scatter 不同，MoE 的 all-to-all 更依赖动态路由结果，通信形状也更不稳定。这使得 MoE 对网络和调度系统更敏感。
+
+\subsection{MoE 对训练与推理 Infra 的影响}
+\label{subsec:moe-impact-on-training-serving-infra}
+
+MoE 对训练 Infra 的影响包括：
+
+\begin{itemize}
+\item \textbf{expert parallel}：experts 分布到不同 GPU，需要 token dispatch；
+\item \textbf{all-to-all 通信}：通信模式更复杂，对网络带宽和延迟敏感；
+\item \textbf{负载均衡}：router 不均衡会造成部分 GPU 成为 straggler；
+\item \textbf{动态 shape}：每个 expert 收到的 token 数变化，GEMM shape 不稳定；
+\item \textbf{checkpoint 复杂}：expert 参数分布式保存和恢复需要清晰映射。
+\end{itemize}
+
+MoE 对推理 Infra 的影响也很明显：
+
+\begin{itemize}
+\item 单请求只激活部分 expert，但多请求 batch 中专家分布可能不均；
+\item expert placement 会影响跨 GPU 通信；
+\item 动态路由使 latency 更难预测；
+\item 缓存和 batching 策略要考虑专家负载；
+\item 量化时不同 experts 的统计分布可能不同。
+\end{itemize}
+
+MoE 的本质是用系统复杂度换模型容量。对于资源充足、网络强、工程栈成熟的团队，它可能带来很高的性价比；对于网络较弱或 serving 调度不成熟的环境，MoE 可能带来难以控制的尾延迟和通信瓶颈。
+
+\section{从架构选择到系统成本}
+\label{sec:architecture-choice-to-system-cost}
+
+本章讨论的每个组件都不仅是模型设计，也是系统设计。下面把 GPT、LLaMA 和 MoE 中的关键选择映射到系统成本。
+
+\subsection{位置编码与上下文扩展}
+\label{subsec:position-encoding-system-cost}
+
+Learned absolute position embedding 简单，但长上下文扩展受限。RoPE 更适合现代 LLM，但需要管理 cos/sin cache、position ids 和长上下文 scaling。对于 serving 系统，位置编码影响：
+
+\begin{itemize}
+\item prefill 与 decode 的 position id 一致性；
+\item prefix cache 复用时的位置偏移；
+\item speculative decoding 中草稿 token 的位置管理；
+\item sliding window 或 chunked attention 的相对位置处理；
+\item 长上下文外推策略是否与训练配置一致。
+\end{itemize}
+
+\subsection{GQA 与 KV Cache 成本}
+\label{subsec:gqa-kv-cache-system-cost}
+
+GQA 的系统收益可以直接从 KV Cache 公式看出：
+[
+M_{\mathrm{KV}}
+===============
+
+2LBSn_{kv}d_hs_{\mathrm{dtype}}.
+]
+在其他参数不变时，将 $n_{kv}$ 从 $n_q$ 降到 $n_q/4$，KV Cache 约减少四倍。对于长上下文和高并发 serving，这可能决定单卡能承载多少请求。
+
+但 GQA 也要求 attention kernel 支持 query head 到 kv head 的映射。如果实现不佳，节省的显存可能被不规则访存和低效 kernel 抵消。因此现代 serving 框架通常会对 MHA/MQA/GQA 分别优化。
+
+\subsection{SwiGLU 与 FFN GEMM}
+\label{subsec:swiglu-ffn-system-cost}
+
+SwiGLU 提升表达能力，但引入 gate/up/down 三个 projection。高效实现通常把 gate 和 up 合并为一个 GEMM：
+[
+[G,U]=XW_{gu}.
+]
+这使 GEMM 更大、更适合 Tensor Core，也减少一次输入读取。随后 SiLU、elementwise multiply 和 down projection 可以进一步通过 fusion 优化。
+
+对于 tensor parallel，FFN 的 up/gate projection 通常做 column parallel，down projection 通常做 row parallel。这会影响 all-reduce 或 reduce-scatter 的位置。后续张量并行章节会专门推导。
+
+\subsection{RMSNorm 与 fused kernel}
+\label{subsec:rmsnorm-fused-kernel-cost}
+
+RMSNorm 是 memory-bound 操作。若每一层有两个 RMSNorm，模型有 $L$ 层，则每个 forward 至少调用 $2L$ 次 norm。训练还需要 backward。若 norm、residual add、dropout 分散为多个 kernel，会产生大量小 kernel 和 HBM 读写。
+
+Fused RMSNorm 或 fused add-RMSNorm 可以把：
+[
+Y=\RMSNorm(X+R)
+]
+放进一个 kernel 中，减少一次或多次显存读写。这类优化看似细节，但在大模型端到端训练和推理中非常重要。
+
+\subsection{MoE 与网络拓扑}
+\label{subsec:moe-network-topology-cost}
+
+MoE 将 FFN 从 dense compute 变成 sparse conditional compute，同时把系统瓶颈从单纯 GEMM 扩展到 all-to-all 通信。Expert placement 应尽量利用高带宽拓扑：
+
+\begin{itemize}
+\item 节点内优先使用 NVLink/NVSwitch；
+\item 跨节点需要高性能 RDMA；
+\item expert parallel group 应与物理拓扑对齐；
+\item router 负载均衡影响每个 GPU 的实际 token 数；
+\item straggler 会拖慢整个训练 step。
+\end{itemize}
+
+这说明模型架构选择不能与硬件拓扑割裂。一个在论文中高效的 MoE 结构，如果部署在网络较弱的集群上，可能无法达到预期吞吐。
+
+\begin{table}[H]
+\centering
+\small
+\caption{现代 Decoder-only 架构组件与系统影响}
+\label{tab:decoder-component-system-impact}
+\begin{tabular}{p{0.22\textwidth}p{0.34\textwidth}p{0.34\textwidth}}
+\toprule
+\textbf{组件} & \textbf{模型侧作用} & \textbf{Infra 侧影响} \
+\midrule
+RoPE
+& 注入相对位置信息，支持更灵活位置建模
+& position id、cos/sin cache、长上下文 scaling、KV Cache 对齐。 \
+\midrule
+RMSNorm
+& 稳定训练，简化归一化
+& memory-bound，小 kernel 多，适合 fused implementation。 \
+\midrule
+SwiGLU
+& 提升 FFN 表达能力
+& gate/up/down GEMM，适合 projection fusion 与 tensor parallel。 \
+\midrule
+GQA
+& 减少 K/V heads，保持较多 query heads
+& KV Cache 显存和带宽下降，attention kernel 需支持 head mapping。 \
+\midrule
+MoE
+& 提升总参数容量，稀疏激活
+& all-to-all、负载均衡、expert placement、动态 batch shape。 \
+\midrule
+Tied Embedding
+& 共享输入输出词表权重
+& 减少参数，但影响 vocabulary parallel 和 checkpoint layout。 \
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{端到端现代 Decoder-only 模型实现骨架}
+\label{sec:modern-decoder-only-code-skeleton}
+
+下面给出一个教学版现代 LLaMA 风格 Decoder-only 模型骨架。它包含 token embedding、RMSNorm、RoPE、GQA、SwiGLU 和 lm head。代码强调结构关系，不追求生产性能。
+
+\begin{lstlisting}[language=Python,caption={教学版 LLaMA 风格 Decoder-only 模型骨架},label={lst:llama-style-model-skeleton}]
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class RMSNorm(nn.Module):
+def **init**(self, hidden_size, eps=1e-6):
+super().**init**()
+self.weight = nn.Parameter(torch.ones(hidden_size))
+self.eps = eps
+
+```
+def forward(self, x):
+    var = x.pow(2).mean(dim=-1, keepdim=True)
+    return self.weight * x * torch.rsqrt(var + self.eps)
+```
+
+def rotate_half(x):
+x_even = x[..., 0::2]
+x_odd = x[..., 1::2]
+return torch.stack((-x_odd, x_even), dim=-1).flatten(-2)
+
+def apply_rope(q, k, cos, sin):
+# q, k: [B, heads, S, D]
+cos = cos[None, None, :, :]
+sin = sin[None, None, :, :]
+q = q * cos + rotate_half(q) * sin
+k = k * cos + rotate_half(k) * sin
+return q, k
+
+class GQAAttention(nn.Module):
+def **init**(self, hidden_size, num_q_heads, num_kv_heads):
+super().**init**()
+assert hidden_size % num_q_heads == 0
+assert num_q_heads % num_kv_heads == 0
+
+```
+    self.hidden_size = hidden_size
+    self.num_q_heads = num_q_heads
+    self.num_kv_heads = num_kv_heads
+    self.head_dim = hidden_size // num_q_heads
+    self.group_size = num_q_heads // num_kv_heads
+
+    self.q_proj = nn.Linear(hidden_size, num_q_heads * self.head_dim, bias=False)
+    self.k_proj = nn.Linear(hidden_size, num_kv_heads * self.head_dim, bias=False)
+    self.v_proj = nn.Linear(hidden_size, num_kv_heads * self.head_dim, bias=False)
+    self.o_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+
+def forward(self, x, cos, sin):
+    B, S, H = x.shape
+
+    q = self.q_proj(x)
+    k = self.k_proj(x)
+    v = self.v_proj(x)
+
+    q = q.view(B, S, self.num_q_heads, self.head_dim).transpose(1, 2)
+    k = k.view(B, S, self.num_kv_heads, self.head_dim).transpose(1, 2)
+    v = v.view(B, S, self.num_kv_heads, self.head_dim).transpose(1, 2)
+
+    q, k = apply_rope(q, k, cos, sin)
+
+    # Repeat K/V heads so each query head has a corresponding K/V head.
+    # Production kernels avoid explicit repeat to save memory bandwidth.
+    k = k.repeat_interleave(self.group_size, dim=1)
+    v = v.repeat_interleave(self.group_size, dim=1)
+
+    scores = q @ k.transpose(-2, -1)
+    scores = scores / math.sqrt(self.head_dim)
+
+    causal_mask = torch.triu(
+        torch.ones(S, S, device=x.device, dtype=torch.bool),
+        diagonal=1,
+    )
+    scores = scores.masked_fill(causal_mask, float("-inf"))
+
+    probs = F.softmax(scores, dim=-1)
+    out = probs @ v
+
+    out = out.transpose(1, 2).contiguous().view(B, S, H)
+    return self.o_proj(out)
+```
+
+class SwiGLUMLP(nn.Module):
+def **init**(self, hidden_size, intermediate_size):
+super().**init**()
+self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
+self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
+self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
+
+```
+def forward(self, x):
+    return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+```
+
+class DecoderBlock(nn.Module):
+def **init**(self, hidden_size, num_q_heads, num_kv_heads, intermediate_size):
+super().**init**()
+self.input_norm = RMSNorm(hidden_size)
+self.attn = GQAAttention(hidden_size, num_q_heads, num_kv_heads)
+self.post_attn_norm = RMSNorm(hidden_size)
+self.mlp = SwiGLUMLP(hidden_size, intermediate_size)
+
+```
+def forward(self, x, cos, sin):
+    x = x + self.attn(self.input_norm(x), cos, sin)
+    x = x + self.mlp(self.post_attn_norm(x))
+    return x
+```
+
+class LlamaStyleModel(nn.Module):
+def **init**(self, vocab_size, hidden_size, num_layers,
+num_q_heads, num_kv_heads, intermediate_size):
+super().**init**()
+self.embed_tokens = nn.Embedding(vocab_size, hidden_size)
+self.layers = nn.ModuleList([
+DecoderBlock(hidden_size, num_q_heads, num_kv_heads, intermediate_size)
+for _ in range(num_layers)
+])
+self.norm = RMSNorm(hidden_size)
+self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
+
+```
+def forward(self, input_ids, cos, sin):
+    x = self.embed_tokens(input_ids)
+
+    for layer in self.layers:
+        x = layer(x, cos, sin)
+
+    x = self.norm(x)
+    logits = self.lm_head(x)
+    return logits
+```
+
+\end{lstlisting}
+
+这段代码中有意保留了一些低效实现，方便读者看到生产系统需要优化什么：
+
+\begin{itemize}
+\item GQA 中显式 \texttt{repeat_interleave} 会浪费显存和带宽；
+\item attention score 被显式物化；
+\item RoPE、mask、softmax、matmul 没有融合；
+\item 没有 KV Cache；
+\item 没有 fused RMSNorm；
+\item 没有 tensor parallel；
+\item logits 没有做 vocabulary parallel 或 fused cross entropy。
+\end{itemize}
+
+在真实训练和推理框架中，这些低效点会分别由 FlashAttention、PagedAttention、fused norm、parallel linear、KV Cache manager、vocab parallel cross entropy 等组件解决。也就是说，现代 AI Infra 的大量工作，正是把这个“教学上清晰的模型”重写成“硬件上高效的模型”。
+
+\section{本章小结}
+\label{sec:chapter06-summary}
+
+本章系统剖析了 GPT、LLaMA 与现代 Decoder-only LLM 架构，并把模型组件与系统成本联系起来。
+
+\begin{itemize}
+\item \textbf{Decoder-only LLM} 由 token embedding、堆叠 decoder blocks、final norm 和 lm head 组成，本质上执行 next-token prediction。
+\item \textbf{Embedding 与 LM Head} 的参数量与词表大小直接相关，大词表模型需要关注 vocabulary parallel、logits 显存和 fused cross entropy。
+\item \textbf{GPT 风格架构} 使用 causal self-attention、residual stream、LayerNorm/GELU 等组件，是现代 Decoder-only 模型的基础范式。
+\item \textbf{LLaMA 风格架构} 更常使用 RMSNorm、RoPE、SwiGLU 和 GQA，体现了现代模型对训练稳定性与推理效率的共同优化。
+\item \textbf{RMSNorm} 计算更简单，但仍然是 memory-bound 高频小算子，适合 fused kernel。
+\item \textbf{RoPE} 将位置信息注入 Q/K，带来更灵活的位置建模，同时要求推理系统正确管理 position ids 和 cos/sin cache。
+\item \textbf{SwiGLU} 通过门控 FFN 提升表达能力，工程上常将 gate/up projection 融合为大 GEMM。
+\item \textbf{GQA} 通过减少 K/V heads 降低 KV Cache 显存和带宽，是现代 LLM serving 友好的重要架构选择。
+\item \textbf{MoE} 用稀疏激活提升总模型容量，但引入 router、expert parallel、all-to-all 通信和负载均衡挑战。
+\item \textbf{模型结构就是系统设计}：每个架构选择都会影响显存、FLOPs、通信、kernel 实现、checkpoint 和 serving 调度。
+\end{itemize}
+
+至此，第二篇完成了从 Transformer 原理、LLM 发展范式到现代 Decoder-only 架构的主线。下一篇将进入分布式训练架构：从数据并行开始，分析为什么单卡无法支撑大模型训练，DDP 如何同步梯度，Ring AllReduce 如何工作，以及通信与计算如何重叠。

@@ -1,0 +1,934 @@
+\chapter{RDMA / RoCE 网络基础}
+\label{chap:rdma-roce}
+
+上一章讨论了单机多卡通信：在一台服务器内部，GPU 可以通过 PCIe、NVLink 与 NVSwitch 交换数据。但是，当模型规模、数据规模或并发请求规模继续扩大时，单机已经不够。训练一个千亿参数模型可能需要数百到数千张 GPU；服务一个高并发大模型系统可能需要跨越多个节点部署 prefill、decode、embedding、rerank、tool calling 或多模型实例。此时，通信路径从“GPU 到 GPU”进一步扩展为：
+
+\[
+  \text{GPU} \rightarrow \text{PCIe/NVLink} \rightarrow \text{NIC} \rightarrow \text{Switch Fabric} \rightarrow \text{NIC} \rightarrow \text{GPU}.
+\]
+
+这就是本章要讨论的问题：多机 GPU 集群中的网络如何影响训练和推理性能。
+
+在传统 Web 服务中，网络通常承载 RPC、HTTP、数据库访问、日志、对象存储等流量。对这些系统而言，毫秒级延迟往往已经足够，吞吐和可用性更重要。而在大模型训练中，GPU 每一步训练都可能需要跨节点同步数 GB 到数十 GB 的梯度、参数分片或激活张量。GPU 计算速度越快，网络越容易成为瓶颈。如果网络跟不上，GPU 就会在通信 barrier 前等待，昂贵的 Tensor Core 将处于空转状态。
+
+因此，AI 集群网络不是普通数据中心网络的简单放大版。它必须同时满足：
+
+\begin{itemize}
+  \item 高带宽：支持大规模 all-reduce、reduce-scatter、all-gather、all-to-all；
+  \item 低延迟：降低小消息、pipeline stage、decode 通信和控制路径等待；
+  \item 低 CPU 开销：避免 CPU 参与数据搬运，减少内核协议栈开销；
+  \item 拓扑可预测：让 collective 算法能够充分利用网络结构；
+  \item 拥塞可控：避免少量热点流量拖慢整个训练作业；
+  \item 可观测：能够定位链路、交换机、队列、NIC、NCCL 和作业层面的瓶颈。
+\end{itemize}
+
+RDMA、InfiniBand、RoCE 与 GPUDirect RDMA 正是为这类问题服务的关键技术。本章会从工程视角解释它们的基本概念，而不是陷入协议细节。读完本章后，你应该能够理解为什么 AI 集群常常选择 InfiniBand 或 RoCE 网络，为什么 RoCE 需要关注 PFC、ECN 和 lossless Ethernet，为什么 GPUDirect RDMA 能显著改善跨节点 GPU 通信，以及如何从 NCCL、网卡计数器和网络拓扑角度排查训练扩展性问题。
+
+\section{多机训练为什么依赖高性能网络}
+\label{sec:why-high-performance-network}
+
+多机训练的核心矛盾是：计算被分散到多张 GPU 上，但模型更新仍然需要在逻辑上保持一致。无论使用 DP、TP、PP、ZeRO 还是 MoE，只要跨越节点，就会产生网络通信。随着 GPU 数量增加，单卡计算时间可能下降，但通信路径变长、通信规模变大、同步等待增加，最终扩展效率会受到网络限制。
+
+\subsection{跨节点 All-Reduce}
+\label{subsec:cross-node-allreduce}
+
+数据并行中最典型的跨节点通信是梯度 all-reduce。假设有 $N$ 张 GPU，每张 GPU 持有一份完整模型副本，并处理不同 mini-batch。反向传播后，每张 GPU 得到本地梯度 $\nabla \theta_i$。为了让所有副本保持一致，需要计算平均梯度：
+
+\[
+  \nabla \theta = \frac{1}{N}\sum_{i=1}^{N}\nabla \theta_i.
+\]
+
+这通常通过 all-reduce 完成。每个 rank 输入自己的梯度 buffer，通信结束后每个 rank 都得到 reduce 后的完整结果。对于一个参数量为 $P$ 的模型，如果梯度使用 BF16 或 FP16，每个参数的梯度约为 2 字节，则一次梯度同步的逻辑数据规模大约为：
+
+\[
+  2P\ \text{Bytes}.
+\]
+
+对于十亿参数模型，这是 GB 级数据；对于百亿参数模型，梯度同步规模会更大。虽然实际系统会使用 bucket、overlap、reduce-scatter、ZeRO 等方法降低峰值显存和改善重叠，但通信总量仍然不容忽视。
+
+在 ring all-reduce 中，每个 rank 的通信量大致为：
+
+\[
+  V_{\text{ring}} \approx 2 \cdot \frac{N-1}{N} \cdot S,
+\]
+
+其中 $S$ 是待 all-reduce tensor 的大小。随着 $N$ 增大，单 rank 通信量接近 $2S$。如果网络有效带宽为 $B$，仅从带宽角度估计通信时间下界为：
+
+\[
+  T_{\text{comm}} \gtrsim \frac{2S}{B}.
+\]
+
+这个估计忽略了延迟、协议开销、拓扑、拥塞和实现细节，但足以说明一个问题：当梯度 buffer 很大时，网络带宽直接决定同步时间。
+
+\begin{figure}[H]
+  \centering
+  \begin{tikzpicture}[
+    font=\small,
+    nodebox/.style={draw, rounded corners, minimum width=2.0cm, minimum height=1.0cm, align=center},
+    gpu/.style={draw, rounded corners, minimum width=1.0cm, minimum height=0.55cm, align=center},
+    sw/.style={draw, rounded corners, minimum width=2.0cm, minimum height=0.75cm, align=center, fill=gray!10},
+    arrow/.style={-{Stealth[length=2mm]}, thick}
+  ]
+    \node[nodebox] (n0) at (-4,1.4) {Node 0};
+    \node[gpu] (g00) at (-4.55,0.75) {G0};
+    \node[gpu] (g01) at (-3.45,0.75) {G1};
+
+    \node[nodebox] (n1) at (0,1.4) {Node 1};
+    \node[gpu] (g10) at (-0.55,0.75) {G2};
+    \node[gpu] (g11) at (0.55,0.75) {G3};
+
+    \node[nodebox] (n2) at (4,1.4) {Node 2};
+    \node[gpu] (g20) at (3.45,0.75) {G4};
+    \node[gpu] (g21) at (4.55,0.75) {G5};
+
+    \node[sw] (leaf0) at (-2,3.1) {Leaf};
+    \node[sw] (leaf1) at (2,3.1) {Leaf};
+    \node[sw] (spine) at (0,4.5) {Spine};
+
+    \draw[arrow] (n0.north) -- (leaf0.south);
+    \draw[arrow] (n1.north) -- (leaf0.south);
+    \draw[arrow] (n1.north) -- (leaf1.south);
+    \draw[arrow] (n2.north) -- (leaf1.south);
+    \draw[arrow] (leaf0.north) -- (spine.south);
+    \draw[arrow] (leaf1.north) -- (spine.south);
+
+    \draw[arrow, dashed] (g00.south) .. controls (-2.2,-0.7) and (2.2,-0.7) .. (g21.south);
+    \node[align=center] at (0,-1.15) {跨节点 collective：GPU 数据经 NIC 与交换网络在节点间移动};
+  \end{tikzpicture}
+  \caption{多节点训练通信路径：节点内 GPU 通过本地互联到达 NIC，节点间数据经过交换网络传输。}
+  \label{fig:multi-node-training-path}
+\end{figure}
+
+\subsection{网络带宽与训练扩展性}
+\label{subsec:network-bandwidth-scaling}
+
+训练扩展性的目标是：增加 GPU 数量后，单位时间完成的训练 token 或 sample 尽可能线性增长。理想情况下，$N$ 张 GPU 的吞吐是单卡的 $N$ 倍。但现实中，扩展效率总是低于 100\%。一个简化的 step time 模型可以写成：
+
+\[
+  T_{\text{step}} = T_{\text{compute}} + T_{\text{comm}} - T_{\text{overlap}} + T_{\text{bubble}} + T_{\text{misc}}.
+\]
+
+其中：
+
+\begin{itemize}
+  \item $T_{\text{compute}}$ 是 GPU 计算时间；
+  \item $T_{\text{comm}}$ 是通信时间；
+  \item $T_{\text{overlap}}$ 是计算与通信重叠抵消掉的部分；
+  \item $T_{\text{bubble}}$ 是 pipeline bubble、同步等待等空洞；
+  \item $T_{\text{misc}}$ 包括数据加载、checkpoint、CPU 调度等其他开销。
+\end{itemize}
+
+网络优化的目标不是让 $T_{\text{comm}}$ 变成 0，而是让它尽量小，并尽可能与计算重叠。当 GPU 更快、模型更大、并行维度更多时，通信在 step time 中的占比会上升。尤其在下面几类场景中，网络更容易成为瓶颈：
+
+\begin{itemize}
+  \item 使用较小 micro-batch，单步计算时间短，通信难以隐藏；
+  \item TP 或 EP 跨节点，通信频率高；
+  \item ZeRO-3 每层 all-gather 参数，通信分散且频繁；
+  \item MoE all-to-all 产生复杂 east-west traffic；
+  \item 网络存在 oversubscription，多个作业互相争用带宽；
+  \item RoCE 拥塞控制不当，出现 PFC storm、丢包、重传或长尾延迟。
+\end{itemize}
+
+\subsection{Latency-Sensitive 与 Bandwidth-Sensitive}
+\label{subsec:latency-vs-bandwidth-sensitive}
+
+不同通信模式对网络的要求不同。可以粗略分为 latency-sensitive 和 bandwidth-sensitive 两类。
+
+\textbf{Latency-sensitive} 通信的特点是消息较小、频率较高、在关键路径上等待。例如：
+
+\begin{itemize}
+  \item pipeline parallel 相邻 stage 之间的小 activation 传输；
+  \item 推理 decode 阶段每层 tensor parallel collective；
+  \item 控制面元数据同步；
+  \item 小 batch 或小 tensor 上的 all-reduce；
+  \item MoE token dispatch 中大量小粒度消息。
+\end{itemize}
+
+这类通信即使数据量不大，也会因为等待和同步影响端到端延迟。优化重点是降低 RTT、减少协议栈开销、避免排队、减少 CPU 参与和减少不必要同步。
+
+\textbf{Bandwidth-sensitive} 通信的特点是消息大、传输时间主要由链路带宽决定。例如：
+
+\begin{itemize}
+  \item 数据并行大 bucket 梯度 all-reduce；
+  \item ZeRO reduce-scatter / all-gather 大参数分片；
+  \item checkpoint 分布式保存；
+  \item 大 batch embedding 或 parameter server 风格通信；
+  \item 大规模 MoE all-to-all。
+\end{itemize}
+
+这类通信的优化重点是提高有效带宽、增加多 rail 并行、选择合适 collective 算法、避免 oversubscription、让通信与计算重叠。
+
+\begin{table}[H]
+  \centering
+  \caption{Latency-sensitive 与 Bandwidth-sensitive 通信对比}
+  \label{tab:latency-bandwidth-communication}
+  \begin{tabular}{p{3.2cm}p{4.6cm}p{4.6cm}p{3.0cm}}
+    \toprule
+    类型 & 特征 & 典型场景 & 优化重点 \\
+    \midrule
+    Latency-sensitive & 小消息、高频、同步等待明显 & Decode TP、PP stage、控制面同步、小 tensor collective & 降低 RTT、减少 CPU 参与、减少同步和排队 \\
+    Bandwidth-sensitive & 大消息、传输时间由带宽主导 & DP all-reduce、ZeRO、checkpoint、MoE 大规模 all-to-all & 提高链路利用率、多 rail、拓扑感知 collective \\
+    Mixed & 消息大小变化大，既受延迟也受带宽影响 & MoE token dispatch、动态 batch serving、参数分片加载 & 分层调度、分桶、合并小消息、拥塞控制 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\subsection{通信瓶颈如何吞噬 GPU 利用率}
+\label{subsec:communication-bottleneck-gpu-utilization}
+
+通信瓶颈经常表现为 GPU 利用率下降，但它的根源并不在 GPU kernel 本身。一个训练 step 中，GPU 可能先执行 forward 和 backward kernel，然后等待 NCCL collective 完成，再进入下一层或下一步。如果通信无法与计算重叠，timeline 上就会出现明显空洞。
+
+更隐蔽的情况是：NCCL kernel 正在 GPU 上运行，但 SM utilization 并不高。此时从 \texttt{nvidia-smi} 看 GPU 可能不是完全空闲，但 Tensor Core 没有执行模型计算。训练吞吐仍然下降。对于 AI Infra 工程师，关键不是追求某个单一利用率指标，而是判断 GPU 时间到底花在：
+
+\begin{itemize}
+  \item 计算 kernel；
+  \item NCCL 通信 kernel；
+  \item memory copy；
+  \item CPU launch 等待；
+  \item stream synchronization；
+  \item dataloader 或存储等待；
+  \item checkpoint I/O。
+\end{itemize}
+
+这需要结合 Nsight Systems、NCCL 日志、网络计数器和训练框架日志一起看。一个成熟的性能分析流程一定是跨层的：从模型 step time 到 NCCL collective，从 GPU timeline 到 NIC counters，从 rank mapping 到交换机队列。
+
+\section{RDMA 基础}
+\label{sec:rdma-basics}
+
+RDMA 是 Remote Direct Memory Access 的缩写，即远程直接内存访问。它允许一台机器上的网卡直接读写另一台机器上的内存区域，而不需要远端 CPU 频繁参与数据拷贝，也不需要每个数据包都经过传统内核网络协议栈的完整处理路径。
+
+RDMA 的核心价值可以概括为三点：
+
+\begin{enumerate}
+  \item \textbf{低延迟}：绕过传统内核协议栈，减少系统调用、协议处理和上下文切换；
+  \item \textbf{低 CPU 开销}：数据搬运由 NIC 和 DMA 引擎完成，CPU 不需要参与每次拷贝；
+  \item \textbf{高带宽}：更容易接近网卡和链路的有效带宽上限。
+\end{enumerate}
+
+在 AI 集群中，RDMA 通常不是直接由训练代码手写 verbs API，而是被 NCCL、UCX、MPI、SHARP、NVSHMEM 或框架通信层间接使用。尽管如此，理解 RDMA 的基本对象仍然非常有帮助，因为很多故障和性能问题会暴露为 QP、CQ、MR、GID、LID、MTU、PFC、ECN、RoCE mode 等配置问题。
+
+\subsection{Kernel Bypass}
+\label{subsec:kernel-bypass}
+
+传统 TCP/IP 数据路径通常需要经过操作系统内核协议栈。发送数据时，应用把数据交给内核，内核处理 socket、TCP/IP 协议、拥塞控制、拷贝、网卡队列等；接收数据时，数据包到达网卡后，内核处理中断、协议栈、缓冲区，再把数据交给应用。这个路径通用、可靠、易用，但对高频低延迟通信来说开销较大。
+
+RDMA 的 kernel bypass 思想是：连接建立、资源注册等控制操作仍然需要内核参与，但数据路径尽量绕过内核。应用通过用户态库把 work request 提交给网卡队列，网卡直接从已注册内存读取或写入数据，并在完成后通过 completion queue 通知应用。
+
+\begin{figure}[H]
+  \centering
+  \begin{tikzpicture}[
+    font=\small,
+    box/.style={draw, rounded corners, minimum width=2.3cm, minimum height=0.7cm, align=center},
+    wide/.style={draw, rounded corners, minimum width=3.2cm, minimum height=0.75cm, align=center},
+    arrow/.style={-{Stealth[length=2mm]}, thick}
+  ]
+    \node[wide] (app1) at (-4,4.0) {Application};
+    \node[wide] (kernel1) at (-4,2.8) {Kernel TCP/IP};
+    \node[wide] (nic1) at (-4,1.6) {NIC};
+    \node[wide] (net1) at (-4,0.4) {Network};
+
+    \draw[arrow] (app1) -- (kernel1);
+    \draw[arrow] (kernel1) -- (nic1);
+    \draw[arrow] (nic1) -- (net1);
+
+    \node[wide] (app2) at (3.2,4.0) {Application};
+    \node[wide] (verbs) at (3.2,2.8) {User-space RDMA Lib};
+    \node[wide] (nic2) at (3.2,1.6) {RNIC / HCA};
+    \node[wide] (net2) at (3.2,0.4) {Network};
+
+    \draw[arrow] (app2) -- (verbs);
+    \draw[arrow] (verbs) -- (nic2);
+    \draw[arrow] (nic2) -- (net2);
+
+    \node[box, minimum width=2.4cm] at (-4,-0.8) {传统 TCP 路径};
+    \node[box, minimum width=2.4cm] at (3.2,-0.8) {RDMA 数据路径};
+
+    \draw[dashed] (-0.6,-1.3) -- (-0.6,4.5);
+    \node[align=center] at (-0.6,4.85) {对比};
+  \end{tikzpicture}
+  \caption{传统 TCP 与 RDMA 数据路径对比：RDMA 的数据面尽量绕过内核协议栈。}
+  \label{fig:tcp-vs-rdma-path}
+\end{figure}
+
+Kernel bypass 不是说内核完全不参与。RDMA 仍然需要内核驱动管理设备、权限、内存注册、连接建立和安全隔离。所谓 bypass 主要指高频数据收发路径不再为每个消息经过传统 TCP/IP 内核处理。
+
+\subsection{Zero-Copy}
+\label{subsec:zero-copy}
+
+Zero-copy 指数据在发送和接收过程中尽量避免 CPU 参与的额外内存拷贝。传统网络通信中，数据可能经历应用缓冲区到内核缓冲区、内核缓冲区到网卡 DMA buffer 等多次移动。RDMA 中，应用先把一段内存注册给 RDMA 设备，NIC 获得访问这段内存的权限和地址映射。之后，NIC 可以直接通过 DMA 从这段内存读取或写入。
+
+在 AI 训练中，zero-copy 的意义非常大。梯度、参数分片、activation 或 KV Cache 都可能是大 tensor。如果每次跨节点通信都需要 CPU 拷贝一份，CPU 内存带宽、缓存污染和延迟都会变成负担。RDMA 让通信库更接近“从源 buffer 直接送到目标 buffer”的理想路径。
+
+不过 zero-copy 也不是免费的。为了让 NIC 安全、正确地访问内存，需要 memory registration。注册过程可能涉及 pin memory、建立地址转换、设置访问权限等操作，成本不低。因此高性能通信库通常会复用注册内存，避免频繁注册和注销。
+
+\subsection{Queue Pair}
+\label{subsec:queue-pair}
+
+Queue Pair，简称 QP，是 RDMA 编程模型中的核心对象。一个 QP 通常包含：
+
+\begin{itemize}
+  \item Send Queue：应用向其中提交发送、写、读等 work request；
+  \item Receive Queue：用于接收远端发送过来的消息；
+  \item 与之关联的 Completion Queue：用于获取完成事件。
+\end{itemize}
+
+可以把 QP 理解为 RDMA 连接或通信端点的抽象。不同 QP 类型支持不同通信语义，例如可靠连接、非可靠连接、数据报等。AI 集群中最常见的上层用户通常不直接管理 QP，但 NCCL、UCX、MPI 等通信库会在底层创建并管理这些对象。
+
+\begin{figure}[H]
+  \centering
+  \begin{tikzpicture}[
+    font=\small,
+    box/.style={draw, rounded corners, minimum width=2.6cm, minimum height=0.7cm, align=center},
+    host/.style={draw, rounded corners, minimum width=4.0cm, minimum height=4.4cm, align=center},
+    arrow/.style={-{Stealth[length=2mm]}, thick}
+  ]
+    \node[host] (h0) at (-3.2,1.8) {};
+    \node[anchor=north west] at ($(h0.north west)+(0.2,-0.2)$) {Host A};
+    \node[box] (sq0) at (-3.2,2.8) {Send Queue};
+    \node[box] (rq0) at (-3.2,1.8) {Receive Queue};
+    \node[box] (cq0) at (-3.2,0.8) {Completion Queue};
+
+    \node[host] (h1) at (3.2,1.8) {};
+    \node[anchor=north west] at ($(h1.north west)+(0.2,-0.2)$) {Host B};
+    \node[box] (sq1) at (3.2,2.8) {Send Queue};
+    \node[box] (rq1) at (3.2,1.8) {Receive Queue};
+    \node[box] (cq1) at (3.2,0.8) {Completion Queue};
+
+    \draw[arrow] (sq0.east) -- node[above] {Work Request} (rq1.west);
+    \draw[arrow] (sq1.west) -- node[below] {Work Request} (rq0.east);
+    \draw[arrow] (rq0.south) -- (cq0.north);
+    \draw[arrow] (rq1.south) -- (cq1.north);
+
+    \node[align=center] at (0,-0.6) {QP 将用户态提交的 work request 与网卡数据路径连接起来};
+  \end{tikzpicture}
+  \caption{RDMA Queue Pair 抽象：发送队列、接收队列和完成队列共同描述通信端点。}
+  \label{fig:rdma-queue-pair}
+\end{figure}
+
+\subsection{Completion Queue}
+\label{subsec:completion-queue}
+
+Completion Queue，简称 CQ，用来通知应用某个 work request 已经完成。应用可以轮询 CQ，也可以使用事件通知。高性能通信库通常偏向轮询，因为轮询可以避免中断和上下文切换开销，但会消耗 CPU core。许多 AI 集群会为通信线程、NCCL proxy、MPI progress engine 等预留 CPU 资源，以免这些通信路径被业务线程或系统任务干扰。
+
+CQ 的存在提醒我们：RDMA 降低了 CPU 数据搬运开销，但并不意味着 CPU 完全无关。连接管理、队列推进、completion 处理、错误处理、通信库调度仍然需要 CPU 或专门的硬件机制支持。如果 CPU 过载，网络性能仍然可能下降。
+
+\subsection{Memory Registration}
+\label{subsec:memory-registration}
+
+RDMA 设备不能随意访问进程的任意虚拟内存。应用需要先注册内存区域，得到 Memory Region，简称 MR。注册后，设备获得这段内存的访问权限和地址映射，并生成 local key 或 remote key，用于本地或远端访问验证。
+
+Memory registration 的工程意义包括：
+
+\begin{itemize}
+  \item 注册内存通常需要 pin 住物理页，防止被操作系统换出或移动；
+  \item 注册和注销有成本，不应在热路径中频繁执行；
+  \item 通信库通常会维护 registration cache；
+  \item 容器、权限、IOMMU、驱动和内核模块都可能影响注册行为；
+  \item GPUDirect RDMA 中，注册对象可能是 GPU memory，而不只是 CPU memory。
+\end{itemize}
+
+对于大模型训练，频繁分配和释放通信 buffer 可能导致 registration cache miss、内存碎片和性能抖动。因此框架通常会复用 gradient bucket、通信 workspace、参数 shard buffer 等内存区域。
+
+\section{InfiniBand 与 RoCE}
+\label{sec:infiniband-and-roce}
+
+RDMA 是一种能力或编程模型，而 InfiniBand 和 RoCE 是实现 RDMA 网络的两类常见方式。它们在 AI 集群中都很常见。
+
+\subsection{InfiniBand 网络}
+\label{subsec:infiniband-network}
+
+InfiniBand 是为高性能计算和低延迟通信设计的专用网络技术。它通常由 HCA、InfiniBand switch、subnet manager、专用线缆和协议栈组成。InfiniBand 的优势在于端到端设计较为一致，天然支持 RDMA，延迟低、带宽高、拥塞控制和拓扑管理能力成熟。
+
+在 AI 训练集群中，InfiniBand 常用于跨节点 GPU 通信。NCCL 可以通过 InfiniBand HCA 在节点间传输 collective 数据，并结合 GPUDirect RDMA 实现 GPU memory 与 NIC 的直接数据路径。
+
+InfiniBand 的典型运维关注点包括：
+
+\begin{itemize}
+  \item HCA 速率、端口状态和 link width；
+  \item subnet manager 是否稳定；
+  \item LID、SL、MTU、GID 等配置；
+  \item switch 端口错误计数；
+  \item fabric 拓扑和路由；
+  \item 多 rail 绑定和 rank 到 NIC 的映射；
+  \item NCCL 是否正确选择 IB 设备。
+\end{itemize}
+
+\subsection{RoCEv1 / RoCEv2}
+\label{subsec:rocev1-rocev2}
+
+RoCE 是 RDMA over Converged Ethernet，即在以太网上承载 RDMA。它的吸引力在于可以复用以太网生态：交换机、布线、运维体系、IP 网络能力等。RoCE 主要有两个版本：
+
+\begin{itemize}
+  \item \textbf{RoCEv1}：运行在二层以太网上，不能跨三层路由；
+  \item \textbf{RoCEv2}：把 RDMA transport 封装在 UDP/IP 上，可以跨三层网络。
+\end{itemize}
+
+RoCEv2 是现代数据中心更常见的形态，因为它更容易与 leaf-spine、L3 routing、ECMP 等数据中心网络设计结合。但 RoCE 的挑战也很明显：传统以太网默认不是无损网络，而 RDMA 对丢包非常敏感。如果发生丢包，性能可能急剧下降。因此 RoCE 网络通常需要配置 PFC、ECN、QoS、buffer、拥塞控制和优先级映射。
+
+\begin{figure}[H]
+  \centering
+  \begin{tikzpicture}[
+    font=\small,
+    layer/.style={draw, rounded corners, minimum width=8.8cm, minimum height=0.65cm, align=center},
+    arrow/.style={-{Stealth[length=2mm]}, thick}
+  ]
+    \node[layer] (app) at (0,4.2) {NCCL / UCX / MPI / Application};
+    \node[layer] (verbs) at (0,3.35) {RDMA Verbs / Communication Runtime};
+    \node[layer] (ibtransport) at (0,2.5) {InfiniBand Transport};
+    \node[layer] (udp) at (0,1.65) {UDP / IP（RoCEv2）};
+    \node[layer] (eth) at (0,0.8) {Ethernet + QoS / PFC / ECN};
+    \node[layer] (phy) at (0,-0.05) {NIC / Switch / Physical Link};
+
+    \draw[arrow] (app) -- (verbs);
+    \draw[arrow] (verbs) -- (ibtransport);
+    \draw[arrow] (ibtransport) -- (udp);
+    \draw[arrow] (udp) -- (eth);
+    \draw[arrow] (eth) -- (phy);
+
+    \node[align=center] at (5.4,2.1) {RoCEv2：\\将 RDMA 传输封装\\在 UDP/IP/Ethernet 上};
+  \end{tikzpicture}
+  \caption{RoCEv2 协议栈抽象：RDMA transport 通过 UDP/IP 承载在以太网 fabric 上。}
+  \label{fig:roce-v2-stack}
+\end{figure}
+
+\subsection{Lossless Ethernet}
+\label{subsec:lossless-ethernet}
+
+RoCE 的关键工程目标是构造近似无损的以太网环境。所谓 lossless 并不是说永远不会出错，而是通过链路层流控、拥塞通知、队列管理和 QoS 配置，尽量避免因拥塞丢包导致 RDMA 重传或连接异常。
+
+在普通 TCP 网络中，丢包常被用作拥塞信号，TCP 会重传并降低发送速率。但 RDMA transport 对丢包更敏感，重传和恢复成本高。对于大规模 all-reduce 或 all-to-all，少量链路丢包可能造成整个训练 step 长尾变长，因为 collective 通常需要等待最慢 rank。
+
+Lossless Ethernet 的核心组件包括：
+
+\begin{itemize}
+  \item \textbf{PFC}：Priority Flow Control，在特定优先级上暂停上游发送，避免队列溢出；
+  \item \textbf{ECN}：Explicit Congestion Notification，在不丢包的情况下标记拥塞；
+  \item \textbf{DCQCN 或类似拥塞控制}：发送端根据拥塞信号调节速率；
+  \item \textbf{QoS / DSCP / PCP 映射}：确保 RoCE 流量进入正确优先级队列；
+  \item \textbf{交换机 buffer 配置}：避免瞬时突发导致丢包；
+  \item \textbf{ECMP 与路由设计}：在多路径网络中平衡流量。
+\end{itemize}
+
+\subsection{PFC 与 ECN}
+\label{subsec:pfc-ecn}
+
+PFC 和 ECN 经常一起出现，但它们解决的问题不同。
+
+PFC 是链路层暂停机制。当某个交换机端口上的特定优先级队列接近拥塞阈值时，可以向上游发送 pause frame，要求对方暂停该优先级流量。这样可以避免队列溢出丢包。它的优点是直接有效，缺点是可能造成 head-of-line blocking、拥塞扩散，甚至在配置不当时出现 PFC storm。
+
+ECN 是网络层拥塞标记机制。当交换机检测到队列拥塞时，不直接丢包，而是在 IP header 中标记 ECN。接收端或协议栈把拥塞信号反馈给发送端，发送端降低速率。相比 PFC，ECN 更适合做端到端拥塞控制，但它要求网络路径上的设备都正确支持和配置。
+
+\begin{table}[H]
+  \centering
+  \caption{PFC 与 ECN 的工程对比}
+  \label{tab:pfc-ecn-comparison}
+  \begin{tabular}{p{2.8cm}p{5.0cm}p{5.0cm}}
+    \toprule
+    机制 & 优势 & 风险 \\
+    \midrule
+    PFC & 可以快速阻止特定优先级队列丢包，适合构造无损队列 & 可能导致 head-of-line blocking、拥塞扩散、pause storm \\
+    ECN & 不丢包即可反馈拥塞，支持端到端速率调节 & 需要端到端设备和主机协议栈正确配置，阈值不当会影响吞吐或延迟 \\
+    QoS 映射 & 将 RoCE 流量放入专用优先级，避免与普通流量互相干扰 & 映射错误会让 RoCE 流量进入非无损队列或错误拥塞控制域 \\
+    Buffer 调优 & 吸收突发流量，降低瞬时丢包概率 & 过大 buffer 可能增加排队延迟，过小 buffer 容易丢包或触发 PFC \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+AI 集群中的 PFC/ECN 配置不能照搬普通业务网络。训练流量具有明显 collective 特征：all-reduce、reduce-scatter、all-gather、all-to-all 会产生同步、突发和多对多模式。错误的阈值可能在小规模测试中看不出问题，但在大规模训练中导致长尾延迟、NCCL timeout 或吞吐抖动。
+
+\subsection{拥塞控制}
+\label{subsec:congestion-control}
+
+拥塞控制的目标是让网络在高负载下仍然稳定运行。对 RoCE 来说，拥塞控制尤其重要，因为它既要避免丢包，又要避免过度 PFC 导致拥塞扩散。
+
+AI 集群中的拥塞来源包括：
+
+\begin{itemize}
+  \item 多个训练作业共享同一 leaf-spine 网络；
+  \item MoE all-to-all 造成多对多突发；
+  \item checkpoint 或数据加载与训练通信混用网络；
+  \item 错误 rank mapping 导致某些链路热点；
+  \item ECMP hash 不均匀，多个大流落到同一路径；
+  \item oversubscription 过高；
+  \item 某个节点或 NIC 异常导致重传和尾延迟。
+\end{itemize}
+
+拥塞控制不是只调一个参数。它涉及主机、NIC、交换机、QoS、队列、路由、NCCL 算法和作业调度。工程上应建立一套闭环：压测、监控、告警、定位、回归。不要只在训练作业报错后才查看交换机丢包计数；更好的做法是在集群上线前就用 NCCL tests、ib\_write\_bw、perftest、RoCE counters、交换机 telemetry 做基线测试。
+
+\section{GPUDirect RDMA}
+\label{sec:gpudirect-rdma}
+
+RDMA 让 NIC 可以直接访问主机内存，而 GPUDirect RDMA 进一步让 NIC 可以直接访问 GPU memory。对于多节点 GPU 训练，这是非常关键的能力。没有 GPUDirect RDMA 时，跨节点通信可能需要经过 CPU host memory staging：
+
+\[
+  \text{GPU HBM} \rightarrow \text{CPU Memory} \rightarrow \text{NIC} \rightarrow \text{Network}.
+\]
+
+有 GPUDirect RDMA 时，理想路径可以变成：
+
+\[
+  \text{GPU HBM} \rightarrow \text{NIC} \rightarrow \text{Network}.
+\]
+
+接收方向同理，远端数据可以由 NIC 直接写入 GPU memory。这样可以减少 CPU 内存拷贝、降低延迟、释放 CPU 资源，并提高跨节点 GPU collective 的效率。
+
+\subsection{GPU Memory 直接被 NIC 访问}
+\label{subsec:nic-access-gpu-memory}
+
+GPUDirect RDMA 需要 GPU、NIC、驱动、内核模块、PCIe 拓扑和系统配置共同支持。NIC 要能够通过 PCIe peer-to-peer DMA 访问 GPU memory；GPU 驱动需要暴露相应的 peer memory 支持；通信库需要正确注册 GPU buffer 并使用支持 GPUDirect 的数据路径。
+
+从应用层看，这些细节通常被 NCCL 或 UCX 封装。例如 PyTorch 中一个跨节点 \texttt{dist.all\_reduce} 操作，底层可能通过 NCCL 使用 InfiniBand 或 RoCE，并利用 GPUDirect RDMA 直接传输 CUDA tensor。
+
+\begin{figure}[H]
+  \centering
+  \begin{tikzpicture}[
+    font=\small,
+    box/.style={draw, rounded corners, minimum width=2.1cm, minimum height=0.75cm, align=center},
+    nodebox/.style={draw, rounded corners, minimum width=5.0cm, minimum height=3.5cm, align=center},
+    arrow/.style={-{Stealth[length=2mm]}, thick}
+  ]
+    \node[nodebox] (nodea) at (-3.3,1.8) {};
+    \node[anchor=north west] at ($(nodea.north west)+(0.2,-0.2)$) {Node A};
+    \node[box] (gpua) at (-4.2,2.4) {GPU HBM};
+    \node[box] (nica) at (-2.4,1.2) {NIC / HCA};
+    \node[box] (cpua) at (-4.2,1.2) {CPU Memory};
+
+    \node[nodebox] (nodeb) at (3.3,1.8) {};
+    \node[anchor=north west] at ($(nodeb.north west)+(0.2,-0.2)$) {Node B};
+    \node[box] (gpub) at (4.2,2.4) {GPU HBM};
+    \node[box] (nicb) at (2.4,1.2) {NIC / HCA};
+    \node[box] (cpub) at (4.2,1.2) {CPU Memory};
+
+    \node[box, minimum width=2.8cm] (net) at (0,1.2) {RDMA Network};
+
+    \draw[arrow] (gpua) -- node[above left] {\scriptsize P2P DMA} (nica);
+    \draw[arrow] (nica) -- (net);
+    \draw[arrow] (net) -- (nicb);
+    \draw[arrow] (nicb) -- node[above right] {\scriptsize P2P DMA} (gpub);
+
+    \draw[dashed] (gpua) -- (cpua);
+    \draw[dashed] (cpub) -- (gpub);
+
+    \node[align=center] at (0,-0.3) {实线：GPUDirect RDMA 数据路径；虚线：传统 CPU staging 路径};
+  \end{tikzpicture}
+  \caption{GPUDirect RDMA 数据流：NIC 可以直接读写 GPU memory，减少 CPU host memory 中转。}
+  \label{fig:gpudirect-rdma-dataflow}
+\end{figure}
+
+\subsection{绕过 CPU Copy}
+\label{subsec:bypass-cpu-copy}
+
+绕过 CPU copy 的价值不仅是减少一次数据拷贝。它还减少了多个隐性开销：
+
+\begin{itemize}
+  \item CPU 内存带宽不再成为跨节点 GPU 通信的中间瓶颈；
+  \item CPU cache 不会被大 tensor 通信污染；
+  \item CPU core 可以用于 dataloader、通信进度、调度和服务逻辑；
+  \item 降低端到端延迟，尤其对小消息和频繁通信有帮助；
+  \item 减少内存分配、pin memory 和 staging buffer 管理复杂度。
+\end{itemize}
+
+不过 GPUDirect RDMA 也有条件和限制。它依赖设备拓扑。如果 GPU 和 NIC 之间跨越不支持 P2P 的 PCIe switch 或平台配置不当，性能可能下降或功能不可用。多 NUMA、多 NIC、多 GPU 节点中，GPU 与 NIC 的亲和性尤其重要。上一章中 \texttt{nvidia-smi topo -m} 的 GPU-NIC 路径，在跨节点通信中会变得更加关键。
+
+\subsection{NCCL 跨节点通信}
+\label{subsec:nccl-cross-node-communication}
+
+NCCL 在多节点环境中会自动选择可用的网络传输路径。常见环境变量包括：
+
+\begin{itemize}
+  \item \texttt{NCCL\_DEBUG}：打开调试日志；
+  \item \texttt{NCCL\_DEBUG\_SUBSYS}：指定调试子系统；
+  \item \texttt{NCCL\_SOCKET\_IFNAME}：指定 socket 网络接口；
+  \item \texttt{NCCL\_IB\_HCA}：指定 InfiniBand / RoCE HCA；
+  \item \texttt{NCCL\_IB\_GID\_INDEX}：选择 RoCE GID；
+  \item \texttt{NCCL\_IB\_ROCE\_VERSION\_NUM}：指定 RoCE version；
+  \item \texttt{NCCL\_NET\_GDR\_LEVEL}：影响 GPUDirect RDMA 使用策略。
+\end{itemize}
+
+下面是一个用于调试的多节点 NCCL 测试示例：
+
+\begin{lstlisting}[language=bash,caption={多节点 NCCL 通信调试示例},label={lst:nccl-rdma-debug}]
+export NCCL_DEBUG=INFO
+export NCCL_DEBUG_SUBSYS=INIT,NET,GRAPH,TOPO,COLL
+export NCCL_IB_HCA=mlx5_0,mlx5_1
+export NCCL_SOCKET_IFNAME=eth0
+
+mpirun -np 16 -H node0:8,node1:8 \
+  ./build/all_reduce_perf -b 8M -e 8G -f 2 -g 1
+\end{lstlisting}
+
+NCCL 日志中需要重点观察：
+
+\begin{itemize}
+  \item 是否检测到 IB/RoCE 设备；
+  \item 是否使用了预期 HCA；
+  \item 是否启用 GPUDirect RDMA；
+  \item channel 数量是否合理；
+  \item ring/tree 拓扑是否符合节点结构；
+  \item 是否 fallback 到 socket；
+  \item 是否存在连接错误、timeout 或 retry。
+\end{itemize}
+
+如果 NCCL 意外 fallback 到 TCP socket，训练仍然可能运行，但性能会显著下降。很多“训练突然变慢”的问题，最终都能在 NCCL 初始化日志中发现线索。
+
+\subsection{多 NIC、多 Rail 与拓扑感知}
+\label{subsec:multi-nic-multirail}
+
+高端 AI 服务器通常配备多张 NIC 或多端口 HCA。多 rail 的目标是让多个网络端口并行承载通信，提高总带宽并改善拓扑利用率。例如，一个 8 GPU 节点可能有 4 张 400Gb/s NIC，每两张 GPU 共享或靠近一张 NIC。理想情况下，rank 应该优先使用距离自己更近的 NIC，避免跨 NUMA 或跨 PCIe switch 访问远端 NIC。
+
+多 rail 设计涉及三个映射：
+
+\begin{enumerate}
+  \item GPU 到 NIC 的物理拓扑映射；
+  \item rank 到 GPU 的映射；
+  \item NCCL channel 到 NIC rail 的映射。
+\end{enumerate}
+
+如果这些映射不一致，可能出现某些 NIC 过载、某些 NIC 空闲，或者 GPU 访问远端 NIC 导致 PCIe/NUMA 瓶颈。
+
+\begin{figure}[H]
+  \centering
+  \begin{tikzpicture}[
+    font=\small,
+    gpu/.style={draw, rounded corners, minimum width=0.9cm, minimum height=0.55cm, align=center},
+    nic/.style={draw, rounded corners, minimum width=1.2cm, minimum height=0.6cm, align=center, fill=gray!10},
+    sw/.style={draw, rounded corners, minimum width=2.0cm, minimum height=0.7cm, align=center},
+    fast/.style={line width=1.1pt},
+    arrow/.style={-{Stealth[length=2mm]}, thick}
+  ]
+    \foreach \i/\x in {0/-3.5,1/-2.5,2/-1.5,3/-0.5,4/0.5,5/1.5,6/2.5,7/3.5} {
+      \node[gpu] (g\i) at (\x,0.4) {G\i};
+    }
+
+    \node[nic] (n0) at (-3.0,2.0) {NIC0};
+    \node[nic] (n1) at (-1.0,2.0) {NIC1};
+    \node[nic] (n2) at (1.0,2.0) {NIC2};
+    \node[nic] (n3) at (3.0,2.0) {NIC3};
+
+    \node[sw] (fabric) at (0,3.6) {Network Fabric};
+
+    \draw[fast] (g0.north) -- (n0.south);
+    \draw[fast] (g1.north) -- (n0.south);
+    \draw[fast] (g2.north) -- (n1.south);
+    \draw[fast] (g3.north) -- (n1.south);
+    \draw[fast] (g4.north) -- (n2.south);
+    \draw[fast] (g5.north) -- (n2.south);
+    \draw[fast] (g6.north) -- (n3.south);
+    \draw[fast] (g7.north) -- (n3.south);
+
+    \draw[arrow] (n0.north) -- (fabric.south);
+    \draw[arrow] (n1.north) -- (fabric.south);
+    \draw[arrow] (n2.north) -- (fabric.south);
+    \draw[arrow] (n3.north) -- (fabric.south);
+
+    \node[align=center] at (0,-0.75) {多 rail 节点：rank、GPU 与 NIC 的亲和性会影响跨节点通信性能};
+  \end{tikzpicture}
+  \caption{多 NIC / 多 rail 拓扑感知：GPU 应尽量使用拓扑距离更近的 NIC。}
+  \label{fig:multi-nic-multirail}
+\end{figure}
+
+\section{AI 集群网络设计}
+\label{sec:ai-cluster-network-design}
+
+理解 RDMA 和 RoCE 之后，还需要从集群整体设计角度看网络。AI 集群网络不只是“每台机器插几张网卡”，还包括拓扑、交换机层级、oversubscription、路由、拥塞控制、监控和调度协同。
+
+\subsection{Fat-Tree}
+\label{subsec:fat-tree}
+
+Fat-tree 是数据中心和 HPC 中常见的拓扑思想。它通过多层交换机构造高带宽 bisection bandwidth，让任意两个节点之间都有较好的通信路径。典型 leaf-spine 架构可以看作 fat-tree 的一种数据中心实现：服务器连接到 leaf switch，leaf switch 上联到 spine switch，spine 之间提供横向互联能力。
+
+对于 AI 训练，fat-tree 的优点是拓扑规则、扩展性好、路径多，适合集体通信。缺点是成本高，尤其当目标是低 oversubscription 或 non-blocking fabric 时，需要大量高速交换机端口和光模块。
+
+\begin{figure}[H]
+  \centering
+  \begin{tikzpicture}[
+    font=\small,
+    srv/.style={draw, rounded corners, minimum width=1.1cm, minimum height=0.55cm, align=center},
+    sw/.style={draw, rounded corners, minimum width=1.5cm, minimum height=0.65cm, align=center, fill=gray!10},
+    link/.style={line width=0.8pt}
+  ]
+    \node[sw] (s0) at (-3,4.0) {Spine0};
+    \node[sw] (s1) at (-1,4.0) {Spine1};
+    \node[sw] (s2) at (1,4.0) {Spine2};
+    \node[sw] (s3) at (3,4.0) {Spine3};
+
+    \node[sw] (l0) at (-3,2.2) {Leaf0};
+    \node[sw] (l1) at (-1,2.2) {Leaf1};
+    \node[sw] (l2) at (1,2.2) {Leaf2};
+    \node[sw] (l3) at (3,2.2) {Leaf3};
+
+    \foreach \l in {l0,l1,l2,l3} {
+      \foreach \s in {s0,s1,s2,s3} {
+        \draw[link] (\l.north) -- (\s.south);
+      }
+    }
+
+    \foreach \i/\x in {0/-3.6,1/-2.4,2/-1.6,3/-0.4,4/0.4,5/1.6,6/2.4,7/3.6} {
+      \node[srv] (n\i) at (\x,0.6) {Node\i};
+    }
+
+    \draw[link] (n0.north) -- (l0.south);
+    \draw[link] (n1.north) -- (l0.south);
+    \draw[link] (n2.north) -- (l1.south);
+    \draw[link] (n3.north) -- (l1.south);
+    \draw[link] (n4.north) -- (l2.south);
+    \draw[link] (n5.north) -- (l2.south);
+    \draw[link] (n6.north) -- (l3.south);
+    \draw[link] (n7.north) -- (l3.south);
+
+    \node[align=center] at (0,-0.35) {Leaf-Spine / Fat-tree：提供多路径、高横向带宽的 AI 集群网络};
+  \end{tikzpicture}
+  \caption{AI 集群 leaf-spine 网络拓扑示意：节点通过 leaf 接入，多 leaf 通过 spine 互联。}
+  \label{fig:ai-cluster-leaf-spine}
+\end{figure}
+
+\subsection{Dragonfly}
+\label{subsec:dragonfly}
+
+Dragonfly 是另一类高性能网络拓扑，常见于大型 HPC 系统。它通过 group 内高带宽连接和 group 间全局连接，在较低直径下连接大量节点。相比 fat-tree，dragonfly 可以在某些规模下减少交换机和线缆成本，但路由、拥塞控制和流量工程更加复杂。
+
+对于 AI 集群，dragonfly 的适用性取决于通信模式。如果 workload 以规则 collective 为主，并且通信库和路由能够充分利用 topology-aware 算法，dragonfly 可以提供良好性能。但如果多个作业混部、all-to-all 流量复杂、拥塞控制不足，热点路径可能导致长尾问题。
+
+本书不深入展开 dragonfly 的路由算法，只强调一点：AI 集群网络拓扑必须与通信模式共同设计。大模型训练不是普通均匀流量。DP、TP、PP、EP、checkpoint、数据加载、推理请求各自产生不同流量形态，网络拓扑和调度系统必须理解这些差异。
+
+\subsection{Oversubscription}
+\label{subsec:oversubscription}
+
+Oversubscription 指下行接入带宽大于上行汇聚带宽。例如一个 leaf switch 下接入 16 台服务器，每台 400Gb/s，总下行 6.4Tb/s，但上行到 spine 总带宽只有 3.2Tb/s，则 oversubscription ratio 为 2:1。普通数据中心为了降低成本，经常接受一定 oversubscription。但 AI 训练网络对 oversubscription 非常敏感。
+
+如果多个节点之间频繁进行 all-reduce 或 all-to-all，跨 leaf 流量会占用上行带宽。oversubscription 会导致：
+
+\begin{itemize}
+  \item collective 带宽下降；
+  \item 某些训练 step 长尾变长；
+  \item 多作业混部互相影响；
+  \item RoCE PFC/ECN 更容易触发；
+  \item NCCL timeout 风险增加。
+\end{itemize}
+
+因此，大规模训练集群通常倾向于低 oversubscription 或 non-blocking fabric，尤其是训练网络。推理集群则可以根据 workload 做分层设计：prefill-heavy、decode-heavy、embedding-heavy、存储访问等流量可能使用不同网络或 QoS 策略。
+
+\subsection{East-West Traffic}
+\label{subsec:east-west-traffic}
+
+AI 集群中的主要流量通常是 east-west traffic，即节点之间的横向流量，而不是 north-south traffic。传统 Web 服务中，请求可能从用户进入负载均衡，再访问服务、缓存、数据库，南北向流量明显。而分布式训练中，大多数通信发生在训练节点之间：rank 与 rank 交换梯度、参数分片、token、activation。
+
+East-west traffic 的特点是：
+
+\begin{itemize}
+  \item 流量同步性强，多个 rank 同时发起 collective；
+  \item 数据量大，容易形成突发；
+  \item 通信模式规则，但受并行策略影响；
+  \item all-to-all 可能造成复杂多对多流量；
+  \item 单个慢 rank 会拖慢整个 job。
+\end{itemize}
+
+这也是为什么 AI 集群调度应尽量把同一个训练作业放在网络拓扑上相邻、带宽充足的节点集合中，而不是随机散布在整个数据中心。后续第 20 章讨论 Kubernetes 调度时，我们会看到 topology-aware scheduling、gang scheduling 和 queueing system 如何与网络拓扑结合。
+
+\subsection{网络监控指标}
+\label{subsec:network-monitoring-metrics}
+
+AI 集群网络必须可观测。只监控 GPU utilization 不够，只监控交换机端口 up/down 也不够。至少需要覆盖以下层次：
+
+\begin{longtable}{p{3.2cm}p{5.0cm}p{5.2cm}}
+  \caption{AI 集群网络常见监控指标}
+  \label{tab:ai-network-monitoring} \\
+  \toprule
+  层次 & 指标 & 说明 \\
+  \midrule
+  \endfirsthead
+  \toprule
+  层次 & 指标 & 说明 \\
+  \midrule
+  \endhead
+  NIC & TX/RX bandwidth & 网卡发送和接收带宽，判断 rail 是否均衡 \\
+  NIC & packet error / retry & 发现链路错误、丢包、重传和 RoCE 异常 \\
+  NIC & RDMA counters & 包括 RDMA read/write/send、completion error 等 \\
+  PCIe & GPU-NIC 拓扑和吞吐 & 判断是否跨 NUMA、跨 switch 或 P2P 不可用 \\
+  Switch & port utilization & 发现热点链路和 oversubscription \\
+  Switch & buffer occupancy & 判断是否存在队列积压和拥塞 \\
+  Switch & PFC pause frame & 发现 PFC 触发频率、pause storm 或拥塞扩散 \\
+  Switch & ECN marking & 判断拥塞标记是否合理，是否过早或过晚 \\
+  NCCL & algbw / busbw & 验证 collective 有效带宽 \\
+  NCCL & timeout / retry / fallback & 发现网络异常、fallback 到 socket 或连接问题 \\
+  Job & step time / comm time & 判断通信是否在训练关键路径 \\
+  Job & straggler rank & 找出拖慢整个作业的慢 rank \\
+  \bottomrule
+\end{longtable}
+
+网络监控的关键是建立 baseline。同一类节点、同一类网卡、同一类拓扑，应有稳定的 NCCL tests 结果和端口带宽曲线。一旦某台机器或某条链路偏离 baseline，就应自动标记为可疑节点，避免调度大作业。
+
+\section{实践：RDMA / RoCE 排查流程}
+\label{sec:rdma-roce-debug-workflow}
+
+本节给出一个常见排查流程。假设一个多节点训练作业扩展性异常，单机 8 卡正常，两机 16 卡明显变慢，或者 NCCL 偶发 timeout。
+
+\subsection{第一步：确认 NCCL 是否走预期网络}
+\label{subsec:debug-nccl-network}
+
+首先打开 NCCL 日志：
+
+\begin{lstlisting}[language=bash,caption={打开 NCCL 网络调试日志},label={lst:nccl-net-debug}]
+export NCCL_DEBUG=INFO
+export NCCL_DEBUG_SUBSYS=INIT,NET,GRAPH,TOPO,COLL
+\end{lstlisting}
+
+观察是否出现以下问题：
+
+\begin{itemize}
+  \item 没有识别到 IB/RoCE 设备；
+  \item fallback 到 Socket；
+  \item 使用了错误网卡；
+  \item GID index 不正确；
+  \item GPUDirect RDMA 未启用；
+  \item 多 rail 未被利用；
+  \item 某些 rank 连接失败或 timeout。
+\end{itemize}
+
+\subsection{第二步：运行基础带宽测试}
+\label{subsec:debug-bandwidth-test}
+
+在训练框架之外运行 NCCL tests：
+
+\begin{lstlisting}[language=bash,caption={多节点 NCCL all-reduce 基线测试},label={lst:multi-node-nccl-baseline}]
+mpirun -np 16 -H node0:8,node1:8 \
+  -x NCCL_DEBUG=INFO \
+  -x NCCL_IB_HCA=mlx5_0,mlx5_1 \
+  ./build/all_reduce_perf -b 8M -e 8G -f 2 -g 1
+\end{lstlisting}
+
+如果 NCCL tests 已经异常，说明问题在通信基础设施或配置，不要先调模型。应继续检查 HCA、链路、交换机和系统配置。
+
+\subsection{第三步：检查 HCA 与链路状态}
+\label{subsec:debug-hca-link}
+
+常见命令包括：
+
+\begin{lstlisting}[language=bash,caption={检查 RDMA 设备和链路状态的常用命令},label={lst:rdma-link-check}]
+# 查看 RDMA 设备
+ibv_devinfo
+
+# 查看网卡和端口
+ibstat
+
+# 查看 RDMA link
+rdma link show
+
+# 查看网卡统计
+ethtool -S <interface>
+
+# 查看 IP 与接口
+ip addr show
+\end{lstlisting}
+
+检查内容包括：
+
+\begin{itemize}
+  \item link 是否 up；
+  \item 速率是否符合预期；
+  \item MTU 是否一致；
+  \item 是否存在大量 error、drop、retry；
+  \item RoCE 接口 IP、GID、VLAN、priority 是否正确；
+  \item 多 NIC 是否全部可用。
+\end{itemize}
+
+\subsection{第四步：检查 RoCE QoS、PFC 与 ECN}
+\label{subsec:debug-roce-qos}
+
+RoCE 环境中，需要确认主机和交换机配置一致：
+
+\begin{itemize}
+  \item RoCE 流量是否映射到正确 priority；
+  \item PFC 是否只对目标 priority 启用；
+  \item ECN 阈值是否合理；
+  \item DSCP/PCP 是否在交换机路径中被保留；
+  \item 是否存在 pause frame 暴增；
+  \item 是否存在 ECN marking 异常；
+  \item 是否有普通业务流量混入 RoCE 无损队列。
+\end{itemize}
+
+如果 PFC pause frame 持续增加，同时训练 step 出现长尾，说明可能存在拥塞扩散或队列阻塞。此时需要结合交换机 telemetry 和作业调度信息，判断是否有多个大作业共享同一瓶颈链路。
+
+\subsection{第五步：检查 GPU-NIC 拓扑}
+\label{subsec:debug-gpu-nic-topology}
+
+运行：
+
+\begin{lstlisting}[language=bash,caption={检查 GPU 与 NIC 拓扑},label={lst:gpu-nic-topology}]
+nvidia-smi topo -m
+\end{lstlisting}
+
+重点观察：
+
+\begin{itemize}
+  \item 每张 GPU 到每张 NIC 的路径；
+  \item 是否跨 NUMA；
+  \item 是否跨 PCIe switch；
+  \item 多 rail 是否与 GPU 分组匹配；
+  \item local rank 是否绑定到了合适 GPU。
+\end{itemize}
+
+如果某些 rank 使用远端 NIC，跨节点带宽可能明显下降。可以通过调整 \texttt{CUDA\_VISIBLE\_DEVICES}、launcher rank mapping、NCCL HCA 选择或调度器节点分配策略改善。
+
+\subsection{第六步：结合训练 Timeline}
+\label{subsec:debug-training-timeline}
+
+最后，用 Nsight Systems 或框架 profiler 观察真实训练 step。需要判断：
+
+\begin{itemize}
+  \item NCCL kernel 是否在关键路径；
+  \item backward 与 all-reduce 是否重叠；
+  \item 是否有某个 rank 明显慢；
+  \item 通信前后是否存在 CPU 空洞；
+  \item checkpoint 或 dataloader 是否与训练通信争用网络；
+  \item MoE all-to-all 是否造成突发拥塞。
+\end{itemize}
+
+只有把网络指标与训练 timeline 对齐，才能避免误判。例如 NCCL tests 正常但训练慢，可能是框架 bucket 太小、overlap 不好、rank mapping 不合理或其他 I/O 干扰；训练 timeline 中 NCCL 长尾明显，同时交换机 PFC/ECN 异常，则更可能是网络拥塞。
+
+\section{设计原则与经验法则}
+\label{sec:rdma-roce-design-principles}
+
+\subsection{原则一：训练网络与普通业务网络分离}
+\label{subsec:principle-separate-network}
+
+大规模训练流量具有突发、大带宽、同步等待和长尾敏感特征。把训练 RDMA/RoCE 流量与普通业务流量混在同一无隔离网络中，容易互相影响。实践中应尽量使用独立训练网络，或至少通过 QoS、VLAN、VRF、优先级队列和带宽隔离明确区分。
+
+\subsection{原则二：先做无损，再做拥塞控制}
+\label{subsec:principle-lossless-congestion}
+
+RoCE 的基础是避免丢包，但只靠 PFC 并不够。PFC 可以阻止队列溢出，却可能造成拥塞扩散。ECN 和端到端拥塞控制用于在不丢包的情况下调节发送速率。一个稳定 RoCE 网络需要 PFC、ECN、QoS、buffer 和路由共同配置。
+
+\subsection{原则三：拓扑感知比盲目加带宽更重要}
+\label{subsec:principle-topology-aware-network}
+
+多 NIC、多 rail、多 leaf 的网络中，平均带宽不代表实际作业带宽。一个错误的 rank mapping 或 NIC 绑定可能让通信集中在少数链路。训练调度器应该理解节点、GPU、NIC、leaf、spine 的关系，把同一作业放在拓扑上更紧凑、更均衡的位置。
+
+\subsection{原则四：用 NCCL Tests 建立集群基线}
+\label{subsec:principle-nccl-baseline}
+
+每个 AI 集群上线前都应建立 NCCL tests 基线，包括单机、双机、跨 leaf、多机规模下的 all-reduce、all-gather、reduce-scatter、all-to-all。后续每次驱动升级、交换机配置变更、NCCL 版本升级、系统镜像更新后，都应重新验证基线。
+
+\subsection{原则五：监控要覆盖端到端路径}
+\label{subsec:principle-end-to-end-monitoring}
+
+只监控 GPU 不够，只监控交换机也不够。一次跨节点 GPU 通信跨越 GPU HBM、PCIe、NIC、交换机、对端 NIC、对端 PCIe、对端 GPU HBM。任何一段异常都可能拖慢训练。监控和告警应覆盖端到端路径，并能关联到具体 job、rank、node、NIC 和 switch port。
+
+\section{本章小结}
+\label{sec:rdma-roce-summary}
+
+本章从多机 AI 集群的角度介绍了 RDMA、RoCE、InfiniBand、GPUDirect RDMA 与集群网络设计。
+
+\begin{itemize}
+  \item 多机训练依赖高性能网络，因为数据并行、张量并行、流水线并行、ZeRO 和 MoE 都会产生跨节点通信。
+  \item 跨节点 all-reduce、reduce-scatter、all-gather 和 all-to-all 的性能直接影响训练 step time 和扩展效率。
+  \item RDMA 通过 kernel bypass、zero-copy、queue pair、completion queue 和 memory registration 降低延迟与 CPU 开销。
+  \item InfiniBand 是面向高性能 RDMA 的专用网络，RoCE 则把 RDMA 承载在以太网上，便于复用以太网生态。
+  \item RoCE 网络需要重点关注 lossless Ethernet、PFC、ECN、QoS、拥塞控制和交换机 buffer，否则少量拥塞就可能导致训练长尾或 NCCL timeout。
+  \item GPUDirect RDMA 允许 NIC 直接访问 GPU memory，减少 CPU host memory staging，是跨节点 GPU collective 的关键能力。
+  \item 多 NIC、多 rail 节点中，GPU-NIC 亲和性、rank mapping 和 NCCL HCA 选择会显著影响实际带宽。
+  \item AI 集群网络设计需要考虑 fat-tree、dragonfly、oversubscription、east-west traffic 和网络可观测性。
+  \item 排查网络问题应从 NCCL 日志、NCCL tests、HCA 状态、RoCE QoS、GPU-NIC 拓扑和训练 timeline 多层结合入手。
+\end{itemize}
+
+至此，我们已经从单个 GPU、单机多卡互联，扩展到了多机 RDMA/RoCE 网络。下一章将进入集群资源调度层：当一个 AI 集群同时运行训练、推理、评测、数据处理和多租户任务时，Kubernetes 如何管理 GPU？Device Plugin、MIG、gang scheduling、Volcano、Kueue、拓扑感知调度和 AI 集群可观测性又如何协同工作？这些内容将进入第 20 章：Kubernetes 在 AI 集群中的调度。

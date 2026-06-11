@@ -1,0 +1,1728 @@
+\chapter{推理服务调度与 Continuous Batching}
+\label{chap:serving-scheduler-continuous-batching}
+
+\section{在线 LLM Serving 的系统目标}
+\label{sec:online-llm-serving-goals}
+
+前几章分别讨论了 KV Cache、PagedAttention、FlashAttention 和量化。它们分别解决了推理系统中的不同问题：
+
+\begin{itemize}
+\item KV Cache 让自回归 decode 不必重复计算历史 Key/Value；
+\item PagedAttention 让动态请求的 KV Cache 可以按 block 管理，减少显存碎片；
+\item FlashAttention 减少 attention 计算中的 HBM IO，尤其适合 prefill 和长序列场景；
+\item 量化降低权重、激活或 KV Cache 的字节数，减少显存与带宽压力。
+\end{itemize}
+
+但是，一个真正的在线 LLM serving 系统不能只依赖单个 kernel 或单个显存优化。它必须面对持续到达的用户请求，在有限 GPU 资源上同时优化吞吐、延迟、公平性、稳定性和成本。
+
+一个 LLM serving engine 的核心问题可以表述为：
+
+[
+\text{在有限 GPU 显存和计算资源下，如何动态选择每个 iteration 要执行哪些 token？}
+]
+
+这里的“token”既包括新请求的 prompt tokens，也包括已经运行请求的 decode token。不同 token 的成本差异很大：prefill token 通常计算密度高，长 prompt 可能一次带来大量计算；decode token 每次只生成一个，但要读取历史 KV Cache，并且对用户的流式体验非常敏感。
+
+因此，推理服务调度不是简单的 batch 拼接，而是一个在线资源管理问题：
+
+[
+\text{Scheduling}
+=================
+
+\text{Queueing}
++
+\text{KV Memory Management}
++
+\text{Kernel Selection}
++
+\text{Admission Control}
++
+\text{SLA Optimization}.
+]
+
+\subsection{请求生命周期}
+\label{subsec:serving-request-lifecycle}
+
+一个典型 LLM 请求从进入系统到完成，大致经历以下阶段：
+
+\begin{enumerate}
+\item \textbf{接收请求}：API server 接收 prompt、采样参数、最大生成长度、streaming 标志等；
+\item \textbf{分词}：tokenizer 将文本转换为 token ids；
+\item \textbf{入队}：请求进入 waiting queue，等待调度器分配资源；
+\item \textbf{准入控制}：系统判断是否有足够 KV Cache blocks、batch token budget 和执行 slot；
+\item \textbf{prefill}：处理 prompt，建立 KV Cache，得到首 token logits；
+\item \textbf{decode}：循环生成新 token，每轮读取历史 KV，追加新的 K/V；
+\item \textbf{采样与停止判断}：根据 logits 采样 token，判断 EOS、stop words、max tokens 或取消；
+\item \textbf{流式返回}：将生成 token 或文本片段返回给用户；
+\item \textbf{资源释放}：请求结束后释放 KV Cache blocks 和调度状态。
+\end{enumerate}
+
+这个流程中的关键资源包括：
+
+\begin{itemize}
+\item GPU compute；
+\item GPU HBM；
+\item KV Cache blocks；
+\item token budget；
+\item batch slots；
+\item network output bandwidth；
+\item CPU scheduler 和 tokenizer 线程；
+\item 多副本部署中的 worker 容量。
+\end{itemize}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+box/.style={draw, rounded corners=4pt, minimum width=1.75cm, minimum height=0.65cm, align=center},
+arrow/.style={-{Latex[length=2.1mm]}, thick}
+]
+
+```
+\node[font=\bfseries] at (0,3.3) {在线 LLM 请求生命周期};
+
+\node[box, fill=blue!8] (api) at (-5.5,1.45) {API\\Request};
+\node[box, fill=green!10] (tok) at (-3.55,1.45) {Tokenizer};
+\node[box, fill=orange!14] (queue) at (-1.55,1.45) {Waiting\\Queue};
+\node[box, fill=yellow!16] (admit) at (0.55,1.45) {Admission\\Control};
+\node[box, fill=purple!10] (prefill) at (2.75,1.45) {Prefill};
+\node[box, fill=red!8] (decode) at (4.9,1.45) {Decode\\Loop};
+
+\node[box, fill=cyan!10] (sample) at (4.9,0.25) {Sampling\\Stop Check};
+\node[box, fill=gray!15] (release) at (2.75,0.25) {Release\\KV Blocks};
+\node[box, fill=blue!6] (stream) at (0.55,0.25) {Stream\\Output};
+
+\draw[arrow] (api) -- (tok);
+\draw[arrow] (tok) -- (queue);
+\draw[arrow] (queue) -- (admit);
+\draw[arrow] (admit) -- (prefill);
+\draw[arrow] (prefill) -- (decode);
+\draw[arrow] (decode) -- (sample);
+\draw[arrow] (sample.west) -- (stream.east);
+\draw[arrow] (sample) -- (release);
+\draw[arrow] (sample.east) .. controls (6.2,0.8) and (6.2,1.45) .. (decode.east);
+
+\node[align=left, text width=10.6cm] at (0,-1.4) {
+  调度器不仅决定请求何时进入 GPU，还要在每个 decode iteration 决定哪些请求继续生成。
+  请求结束、取消或超时后，KV Cache blocks 必须及时释放。
+};
+```
+
+\end{tikzpicture}
+\caption{在线 LLM serving 的请求生命周期}
+\label{fig:serving-request-lifecycle}
+\end{figure}
+
+\subsection{关键指标：TTFT、TPOT、吞吐与尾延迟}
+\label{subsec:serving-key-metrics}
+
+LLM serving 的指标比普通推理更复杂。因为用户不只关心整个请求什么时候结束，也关心模型什么时候开始输出，以及输出过程中是否流畅。
+
+\textbf{TTFT, Time To First Token} 指从请求到达系统，到第一个生成 token 返回给用户的时间。它通常包括：
+
+[
+T_{\mathrm{TTFT}}
+=================
+
+T_{\mathrm{queue}}
++
+T_{\mathrm{tokenize}}
++
+T_{\mathrm{prefill}}
++
+T_{\mathrm{first_sample}}
++
+T_{\mathrm{network}}.
+]
+
+TTFT 主要受排队时间和 prefill 时间影响。长 prompt 请求的 TTFT 往往较高。
+
+\textbf{TPOT, Time Per Output Token} 指 decode 阶段生成每个 token 的平均时间。若生成 $N_{\mathrm{out}}$ 个 tokens，decode 总时间为 $T_{\mathrm{decode}}$，则：
+
+[
+T_{\mathrm{TPOT}}
+=================
+
+\frac{T_{\mathrm{decode}}}{N_{\mathrm{out}}}.
+]
+
+TPOT 影响用户看到流式输出的速度。它主要受 decode batch size、KV Cache 读取、PagedAttention kernel、量化 kernel 和 GPU 利用率影响。
+
+\textbf{E2E Latency} 指请求从到达到完成的端到端延迟：
+
+[
+T_{\mathrm{E2E}}
+================
+
+T_{\mathrm{TTFT}}
++
+T_{\mathrm{decode}}.
+]
+
+\textbf{Throughput} 可以用 tokens/s 表示：
+
+[
+\mathrm{Throughput}
+===================
+
+\frac{\mathrm{Total\ generated\ tokens}}
+{\mathrm{Wall\ clock\ time}}.
+]
+
+也可以区分 prefill tokens/s 和 decode tokens/s。对 serving 系统来说，仅看总 tokens/s 可能误导，因为 prefill token 和 decode token 的成本不同。
+
+\textbf{Tail Latency} 通常看 P95、P99 或 P999。在线系统中，平均延迟不够，尾延迟才决定用户体验和 SLA。一个调度策略可能提高平均吞吐，但让长请求或低优先级请求长期饥饿，导致 P99 恶化。
+
+\begin{table}[H]
+\centering
+\small
+\caption{LLM Serving 常见指标}
+\label{tab:serving-metrics}
+\begin{tabular}{p{0.20\textwidth}p{0.38\textwidth}p{0.30\textwidth}}
+\toprule
+\textbf{指标} & \textbf{含义} & \textbf{主要受哪些因素影响} \
+\midrule
+TTFT
+& 从请求到达到首 token 输出的时间
+& 排队、tokenizer、prefill、chunked prefill、prefix cache。 \
+\midrule
+TPOT
+& 每个输出 token 的平均生成时间
+& decode batch、KV Cache、PagedAttention、量化、GPU 利用率。 \
+\midrule
+E2E Latency
+& 请求完整完成时间
+& TTFT、输出长度、decode 速度、stop 条件。 \
+\midrule
+Throughput
+& 系统单位时间处理 tokens 数
+& batch size、continuous batching、kernel、显存容量。 \
+\midrule
+Tail Latency
+& P95/P99/P999 延迟
+& 调度公平性、长请求、资源竞争、preemption、排队。 \
+\midrule
+Cost/token
+& 每生成 token 的成本
+& GPU 价格、利用率、量化、并发、缓存命中。 \
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{吞吐与延迟的基本矛盾}
+\label{subsec:throughput-latency-tradeoff}
+
+Serving 调度的核心矛盾是吞吐与延迟。
+
+为了提高吞吐，系统倾向于：
+
+\begin{itemize}
+\item 增大 batch；
+\item 等待更多请求凑 batch；
+\item 同时处理更多 decode sequences；
+\item 让 GPU 尽量满载；
+\item 接收更多长请求以提高资源利用。
+\end{itemize}
+
+但这些做法可能增加延迟：
+
+\begin{itemize}
+\item 等待凑 batch 会增加 queueing delay；
+\item 长 prefill 会阻塞短 decode；
+\item 过大 batch 会增加单 iteration 时间；
+\item 过高并发会导致 KV Cache 紧张；
+\item 长请求占用 blocks 过久，影响后续请求准入。
+\end{itemize}
+
+因此，调度器不是简单地“尽量多塞请求”。它需要在每个 iteration 解决一个受约束优化问题：
+
+[
+\max
+\quad
+\mathrm{utility}(\mathrm{scheduled\ tokens})
+]
+
+满足：
+
+[
+\mathrm{KVBlocksUsed}
+\le
+\mathrm{KVBlocksCapacity},
+]
+
+[
+\mathrm{BatchedTokens}
+\le
+\mathrm{TokenBudget},
+]
+
+[
+\mathrm{NumSequences}
+\le
+\mathrm{MaxSequences},
+]
+
+[
+\mathrm{LatencySLA}
+\le
+\mathrm{Target}.
+]
+
+不同业务对 utility 的定义不同。聊天机器人可能更重视 TTFT 和流式体验；离线批量生成可能更重视吞吐；代码补全可能要求极低 TPOT；长文档总结可能更重视长上下文 prefill 能力。
+
+\section{Prefill 与 Decode 混合调度}
+\label{sec:prefill-decode-mixed-scheduling}
+
+LLM serving 的独特难点之一，是 prefill 和 decode 的计算形态完全不同。
+
+Prefill 一次处理多个 prompt tokens，计算密度高，容易形成较大 GEMM，也更适合 FlashAttention。Decode 每次每个请求只处理一个 token，需要读取历史 KV Cache，通常更 memory-bound。调度器必须把这两类任务放到同一个 GPU 时间线上执行。
+
+\subsection{prefill 的计算特征}
+\label{subsec:prefill-computation-characteristics}
+
+Prefill 输入长度可能是：
+
+[
+S_{\mathrm{prompt}}\in[1,S_{\max}].
+]
+
+一个 prefill 请求需要计算整个 prompt 的 Transformer forward，并写入 KV Cache。Attention 中会出现：
+
+[
+S_{\mathrm{prompt}}\times S_{\mathrm{prompt}}
+]
+
+的 causal attention 结构。虽然 FlashAttention 避免物化完整 attention matrix，但 dense attention 的计算复杂度仍然与：
+
+[
+O(S_{\mathrm{prompt}}^2d_h)
+]
+
+相关。
+
+Prefill 的特点包括：
+
+\begin{itemize}
+\item 对长 prompt 成本很高；
+\item 计算密度较高；
+\item 更容易吃满 GPU compute；
+\item 会一次写入大量 KV Cache；
+\item 直接决定 TTFT；
+\item 若不切分，长 prefill 会阻塞 decode。
+\end{itemize}
+
+\subsection{decode 的计算特征}
+\label{subsec:decode-computation-characteristics}
+
+Decode 阶段每个请求每轮通常只生成一个 token。对第 $i$ 个请求，当前上下文长度为：
+
+[
+S_i.
+]
+
+每层 attention 读取该请求的历史 KV Cache：
+
+[
+K_i,V_i\in\mathbb{R}^{S_i\times n_{kv}\times d_h}.
+]
+
+Decode 的特点包括：
+
+\begin{itemize}
+\item 单请求单步计算很小；
+\item 强自回归依赖；
+\item 需要持续读取 KV Cache；
+\item 对 TPOT 敏感；
+\item batch 中请求长度不同；
+\item 请求会动态结束和加入。
+\end{itemize}
+
+若 decode batch 太小，GPU 利用率低；若 decode batch 太大，单 iteration 时间上升，流式输出变慢。调度器需要维持合适的 running sequences 数量。
+
+\subsection{prefill 阻塞 decode 的问题}
+\label{subsec:prefill-blocks-decode}
+
+如果调度器简单地按请求到达顺序执行，一个很长的 prefill 可能占用 GPU 很长时间。在这段时间内，已经处于 decode 阶段的请求无法生成下一个 token，用户会感到流式输出卡顿。
+
+这就是 prefill-decode interference：
+
+[
+\text{Long Prefill}
+\rightarrow
+\text{Decode Delay}
+\rightarrow
+\text{TPOT / P99 worsens}.
+]
+
+反过来，如果调度器总是优先 decode，新请求可能长时间无法 prefill，TTFT 变差。调度器必须在 TTFT 和 TPOT 之间折中。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\scriptsize,
+cell/.style={draw, minimum width=0.68cm, minimum height=0.42cm, align=center},
+prefill/.style={fill=green!12},
+decode/.style={fill=blue!12},
+wait/.style={fill=gray!18}
+]
+
+```
+\node[font=\bfseries\small] at (0,3.0) {长 Prefill 阻塞 Decode 的时间线};
+
+\foreach \t in {0,...,9} {
+  \node at ({-3.8+0.75*\t},2.25) {t\t};
+}
+
+\node at (-4.55,1.55) {GPU};
+\node at (-4.55,0.7) {Decode reqs};
+
+\foreach \t in {0,1} {
+  \node[cell, decode] at ({-3.8+0.75*\t},1.55) {D};
+}
+\foreach \t in {2,3,4,5,6} {
+  \node[cell, prefill] at ({-3.8+0.75*\t},1.55) {Long P};
+}
+\foreach \t in {7,8,9} {
+  \node[cell, decode] at ({-3.8+0.75*\t},1.55) {D};
+}
+
+\foreach \t in {0,1,7,8,9} {
+  \node[cell, decode] at ({-3.8+0.75*\t},0.7) {run};
+}
+\foreach \t in {2,3,4,5,6} {
+  \node[cell, wait] at ({-3.8+0.75*\t},0.7) {wait};
+}
+
+\node[align=left, text width=10.5cm, font=\small] at (0,-0.85) {
+  长 prompt prefill 若一次性执行，会让已经在 decode 的请求等待多个 iteration。
+  用户看到的流式输出会出现明显停顿。
+};
+```
+
+\end{tikzpicture}
+\caption{长 prefill 对 decode 流式体验的阻塞}
+\label{fig:long-prefill-blocks-decode}
+\end{figure}
+
+\subsection{调度器的 token budget}
+\label{subsec:scheduler-token-budget}
+
+现代 LLM serving 调度器常用 token budget 控制每个 iteration 的总工作量。设每轮最大可调度 token 数为：
+
+[
+T_{\max}.
+]
+
+对于 decode 请求，每个请求通常消耗 1 个 token budget；对于 prefill 请求，消耗 prompt tokens 数或 chunk tokens 数。
+
+如果本轮调度 $N_D$ 个 decode 请求和若干 prefill chunks，则约束为：
+
+[
+N_D
++
+\sum_{r\in\mathcal{P}}
+S_{r,\mathrm{chunk}}
+\le
+T_{\max}.
+]
+
+同时还要满足最大序列数约束：
+
+[
+N_{\mathrm{seq}}
+\le
+N_{\max}.
+]
+
+以及 KV block 约束：
+
+[
+B_{\mathrm{needed}}
+\le
+B_{\mathrm{free}}.
+]
+
+Token budget 的作用是防止单个 iteration 太大，造成 decode 延迟抖动。它也为 prefill 和 decode 的混合提供统一资源度量。
+
+\begin{lstlisting}[language=Python,caption={基于 token budget 的 prefill/decode 混合调度骨架},label={lst:mixed-prefill-decode-scheduler}]
+def schedule_iteration(
+waiting_queue,
+running_requests,
+block_manager,
+max_num_batched_tokens,
+max_num_sequences,
+):
+scheduled_decode = []
+scheduled_prefill = []
+
+```
+token_budget = max_num_batched_tokens
+
+# Decode-first policy: protect TPOT for running requests.
+for req in running_requests:
+    if req.is_finished:
+        continue
+    if token_budget <= 0:
+        break
+    if not block_manager.can_append_one_token(req):
+        continue
+
+    scheduled_decode.append(req)
+    token_budget -= 1
+
+# Admit new prefill requests if budget and KV blocks allow.
+while waiting_queue and token_budget > 0:
+    if len(running_requests) >= max_num_sequences:
+        break
+
+    req = waiting_queue.peek()
+    prefill_tokens = req.prompt_len
+
+    if prefill_tokens > token_budget:
+        break
+
+    if not block_manager.can_allocate_prefill(req, prefill_tokens):
+        break
+
+    waiting_queue.pop()
+    block_manager.allocate_prefill(req, prefill_tokens)
+
+    scheduled_prefill.append((req, prefill_tokens))
+    running_requests.add(req)
+    token_budget -= prefill_tokens
+
+return scheduled_prefill, scheduled_decode
+```
+
+\end{lstlisting}
+
+这个策略优先保护 decode，因此 TPOT 较稳，但长 prompt 的 TTFT 可能变差。后面我们会讨论 chunked prefill 来缓解这个问题。
+
+\section{Continuous Batching}
+\label{sec:continuous-batching}
+
+Continuous batching 是 LLM serving 的核心调度技术之一。它的思想是：不要等一个 batch 中所有请求都完成才处理下一批，而是在每个 decode iteration 动态重组 batch，让完成请求退出，让新请求加入。
+
+[
+\text{Static batching}
+======================
+
+\text{batch-level scheduling}.
+]
+
+[
+\text{Continuous batching}
+==========================
+
+\text{iteration-level scheduling}.
+]
+
+\subsection{静态 batching 的局限}
+\label{subsec:static-batching-limitations}
+
+静态 batching 适合传统模型推理：一批请求进来，一次 forward，所有请求都结束。但 LLM 生成长度不同。如果一个 batch 内有短请求和长请求，短请求完成后会空占 batch slot，或者必须等待长请求结束才能释放资源。
+
+假设一个 batch 有三个请求，输出长度分别为：
+
+[
+[8,\ 64,\ 512].
+]
+
+如果静态执行到所有请求完成，前两个请求很早结束，但第三个请求仍然运行很久。短请求的资源利用低，后续新请求也无法及时加入。
+
+静态 batching 的问题包括：
+
+\begin{itemize}
+\item 结束请求不能及时释放 KV Cache；
+\item 新请求必须等待整个 batch 完成；
+\item 长请求拖慢短请求；
+\item batch 内有效请求数逐渐下降；
+\item GPU 利用率随时间下降；
+\item 尾延迟恶化。
+\end{itemize}
+
+\subsection{iteration-level scheduling}
+\label{subsec:iteration-level-scheduling}
+
+Continuous batching 每个 iteration 做一次调度。一个 iteration 通常对应一次 decode step，也可能混入 prefill chunks。调度器在每轮开始时：
+
+\begin{enumerate}
+\item 移除已经完成或取消的请求；
+\item 释放它们的 KV blocks；
+\item 为 running 请求安排 decode token；
+\item 从 waiting queue 中选择新请求或 prefill chunks；
+\item 检查 token budget 和 KV block budget；
+\item 构造本轮模型输入；
+\item 执行 GPU forward；
+\item 采样并更新请求状态。
+\end{enumerate}
+
+这种方式让 batch 成为动态集合：
+
+[
+\mathcal{B}^{(t)}
+\ne
+\mathcal{B}^{(t+1)}.
+]
+
+每轮 batch 都可以变化。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\scriptsize,
+cell/.style={draw, minimum width=0.68cm, minimum height=0.42cm, align=center},
+prefill/.style={fill=green!12},
+decode/.style={fill=blue!12},
+inactive/.style={fill=gray!18},
+finish/.style={fill=red!10}
+]
+
+```
+\node[font=\bfseries\small] at (0,3.0) {Continuous Batching：每个 iteration 动态重组 batch};
+
+\foreach \t in {0,...,8} {
+  \node at ({-3.65+0.75*\t},2.35) {iter \t};
+}
+
+\foreach \r/\y in {A/1.65,B/1.1,C/0.55,D/0.0,E/-0.55} {
+  \node at (-4.45,\y) {Req \r};
+}
+
+% A
+\foreach \t in {0,1,2} {
+  \node[cell, decode] at ({-3.65+0.75*\t},1.65) {D};
+}
+\node[cell, finish] at ({-3.65+0.75*3},1.65) {end};
+\foreach \t in {4,...,8} {
+  \node[cell, inactive] at ({-3.65+0.75*\t},1.65) {};
+}
+
+% B
+\foreach \t in {0,...,8} {
+  \node[cell, decode] at ({-3.65+0.75*\t},1.1) {D};
+}
+
+% C joins
+\foreach \t in {0,1} {
+  \node[cell, inactive] at ({-3.65+0.75*\t},0.55) {};
+}
+\node[cell, prefill] at ({-3.65+0.75*2},0.55) {P};
+\foreach \t in {3,...,8} {
+  \node[cell, decode] at ({-3.65+0.75*\t},0.55) {D};
+}
+
+% D joins
+\foreach \t in {0,...,4} {
+  \node[cell, inactive] at ({-3.65+0.75*\t},0.0) {};
+}
+\node[cell, prefill] at ({-3.65+0.75*5},0.0) {P};
+\foreach \t in {6,7,8} {
+  \node[cell, decode] at ({-3.65+0.75*\t},0.0) {D};
+}
+
+% E joins at 7
+\foreach \t in {0,...,6} {
+  \node[cell, inactive] at ({-3.65+0.75*\t},-0.55) {};
+}
+\node[cell, prefill] at ({-3.65+0.75*7},-0.55) {P};
+\node[cell, decode] at ({-3.65+0.75*8},-0.55) {D};
+
+\node[align=left, text width=10.5cm, font=\small] at (0,-1.85) {
+  Continuous batching 允许请求 A 结束后立即释放资源，同时请求 C、D、E 在后续 iteration 加入。
+  每个 iteration 的 batch 都是调度器重新构造的。
+};
+```
+
+\end{tikzpicture}
+\caption{Continuous batching 的动态请求集合}
+\label{fig:continuous-batching-dynamic-batch}
+\end{figure}
+
+\subsection{running、waiting、swapped 队列}
+\label{subsec:running-waiting-swapped-queues}
+
+一个 serving scheduler 通常维护多个状态集合：
+
+\begin{itemize}
+\item \textbf{Waiting}：请求已到达，但尚未获得 KV blocks 或执行机会；
+\item \textbf{Running}：请求已被准入，拥有 KV Cache，正在 prefill 或 decode；
+\item \textbf{Finished}：请求已完成，等待输出收尾和资源释放；
+\item \textbf{Swapped / Paused}：请求因为资源压力被暂停或迁出；
+\item \textbf{Preempted}：请求被抢占，后续需要恢复或重算。
+\end{itemize}
+
+状态转移可以表示为：
+
+[
+\text{Waiting}
+\rightarrow
+\text{Running}
+\rightarrow
+\text{Finished}.
+]
+
+也可能出现：
+
+[
+\text{Running}
+\rightarrow
+\text{Paused}
+\rightarrow
+\text{Running}.
+]
+
+或者：
+
+[
+\text{Running}
+\rightarrow
+\text{Preempted}
+\rightarrow
+\text{Waiting}.
+]
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+state/.style={draw, rounded corners=4pt, minimum width=2.0cm, minimum height=0.75cm, align=center},
+arrow/.style={-{Latex[length=2.1mm]}, thick}
+]
+
+```
+\node[font=\bfseries] at (0,3.15) {Serving Scheduler 请求状态机};
+
+\node[state, fill=orange!14] (waiting) at (-4.4,1.25) {Waiting};
+\node[state, fill=green!10] (running) at (-1.35,1.25) {Running};
+\node[state, fill=blue!8] (finished) at (1.85,1.25) {Finished};
+\node[state, fill=gray!15] (released) at (4.75,1.25) {Released};
+
+\node[state, fill=purple!10] (paused) at (-1.35,-0.25) {Paused\\Swapped};
+\node[state, fill=red!8] (preempted) at (-4.4,-0.25) {Preempted};
+
+\draw[arrow] (waiting) -- node[above] {admit} (running);
+\draw[arrow] (running) -- node[above] {stop/eos} (finished);
+\draw[arrow] (finished) -- node[above] {free blocks} (released);
+
+\draw[arrow] (running) -- node[right] {memory pressure} (paused);
+\draw[arrow] (paused) -- node[right] {resume} (running);
+
+\draw[arrow] (running) -- (preempted);
+\draw[arrow] (preempted) -- node[left] {requeue} (waiting);
+
+\node[align=left, text width=10.5cm] at (0,-1.6) {
+  Running 请求持有 KV Cache blocks，是显存管理的重点。
+  当资源不足时，调度器可能暂停、迁出或抢占低优先级请求。
+};
+```
+
+\end{tikzpicture}
+\caption{请求在 scheduler 中的状态转移}
+\label{fig:serving-scheduler-state-machine}
+\end{figure}
+
+\subsection{continuous batching 的核心伪代码}
+\label{subsec:continuous-batching-pseudocode}
+
+下面给出一个简化 continuous batching 主循环。它展示调度器、block manager、model runner 和 output processor 的关系。
+
+\begin{lstlisting}[language=Python,caption={Continuous batching serving loop 的简化伪代码},label={lst:continuous-batching-main-loop}]
+def serving_loop(engine):
+while True:
+# 1. Pull new requests from frontend.
+new_requests = engine.frontend.poll_requests()
+for req in new_requests:
+engine.waiting_queue.push(req)
+
+```
+    # 2. Free finished or cancelled requests.
+    for req in list(engine.running_requests):
+        if req.is_finished() or req.is_cancelled():
+            engine.block_manager.release(req)
+            engine.running_requests.remove(req)
+            engine.output_processor.finalize(req)
+
+    # 3. Build an iteration-level schedule.
+    schedule = engine.scheduler.schedule(
+        waiting_queue=engine.waiting_queue,
+        running_requests=engine.running_requests,
+        block_manager=engine.block_manager,
+    )
+
+    if schedule.is_empty():
+        engine.sleep_briefly()
+        continue
+
+    # 4. Prepare model inputs and KV slot mapping.
+    model_inputs = engine.input_builder.build(schedule)
+
+    # 5. Execute prefill/decode on GPU.
+    model_outputs = engine.model_runner.execute(model_inputs)
+
+    # 6. Sample next tokens and update request states.
+    sampled_tokens = engine.sampler.sample(model_outputs.logits)
+    engine.output_processor.process(schedule, sampled_tokens)
+
+    # 7. Update sequence lengths and KV metadata.
+    engine.scheduler.update_after_step(schedule, sampled_tokens)
+```
+
+\end{lstlisting}
+
+真实系统会使用异步队列、多线程、CUDA streams、RPC、多 GPU executor 和更复杂的错误处理。但核心循环仍然类似：每轮接收请求、释放资源、调度、执行、采样、更新状态。
+
+\section{Chunked Prefill}
+\label{sec:chunked-prefill}
+
+Chunked prefill 是解决长 prompt 阻塞 decode 的重要技术。它把长 prompt 拆成多个较小 chunks，在多个 iterations 中逐步执行，让 decode 请求可以穿插运行。
+
+\subsection{为什么需要 chunked prefill}
+\label{subsec:why-need-chunked-prefill}
+
+如果一个 prompt 长度为 $S_{\mathrm{prompt}}=16000$，一次性 prefill 可能占用 GPU 很长时间。期间所有 decode 请求都无法生成新 token，TPOT 和 P99 会恶化。
+
+Chunked prefill 将 prompt 切成大小不超过 $C$ 的 chunks：
+
+[
+S_{\mathrm{prompt}}
+===================
+
+C_1+C_2+\cdots+C_m,
+]
+
+其中：
+
+[
+C_i\le C_{\max}.
+]
+
+每个 iteration 只处理一个或几个 chunks，并保留一部分 token budget 给 decode。这样长 prompt 的 TTFT 可能略有增加，但正在运行请求的 TPOT 更稳定。
+
+[
+\text{Without chunking:}
+\quad
+\text{one huge prefill blocks decode}.
+]
+
+[
+\text{With chunking:}
+\quad
+\text{prefill chunks interleave with decode}.
+]
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\scriptsize,
+cell/.style={draw, minimum width=0.7cm, minimum height=0.42cm, align=center},
+prefill/.style={fill=green!12},
+decode/.style={fill=blue!12}
+]
+
+```
+\node[font=\bfseries\small] at (0,3.1) {Chunked Prefill：长 Prompt 被切分并与 Decode 穿插};
+
+\foreach \t in {0,...,9} {
+  \node at ({-3.8+0.75*\t},2.35) {t\t};
+}
+
+\node at (-4.65,1.55) {No chunk};
+\foreach \t in {0,1,2,3,4} {
+  \node[cell, prefill] at ({-3.8+0.75*\t},1.55) {P};
+}
+\foreach \t in {5,6,7,8,9} {
+  \node[cell, decode] at ({-3.8+0.75*\t},1.55) {D};
+}
+
+\node at (-4.65,0.55) {Chunked};
+\foreach \t/\op in {0/P1,1/D,2/P2,3/D,4/P3,5/D,6/P4,7/D,8/P5,9/D} {
+  \ifodd\t
+    \node[cell, decode] at ({-3.8+0.75*\t},0.55) {\op};
+  \else
+    \node[cell, prefill] at ({-3.8+0.75*\t},0.55) {\op};
+  \fi
+}
+
+\node[align=left, text width=10.5cm, font=\small] at (0,-0.85) {
+  Chunked prefill 将长 prompt 拆成多个 chunks，避免一次性占满 GPU。
+  这样可以保护 decode 请求的流式输出体验。
+};
+```
+
+\end{tikzpicture}
+\caption{Chunked prefill 与 decode 的交错执行}
+\label{fig:chunked-prefill-interleaving}
+\end{figure}
+
+\subsection{chunk 大小的选择}
+\label{subsec:chunk-size-choice}
+
+Chunk size 是一个重要参数。若 chunk 太大：
+
+\begin{itemize}
+\item 仍然会阻塞 decode；
+\item 单 iteration 时间波动大；
+\item 长 prompt 对 TPOT 影响明显。
+\end{itemize}
+
+若 chunk 太小：
+
+\begin{itemize}
+\item prefill 被拆得太碎；
+\item kernel 启动和调度开销增加；
+\item FlashAttention 的大块计算效率下降；
+\item TTFT 可能变差。
+\end{itemize}
+
+设每轮 token budget 为 $T_{\max}$，decode 请求数为 $N_D$。可用于 prefill 的 budget 为：
+
+[
+T_{\mathrm{prefill}}
+====================
+
+T_{\max}-N_D.
+]
+
+如果采用 decode-first 策略，则每轮 prefill chunk size 可以限制为：
+
+[
+C
+\le
+T_{\max}-N_D.
+]
+
+系统也可以保留最小 decode budget：
+
+[
+N_D
+\le
+T_{\max}-C_{\min}.
+]
+
+实际中，chunk size 可能动态变化：当 running decode 请求少时，允许更大 prefill chunk；当 decode 请求多时，缩小 chunk 以保护 TPOT。
+
+\subsection{chunked prefill 的 KV Cache 写入}
+\label{subsec:chunked-prefill-kv-write}
+
+Chunked prefill 不是把 prompt 独立分段计算。第 $k$ 个 chunk 必须 attend 到前面已经 prefill 的 chunks。因此，chunked prefill 需要在每个 chunk 后把 K/V 写入 KV Cache，并在下一 chunk 中读取已有 KV。
+
+设 prompt 被切为：
+
+[
+X^{(1)},X^{(2)},\ldots,X^{(m)}.
+]
+
+处理第 $r$ 个 chunk 时，已有 cache 长度为：
+
+[
+S_{\mathrm{past}}
+=================
+
+\sum_{i=1}^{r-1}|X^{(i)}|.
+]
+
+当前 chunk 长度为 $C_r$。该 chunk 中 token 的 attention 需要看：
+
+[
+S_{\mathrm{past}}+C_r
+]
+
+个位置，其中前 $S_{\mathrm{past}}$ 来自 KV Cache，当前 chunk 内部也需要 causal attention。
+
+因此 chunked prefill 的 attention 形态介于 full prefill 和 decode 之间：
+
+[
+Q: C_r\times d_h,
+\quad
+K,V: (S_{\mathrm{past}}+C_r)\times d_h.
+]
+
+它比 decode 更大，但比一次性完整 prefill 更可控。
+
+\begin{lstlisting}[language=Python,caption={Chunked prefill 调度和 KV 写入的伪代码},label={lst:chunked-prefill-pseudocode}]
+def run_chunked_prefill(req, model_runner, block_manager, chunk_size):
+prompt = req.prompt_tokens
+offset = req.num_prefilled_tokens
+
+```
+while offset < len(prompt):
+    end = min(offset + chunk_size, len(prompt))
+    chunk = prompt[offset:end]
+
+    # Allocate KV slots for this chunk.
+    slot_mapping = block_manager.allocate_slots(req, num_tokens=len(chunk))
+
+    # The model attends to past KV cache plus current chunk.
+    outputs = model_runner.prefill_chunk(
+        request=req,
+        input_tokens=chunk,
+        past_length=offset,
+        slot_mapping=slot_mapping,
+    )
+
+    # KV for this chunk has been written into cache.
+    offset = end
+    req.num_prefilled_tokens = offset
+
+    # Scheduler may yield here to run decode requests.
+    if scheduler_should_yield():
+        break
+
+return req.num_prefilled_tokens == len(prompt)
+```
+
+\end{lstlisting}
+
+在实际系统中，chunked prefill 通常由 scheduler 在每个 iteration 决定执行多少 chunk，而不是在一个 Python 循环里独占 GPU。
+
+\subsection{对 TTFT 与 TPOT 的影响}
+\label{subsec:chunked-prefill-impact-ttft-tpot}
+
+Chunked prefill 对指标的影响是双向的。
+
+它改善：
+
+\begin{itemize}
+\item running decode 请求的 TPOT；
+\item P99 流式稳定性；
+\item scheduler 对长 prompt 的可控性；
+\item GPU iteration 时间波动。
+\end{itemize}
+
+它可能恶化：
+
+\begin{itemize}
+\item 长 prompt 请求自身的 TTFT；
+\item prefill 总 kernel 效率；
+\item 调度和 metadata 开销。
+\end{itemize}
+
+因此，chunked prefill 的策略取决于业务目标。如果系统更重视正在流式输出请求的稳定性，可以更激进地 chunk；如果系统更重视新请求尽快首 token，可以允许更大 prefill chunk。
+
+\section{KV Cache 准入控制与显存调度}
+\label{sec:kv-cache-admission-control}
+
+LLM serving 的准入控制不同于普通服务。普通服务可能主要看 CPU queue 或 QPS；LLM serving 必须看 KV Cache 显存。一个请求能否进入 running set，取决于是否有足够 cache blocks 支持它的 prompt 和未来生成。
+
+\subsection{block 预算}
+\label{subsec:block-budget}
+
+使用 PagedAttention 时，KV Cache 被划分为 fixed-size blocks。设 block size 为 $B_{\mathrm{blk}}$。请求当前需要缓存 $S$ 个 tokens，则所需 blocks 为：
+
+[
+N_{\mathrm{blocks}}(S)
+======================
+
+\left\lceil
+\frac{S}{B_{\mathrm{blk}}}
+\right\rceil.
+]
+
+对于新请求，prefill 需要的初始 blocks 为：
+
+[
+N_{\mathrm{prefill}}
+====================
+
+\left\lceil
+\frac{S_{\mathrm{prompt}}}{B_{\mathrm{blk}}}
+\right\rceil.
+]
+
+Decode 每生成一个 token，若当前长度正好到达 block 边界，就需要新增一个 block：
+
+[
+S\bmod B_{\mathrm{blk}}=0
+\Rightarrow
+\text{allocate new block}.
+]
+
+调度器需要维护：
+
+[
+B_{\mathrm{free}},
+\quad
+B_{\mathrm{used}},
+\quad
+B_{\mathrm{reserved}}.
+]
+
+其中 reserved blocks 可以用于为 running 请求预留未来若干 decode slots，避免运行到一半发现没有 block 可追加。
+
+\begin{lstlisting}[language=Python,caption={KV block 准入控制的简化逻辑},label={lst:kv-block-admission-control}]
+def can_admit_request(req, block_manager, block_size, lookahead_tokens):
+prompt_blocks = ceil_div(req.prompt_len, block_size)
+
+```
+# Reserve a small number of future decode slots.
+future_len = req.prompt_len + lookahead_tokens
+future_blocks = ceil_div(future_len, block_size)
+
+needed_blocks = max(prompt_blocks, future_blocks)
+
+return block_manager.num_free_blocks() >= needed_blocks
+```
+
+\end{lstlisting}
+
+Lookahead tokens 的作用是给请求一些未来 decode 空间。但预留太多会降低并发；预留太少会增加运行中 block 不足的风险。
+
+\subsection{最大生成长度与保守预留}
+\label{subsec:max-generation-length-reservation}
+
+如果为每个请求按最大生成长度预留 KV Cache，则需要：
+
+[
+N_{\mathrm{max}}
+================
+
+\left\lceil
+\frac{S_{\mathrm{prompt}}+S_{\mathrm{max_new}}}
+{B_{\mathrm{blk}}}
+\right\rceil.
+]
+
+这种方式安全但浪费，因为很多请求不会生成到最大长度。PagedAttention 的优势之一是可以不必一次性预留最大长度，而是按需追加。
+
+但完全不预留未来也有风险。如果系统过度接收请求，后续 decode 时 blocks 耗尽，就必须抢占、暂停或失败。因此实际系统会采用折中：
+
+\begin{itemize}
+\item 为 prompt 立即分配；
+\item 为未来少量 decode 预留；
+\item 到 block 边界时再追加；
+\item 使用水位线控制 admission；
+\item 在内存紧张时暂停低优先级请求。
+\end{itemize}
+
+可以设置高低水位线：
+
+[
+B_{\mathrm{free}} < B_{\mathrm{low}}
+\Rightarrow
+\text{stop admitting new requests}.
+]
+
+[
+B_{\mathrm{free}} > B_{\mathrm{high}}
+\Rightarrow
+\text{resume admitting}.
+]
+
+这样可以避免频繁在接收和拒绝之间抖动。
+
+\subsection{preemption、swap 与 recompute}
+\label{subsec:preemption-swap-recompute}
+
+当 KV Cache blocks 不足时，系统有几种选择：
+
+\begin{itemize}
+\item \textbf{Reject}：拒绝新请求；
+\item \textbf{Queue}：让新请求继续等待；
+\item \textbf{Preempt}：抢占某些 running 请求；
+\item \textbf{Swap}：将某些请求的 KV Cache 迁出到 CPU 内存；
+\item \textbf{Recompute}：释放 KV Cache，未来从 prompt 重新 prefill；
+\item \textbf{Evict prefix cache}：驱逐可重算的共享 prefix。
+\end{itemize}
+
+这些策略的成本不同。Swap 保留状态但需要 PCIe/CPU 内存带宽；recompute 释放显存但未来恢复时需要重新 prefill；reject 最简单但影响可用性；queue 会增加 TTFT。
+
+可以用一个成本函数比较：
+
+[
+C_{\mathrm{evict}}
+==================
+
+\alpha T_{\mathrm{restore}}
++
+\beta M_{\mathrm{freed}}
++
+\gamma P_{\mathrm{user_impact}}.
+]
+
+实际系统通常用启发式策略，例如：
+
+\begin{itemize}
+\item 优先驱逐已结束或长时间 idle 的 prefix cache；
+\item 优先暂停低优先级请求；
+\item 避免抢占接近完成的请求；
+\item 避免抢占已经生成很多 token 的请求；
+\item 对超长请求设置单独配额。
+\end{itemize}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+box/.style={draw, rounded corners=4pt, minimum width=2.0cm, minimum height=0.7cm, align=center},
+arrow/.style={-{Latex[length=2.1mm]}, thick}
+]
+
+```
+\node[font=\bfseries] at (0,3.1) {KV Cache 不足时的资源处理策略};
+
+\node[box, fill=red!8] (pressure) at (0,2.0) {KV Memory\\Pressure};
+
+\node[box, fill=orange!14] (queue) at (-5.0,0.8) {Queue\\new reqs};
+\node[box, fill=yellow!16] (reject) at (-2.5,0.8) {Reject};
+\node[box, fill=blue!8] (preempt) at (0,0.8) {Preempt};
+\node[box, fill=green!10] (swap) at (2.5,0.8) {Swap to\\CPU};
+\node[box, fill=purple!10] (recompute) at (5.0,0.8) {Release and\\Recompute};
+
+\foreach \n in {queue,reject,preempt,swap,recompute} {
+  \draw[arrow] (pressure) -- (\n);
+}
+
+\node[align=left, text width=10.5cm] at (0,-0.85) {
+  显存压力下没有免费选择。不同策略在用户体验、恢复时间、系统吞吐和实现复杂度之间取舍。
+};
+```
+
+\end{tikzpicture}
+\caption{KV Cache 资源不足时的处理路径}
+\label{fig:kv-memory-pressure-actions}
+\end{figure}
+
+\section{调度策略：吞吐、延迟与公平性}
+\label{sec:scheduling-policies-throughput-latency-fairness}
+
+调度器的策略决定系统行为。不同策略可能使用相同 kernel 和相同 GPU，但表现出完全不同的 TTFT、TPOT、吞吐和尾延迟。
+
+\subsection{FCFS}
+\label{subsec:fcfs-scheduling}
+
+FCFS，First-Come First-Served，是最简单的策略。请求按到达顺序进入 running set。优点是公平、易理解、实现简单。缺点是容易被长请求阻塞。
+
+如果前面有一个超长 prompt 请求，后面的短请求必须等待，即 head-of-line blocking。对于用户交互场景，FCFS 可能导致短请求体验很差。
+
+\subsection{decode-first}
+\label{subsec:decode-first-scheduling}
+
+Decode-first 策略优先调度已经在 running set 中的 decode 请求，再用剩余 token budget 处理 prefill。它的目标是保护流式输出稳定性：
+
+[
+\text{minimize TPOT}.
+]
+
+优点：
+
+\begin{itemize}
+\item 已开始输出的请求不容易卡顿；
+\item 用户感知更流畅；
+\item decode latency 更稳定。
+\end{itemize}
+
+缺点：
+
+\begin{itemize}
+\item 新请求 TTFT 可能变差；
+\item waiting queue 在高负载下可能积压；
+\item 长 prompt 更难被准入。
+\end{itemize}
+
+Decode-first 常与 chunked prefill 配合：先保护 decode，再把剩余 budget 用于 prefill chunks。
+
+\subsection{prefill-first}
+\label{subsec:prefill-first-scheduling}
+
+Prefill-first 策略优先处理新请求 prefill，目标是降低 TTFT。它适合希望用户尽快看到首 token的场景。缺点是可能阻塞 running decode，导致流式输出卡顿。
+
+Prefill-first 在低负载时问题不大；在高负载、长 prompt 混入时，容易导致 TPOT 和尾延迟恶化。因此生产系统中通常不会无条件 prefill-first，而是结合 budget 或优先级。
+
+\subsection{Shortest-Remaining-Processing-Time 直觉}
+\label{subsec:srpt-intuition}
+
+在排队论中，SRPT，Shortest Remaining Processing Time，倾向于优先处理剩余工作量最小的任务，以降低平均完成时间。LLM serving 中可以借鉴这个直觉：短请求优先可以改善平均延迟。
+
+但 LLM 请求的剩余生成长度通常未知。用户可能设置 max tokens，但模型可能提前 EOS。系统只能估计：
+
+[
+\hat{S}_{\mathrm{remaining}}.
+]
+
+估计可来自：
+
+\begin{itemize}
+\item 用户 max tokens；
+\item 历史请求分布；
+\item prompt 类型；
+\item 当前已生成长度；
+\item stop sequence；
+\item 业务接口类型。
+\end{itemize}
+
+短请求优先的风险是长请求饥饿。因此需要 aging 或配额机制，让等待时间较长的请求逐渐提高优先级。
+
+\subsection{优先级与 SLA}
+\label{subsec:priority-and-sla}
+
+生产系统中，请求可能有不同优先级：
+
+\begin{itemize}
+\item 付费等级；
+\item 业务类型；
+\item 用户交互请求 vs 离线任务；
+\item 系统内部调用；
+\item 实时补全 vs 批量生成；
+\item 短上下文 vs 长上下文。
+\end{itemize}
+
+调度器可以为每个请求定义 priority：
+
+[
+\pi_r.
+]
+
+调度 utility 可写为：
+
+[
+U_r
+===
+
+\pi_r
+\cdot
+f(T_{\mathrm{waiting}},S_{\mathrm{prompt}},S_{\mathrm{generated}},\mathrm{SLA}).
+]
+
+高优先级请求获得更早 prefill、更稳定 decode 或更多资源配额。但优先级系统必须防止低优先级请求永久饥饿。常见做法是引入 waiting time aging：
+
+[
+\pi_r^{\mathrm{effective}}
+==========================
+
+\pi_r
++
+\lambda T_{\mathrm{waiting}}.
+]
+
+等待越久，有效优先级越高。
+
+\begin{table}[H]
+\centering
+\small
+\caption{常见 LLM Serving 调度策略对比}
+\label{tab:serving-scheduling-policies}
+\begin{tabular}{p{0.18\textwidth}p{0.32\textwidth}p{0.38\textwidth}}
+\toprule
+\textbf{策略} & \textbf{优点} & \textbf{风险} \
+\midrule
+FCFS
+& 简单公平，易实现
+& 长请求造成 head-of-line blocking。 \
+\midrule
+Decode-first
+& TPOT 稳定，流式体验好
+& 新请求 TTFT 可能变差。 \
+\midrule
+Prefill-first
+& 新请求首 token 更快
+& 长 prefill 可能阻塞 decode。 \
+\midrule
+Shortest-first
+& 平均完成时间较好
+& 长请求可能饥饿，需要 aging。 \
+\midrule
+Priority/SLA
+& 支持业务分级和延迟目标
+& 复杂度高，低优先级需防饥饿。 \
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{调度器与底层优化的协同}
+\label{sec:scheduler-and-low-level-optimizations}
+
+调度器不是孤立模块。它必须了解底层 kernel、量化格式、KV Cache 管理和多 GPU 并行，否则会做出看似合理但性能很差的决策。
+
+\subsection{与 PagedAttention 的协同}
+\label{subsec:scheduler-with-pagedattention}
+
+PagedAttention 让请求的 KV Cache 不必连续存储，调度器因此可以更灵活地动态加入和退出请求。Scheduler 需要与 Block Manager 交互：
+
+\begin{itemize}
+\item prefill 前申请 blocks；
+\item decode 到 block 边界时申请新 block；
+\item 请求结束释放 blocks；
+\item prefix cache 命中时共享 blocks；
+\item copy-on-write 时申请新 block；
+\item 显存压力下触发 eviction 或 preemption。
+\end{itemize}
+
+每个 iteration，调度器会构造：
+
+\begin{itemize}
+\item block table；
+\item slot mapping；
+\item sequence lengths；
+\item request ids；
+\item position ids。
+\end{itemize}
+
+这些 metadata 传给 PagedAttention kernel，用于读取和写入 KV Cache。
+
+\subsection{与 FlashAttention 的协同}
+\label{subsec:scheduler-with-flashattention}
+
+Prefill 阶段常使用 FlashAttention。调度器影响 FlashAttention 的 shape：
+
+[
+\text{batched prompt tokens}
+\rightarrow
+\text{attention kernel shape}.
+]
+
+如果调度器把 prefill chunk 切得太小，FlashAttention 可能无法充分发挥大块计算效率；如果切得太大，又会阻塞 decode。调度器需要在 kernel efficiency 和 latency 之间折中。
+
+对于 variable-length prompts，调度器还要生成 packed sequence metadata，使 FlashAttention 可以处理不同长度序列，避免 padding 到最大长度。
+
+\subsection{与量化的协同}
+\label{subsec:scheduler-with-quantization}
+
+量化改变资源模型。INT4 weight-only 降低权重显存和权重读取带宽，可能允许：
+
+\begin{itemize}
+\item 更大 KV Cache budget；
+\item 更高 running request 数；
+\item 更长上下文；
+\item 更少 GPU 副本；
+\item 更低成本。
+\end{itemize}
+
+但量化 kernel 可能对 batch size、group size、alignment、TP shard 有要求。调度器若构造出不友好的 shape，量化 kernel 性能可能下降。比如某些 INT4 GEMM 对 batch 或 hidden 维对齐敏感；某些 FP8 kernel 需要特定 scale metadata；KV Cache 量化需要 attention kernel 读取 scale。
+
+因此，调度器的资源估算不能只使用 token 数，还需要考虑 kernel backend 的 shape 约束。
+
+\subsection{统一执行图}
+\label{subsec:unified-serving-execution-graph}
+
+一个现代 serving engine 的每轮执行可以抽象为：
+
+[
+\text{Schedule}
+\rightarrow
+\text{Build Inputs}
+\rightarrow
+\text{Quantized Linear}
+\rightarrow
+\text{Attention Backend}
+\rightarrow
+\text{KV Write}
+\rightarrow
+\text{Sampling}
+\rightarrow
+\text{State Update}.
+]
+
+其中 Attention Backend 可能根据阶段选择：
+
+[
+\text{Prefill}
+\rightarrow
+\text{FlashAttention}.
+]
+
+[
+\text{Decode}
+\rightarrow
+\text{PagedAttention}.
+]
+
+Linear backend 可能根据模型选择：
+
+[
+\text{FP16/BF16 GEMM},
+\quad
+\text{INT4 weight-only GEMM},
+\quad
+\text{W8A8 GEMM},
+\quad
+\text{FP8 GEMM}.
+]
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+box/.style={draw, rounded corners=4pt, minimum width=2.05cm, minimum height=0.7cm, align=center},
+arrow/.style={-{Latex[length=2.1mm]}, thick}
+]
+
+```
+\node[font=\bfseries] at (0,3.25) {调度器与底层优化的统一执行路径};
+
+\node[box, fill=orange!14] (sched) at (-5.0,1.45) {Scheduler};
+\node[box, fill=green!10] (inputs) at (-2.65,1.45) {Input Builder\\slot mapping};
+\node[box, fill=blue!8] (linear) at (-0.2,1.45) {Quantized\\Linear};
+\node[box, fill=purple!10] (attn) at (2.25,1.45) {Attention\\Backend};
+\node[box, fill=red!8] (kv) at (4.7,1.45) {KV Write\\Blocks};
+
+\node[box, fill=yellow!16] (sample) at (2.25,0.15) {Sampling};
+\node[box, fill=gray!15] (update) at (-0.2,0.15) {State\\Update};
+
+\draw[arrow] (sched) -- (inputs);
+\draw[arrow] (inputs) -- (linear);
+\draw[arrow] (linear) -- (attn);
+\draw[arrow] (attn) -- (kv);
+\draw[arrow] (kv) -- (sample);
+\draw[arrow] (sample) -- (update);
+\draw[arrow] (update.west) .. controls (-2.5,-0.7) and (-4.9,0.1) .. (sched.south);
+
+\node[align=left, text width=10.5cm] at (0,-1.4) {
+  调度器决定 shape 和资源分配；底层 kernel 决定每个 shape 的执行效率。
+  高性能 serving 必须让 scheduler、PagedAttention、FlashAttention 和量化 kernel 协同设计。
+};
+```
+
+\end{tikzpicture}
+\caption{Serving iteration 的统一执行路径}
+\label{fig:serving-unified-execution-path}
+\end{figure}
+
+\section{多 GPU 与多副本 Serving 调度}
+\label{sec:multi-gpu-and-replica-serving-scheduling}
+
+单 GPU serving 已经复杂，多 GPU 和多副本部署会引入新的调度问题。
+
+\subsection{Replica routing}
+\label{subsec:replica-routing}
+
+生产系统通常部署多个模型副本。Router 需要把请求分配给某个 replica。简单策略包括：
+
+\begin{itemize}
+\item round-robin；
+\item least outstanding requests；
+\item least KV memory used；
+\item least estimated latency；
+\item consistent hashing by session id；
+\item priority-aware routing。
+\end{itemize}
+
+LLM serving 中，least outstanding requests 不一定好，因为一个短请求和一个长请求成本差异巨大。更合理的是估计每个 worker 的负载：
+
+[
+\operatorname{Load}
+===================
+
+\alpha N_{\mathrm{running}}
++
+\beta B_{\mathrm{KV\ used}}
++
+\gamma T_{\mathrm{queued}}
++
+\delta C_{\mathrm{prefill\ pending}}.
+]
+
+Router 根据估计负载选择 replica。
+
+\subsection{Sticky session 与 KV locality}
+\label{subsec:sticky-session-and-kv-locality}
+
+多轮对话中，KV Cache 通常驻留在某个 worker 上。如果下一轮请求路由到同一个 worker，可以复用会话 cache 或 prefix cache；如果路由到其他 worker，就需要重新 prefill 或迁移 KV Cache。
+
+Sticky session 策略：
+
+[
+\text{session id}
+\rightarrow
+\text{same worker}.
+]
+
+优点是 cache locality 好，TTFT 低。缺点是负载可能不均。某些 worker 可能积累大量长会话，显存紧张；另一些 worker 空闲。
+
+因此 routing 要在 cache locality 和 load balancing 之间折中：
+
+[
+\text{RouteScore}
+=================
+
+-\alpha\operatorname{Load}
++
+\beta\operatorname{CacheHit}
+----------------------------
+
+\gamma\operatorname{KVPressure}.
+]
+
+\subsection{Tensor Parallel Serving}
+\label{subsec:tensor-parallel-serving-scheduling}
+
+当单 GPU 放不下模型，或希望提升单请求吞吐时，会使用 tensor parallel。一个 replica 可能由多个 GPU 组成：
+
+[
+P_{\mathrm{TP}}>1.
+]
+
+此时一个请求必须被同一个 TP group 内的所有 ranks 共同执行。Scheduler 的资源单位不再是单 GPU，而是一个 TP group。TP group 内部需要同步执行每个 iteration，不能某个 rank 跑请求 A，另一个 rank 跑请求 B。
+
+TP serving 的调度影响包括：
+
+\begin{itemize}
+\item KV Cache 按 heads 或 hidden shard 分布在 TP ranks；
+\item block allocation 要在 TP ranks 上一致；
+\item PagedAttention block table 需要每个 rank 对应本地 shard；
+\item sampling logits 可能需要 gather 或只在某个 rank 完成；
+\item all-reduce/all-gather 通信影响 TPOT。
+\end{itemize}
+
+\subsection{Prefill/Decode 分离部署}
+\label{subsec:prefill-decode-disaggregation}
+
+更高级的 serving 架构可能将 prefill 和 decode 分离到不同 GPU 池。原因是二者资源特征不同：
+
+\begin{itemize}
+\item prefill 更 compute-bound，适合大块计算；
+\item decode 更 memory-bound，受 KV Cache 和 HBM 带宽影响；
+\item prefill 延迟影响 TTFT；
+\item decode 资源决定持续输出吞吐。
+\end{itemize}
+
+Prefill/decode disaggregation 的挑战是：prefill 完成后生成的 KV Cache 需要转移到 decode worker，或者使用共享存储/高速网络让 decode worker 访问。KV transfer 可能成为新瓶颈。
+
+迁移成本约为：
+
+[
+M_{\mathrm{KV,prompt}}
+======================
+
+2L S_{\mathrm{prompt}} n_{kv}d_hs_{\mathrm{dtype}}.
+]
+
+如果 prompt 很长，KV transfer 可能非常大。因此 disaggregation 需要高带宽网络、KV 压缩、分层缓存或特定路由策略支持。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+pool/.style={draw, rounded corners=5pt, minimum width=3.2cm, minimum height=1.3cm, align=center},
+arrow/.style={-{Latex[length=2.1mm]}, thick}
+]
+
+```
+\node[font=\bfseries] at (0,3.1) {Prefill / Decode 分离部署的基本形态};
+
+\node[pool, fill=green!10] (prefill) at (-3.2,1.25) {Prefill Pool\\compute-oriented};
+\node[pool, fill=blue!8] (decode) at (3.2,1.25) {Decode Pool\\KV / memory-oriented};
+
+\node[pool, fill=orange!14, minimum width=2.8cm] (router) at (0,-0.45) {Router\\Scheduler};
+
+\draw[arrow] (router) -- (prefill);
+\draw[arrow] (prefill) -- node[above] {KV transfer} (decode);
+\draw[arrow] (decode) -- (router);
+
+\node[align=left, text width=10.5cm] at (0,-1.85) {
+  Prefill/decode 分离能针对两类工作负载分别优化资源，但 KV Cache 转移成本很高。
+  是否值得取决于 prompt 长度、网络带宽、worker 负载和缓存策略。
+};
+```
+
+\end{tikzpicture}
+\caption{Prefill 与 decode 分离的 serving 架构}
+\label{fig:prefill-decode-disaggregation}
+\end{figure}
+
+\section{监控、压测与调优}
+\label{sec:serving-monitoring-benchmarking-tuning}
+
+Serving 系统的调度策略必须靠数据验证。没有监控和压测，很难判断瓶颈到底在 tokenizer、scheduler、KV Cache、attention kernel、GEMM、采样、网络还是路由。
+
+\subsection{核心监控指标}
+\label{subsec:serving-monitoring-metrics}
+
+推荐监控以下指标：
+
+\begin{itemize}
+\item QPS；
+\item input tokens/s；
+\item output tokens/s；
+\item TTFT P50/P90/P99；
+\item TPOT P50/P90/P99；
+\item E2E latency；
+\item waiting queue length；
+\item running request count；
+\item GPU utilization；
+\item HBM used/free；
+\item KV blocks used/free；
+\item block allocation failures；
+\item preemption/swap/recompute 次数；
+\item prefix cache hit rate；
+\item prefill/decode token ratio；
+\item average prompt length；
+\item average output length；
+\item per-iteration batch size；
+\item per-iteration token count；
+\item kernel time breakdown。
+\end{itemize}
+
+这些指标应该按 worker、model、priority、tenant、prompt length bucket 分维度统计。全局平均值常常掩盖问题。例如整体 TPOT 很好，但长上下文请求 P99 很差；整体显存充足，但某些 worker 因 sticky session 显存耗尽。
+
+\subsection{负载模型}
+\label{subsec:serving-load-model}
+
+压测时需要构造真实负载模型。至少包括：
+
+\begin{itemize}
+\item 请求到达过程，例如 Poisson、burst、trace replay；
+\item prompt length 分布；
+\item output length 分布；
+\item 并发用户数；
+\item streaming 开关；
+\item 多轮会话比例；
+\item prefix 共享比例；
+\item 取消请求比例；
+\item 不同优先级混合；
+\item 长上下文请求比例。
+\end{itemize}
+
+只用固定 prompt length 和固定 output length 压测，会严重低估真实调度难度。真实流量的长尾分布才是 tail latency 和 KV Cache 压力的主要来源。
+
+\subsection{调优参数}
+\label{subsec:serving-tuning-knobs}
+
+常见调优参数包括：
+
+\begin{itemize}
+\item \texttt{max_num_batched_tokens}；
+\item \texttt{max_num_seqs}；
+\item prefill chunk size；
+\item KV block size；
+\item GPU memory utilization target；
+\item lookahead slots；
+\item prefix cache capacity；
+\item scheduler policy；
+\item decode-first ratio；
+\item request timeout；
+\item max model length；
+\item quantization format；
+\item tensor parallel size；
+\item tokenizer worker 数；
+\item router load balancing policy。
+\end{itemize}
+
+调优时应一次只改少量参数，并观察 TTFT、TPOT、吞吐和 KV block 使用率的变化。一个参数可能改善吞吐但恶化尾延迟。例如增大 \texttt{max_num_batched_tokens} 可以提高 GPU 利用率，但可能让单 iteration 更长，TPOT P99 上升。
+
+\section{本章小结}
+\label{sec:chapter16-summary}
+
+本章系统介绍了 LLM 推理服务调度与 Continuous Batching。至此，第四篇从 KV Cache、PagedAttention、FlashAttention、量化一路走到完整 serving engine 的在线调度问题。
+
+\begin{itemize}
+\item \textbf{LLM serving 是在线资源管理问题}，不仅是模型 forward。系统需要同时管理请求队列、KV Cache、token budget、GPU kernel、采样和流式输出。
+\item \textbf{请求生命周期} 包括接收、分词、入队、准入、prefill、decode、采样、流式返回和资源释放。
+\item \textbf{核心指标} 包括 TTFT、TPOT、E2E latency、throughput、tail latency 和 cost/token。不同业务对这些指标权重不同。
+\item \textbf{Prefill 与 decode 的计算形态不同}：prefill 计算密度高、长 prompt 成本大；decode token-by-token，强依赖 KV Cache，通常更 memory-bound。
+\item \textbf{长 prefill 会阻塞 decode}，导致流式输出卡顿。调度器需要在 TTFT 和 TPOT 之间折中。
+\item \textbf{Continuous batching 是 iteration-level scheduling}，每个 decode iteration 都可以让完成请求退出、新请求加入，从而提高 GPU 利用率。
+\item \textbf{Scheduler 通常维护 waiting、running、finished、paused 等状态集合}，并在每轮根据 token budget、KV block budget 和序列数限制构造 batch。
+\item \textbf{Chunked prefill 将长 prompt 拆成多个 chunks}，让 prefill 可以与 decode 交错执行，保护 TPOT 和尾延迟。
+\item \textbf{KV Cache 准入控制是 serving 的关键}。请求能否进入 running set，不只取决于 batch slot，也取决于是否有足够 KV blocks。
+\item \textbf{显存压力下可以 queue、reject、preempt、swap 或 recompute}，不同策略在吞吐、延迟、实现复杂度和用户体验之间权衡。
+\item \textbf{调度策略没有唯一最优}。FCFS 简单但容易被长请求阻塞；decode-first 保护流式输出；prefill-first 降低首 token；priority/SLA 策略适合多租户生产系统。
+\item \textbf{调度器必须与 PagedAttention、FlashAttention 和量化 kernel 协同}。调度器决定 shape 和资源分配，底层 kernel 决定每个 shape 的执行效率。
+\item \textbf{多副本部署需要 replica routing 和 sticky session 权衡}。KV locality 能降低多轮对话 TTFT，但可能造成 worker 负载不均。
+\item \textbf{多 GPU serving 中，一个 TP group 是调度资源单位}，KV Cache、block table、sampling 和通信都必须跨 ranks 协调。
+\item \textbf{监控与压测是调度调优的基础}。必须观察 TTFT/TPOT 分位数、KV blocks、running requests、prefix hit rate、kernel breakdown 等指标。
+\end{itemize}
+
+至此，第四篇“推理架构优化”完成。我们已经从 KV Cache 的基本机制出发，讨论了 PagedAttention 如何解决动态 cache 管理，FlashAttention 如何减少 attention IO，量化如何降低显存与带宽压力，最后回到 serving scheduler 如何把所有这些优化组合成可运行的在线推理系统。
+
+下一篇将进入硬件与资源调度。我们会从 GPU 架构、HBM、NVLink、PCIe、RDMA、NCCL 与集群网络开始，进一步理解为什么 AI Infra 的性能最终取决于硬件拓扑、通信路径、资源隔离、调度策略和故障恢复。

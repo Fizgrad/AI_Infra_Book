@@ -1,0 +1,816 @@
+\chapter{NVLink 与 NVSwitch}
+\label{chap:nvlink-nvswitch}
+
+上一章我们从单个 GPU 的内部结构出发，讨论了 SM、Tensor Core、HBM、Shared Memory、L2 Cache 以及 profiler 如何帮助我们判断 kernel 是 compute-bound 还是 memory-bound。但是在真正的大模型训练和推理系统中，单个 GPU 很快就会遇到边界：模型参数放不下，batch 放不下，KV Cache 放不下，训练时间太长，推理吞吐不够，单卡再强也无法独自承担所有计算。
+
+于是，多 GPU 系统成为 AI Infrastructure 的核心形态。多 GPU 系统中的关键问题不是“把几张 GPU 插到一台机器里”这么简单，而是这些 GPU 之间如何通信、通信带宽和延迟如何影响并行策略、通信拓扑如何影响 NCCL collective、以及错误的 rank mapping 如何让昂贵的 GPU 集群跑出低效性能。
+
+本章讨论单机多卡场景中最重要的 scale-up 互联技术：PCIe、GPU Direct P2P、NVLink 与 NVSwitch。它们共同决定了一台 AI 服务器内部 GPU 之间的数据移动能力。理解这些内容，是进入下一章 RDMA / RoCE 多机通信之前的必要准备。
+
+本章将围绕四个问题展开：
+
+\begin{itemize}
+  \item 单机多卡为什么不能只依赖 PCIe？
+  \item NVLink 如何改善 GPU-to-GPU 通信？
+  \item NVSwitch 如何把点对点互联扩展为接近 all-to-all 的 GPU fabric？
+  \item 如何用 \texttt{nvidia-smi topo}、NCCL tests 和 profiler 诊断单机多卡通信问题？
+\end{itemize}
+
+\section{单机多卡通信问题}
+\label{sec:single-node-multi-gpu}
+
+大模型训练和推理中的多卡通信可以分为两类：一类是显式通信，例如 tensor parallel 中的 all-reduce、all-gather、reduce-scatter；另一类是隐式数据移动，例如不同 GPU 之间访问 peer memory、模型 shard 之间交换激活、流水线并行 stage 之间发送 tensor。无论是哪一类，本质上都需要 GPU 与 GPU 之间高速传输数据。
+
+如果没有高速互联，多卡系统就会出现一种尴尬局面：每张 GPU 的 Tensor Core 都很快，但它们经常在等待数据。训练中，等待梯度同步；推理中，等待 KV Cache 或中间激活跨卡传输；模型并行中，等待前一个 shard 的输出。此时系统瓶颈不在计算，而在 GPU 之间的数据路径。
+
+\subsection{PCIe 的局限}
+\label{subsec:pcie-limitations}
+
+PCIe 是通用 I/O 总线，CPU、GPU、NIC、NVMe 等设备都可以通过 PCIe 接入系统。它的优点是生态成熟、通用性强、设备支持广；缺点是它并不是专门为多 GPU 高密度通信设计的。
+
+在传统服务器中，多张 GPU 通常挂在 CPU root complex 或 PCIe switch 下面。GPU 之间通信时，数据可能需要经过 PCIe switch，甚至经过 CPU root complex。这样会带来几个问题：
+
+\begin{itemize}
+  \item \textbf{带宽受限}：PCIe 的带宽相对 GPU 内部 HBM 和 Tensor Core 吞吐低得多，容易成为通信瓶颈。
+  \item \textbf{拓扑不均匀}：同一台机器中，不同 GPU pair 的通信路径可能不同，有的只经过一个 switch，有的需要跨 CPU socket。
+  \item \textbf{延迟较高}：相比 GPU-to-GPU 专用互联，PCIe 路径更长，协议栈更通用，延迟也更高。
+  \item \textbf{与其他 I/O 竞争}：NIC、NVMe、其他加速卡可能共享 PCIe 资源，在高负载下互相影响。
+  \item \textbf{跨 socket 代价}：双路 CPU 服务器中，如果 GPU 分布在不同 NUMA domain 下，跨 socket 通信可能显著变慢。
+\end{itemize}
+
+这并不是说 PCIe 不重要。事实上，PCIe 仍然是 GPU 接入主机系统的基础路径，也常用于 CPU-GPU 数据传输、GPU-NIC 连接、GPU-NVMe 数据路径等。但对于需要频繁 GPU-to-GPU 通信的大模型训练，单靠 PCIe 往往难以满足高吞吐需求。
+
+\begin{figure}[H]
+  \centering
+  \begin{tikzpicture}[
+    font=\small,
+    box/.style={draw, rounded corners, minimum width=1.9cm, minimum height=0.75cm, align=center},
+    wide/.style={draw, rounded corners, minimum width=4.8cm, minimum height=0.8cm, align=center},
+    arrow/.style={-{Stealth[length=2mm]}, thick},
+    link/.style={thick}
+  ]
+    \node[wide] (cpu) at (0,3.5) {CPU / Root Complex};
+    \node[wide] (sw) at (0,2.2) {PCIe Switch};
+    \node[box] (g0) at (-3,0.8) {GPU 0};
+    \node[box] (g1) at (-1,0.8) {GPU 1};
+    \node[box] (g2) at (1,0.8) {GPU 2};
+    \node[box] (g3) at (3,0.8) {GPU 3};
+
+    \draw[link] (cpu.south) -- (sw.north);
+    \draw[link] (sw.south) -- (g0.north);
+    \draw[link] (sw.south) -- (g1.north);
+    \draw[link] (sw.south) -- (g2.north);
+    \draw[link] (sw.south) -- (g3.north);
+
+    \draw[arrow, dashed] (g0.south) .. controls (-2,-0.4) and (2,-0.4) .. (g3.south);
+    \node[align=center] at (0,-0.75) {GPU-to-GPU 通信可能需要经过 PCIe Switch / Root Complex};
+
+    \node[align=center] at (0,4.35) {PCIe 拓扑：通用但路径可能不均匀};
+  \end{tikzpicture}
+  \caption{PCIe 多 GPU 拓扑的抽象示意：不同 GPU 之间通信路径可能经过 PCIe Switch 或 CPU root complex。}
+  \label{fig:pcie-gpu-topology}
+\end{figure}
+
+\subsection{GPU Direct P2P}
+\label{subsec:gpu-direct-p2p}
+
+GPU Direct P2P 允许一张 GPU 直接访问另一张 GPU 的显存地址空间，而不必把数据先拷贝到 CPU host memory 再拷贝到目标 GPU。对上层程序而言，它使 GPU-to-GPU 数据传输更直接，也让通信库可以更高效地实现 peer copy 和 collective。
+
+没有 P2P 时，GPU 之间的数据交换可能退化为如下路径：
+
+\[
+  \text{GPU 0 HBM} \rightarrow \text{Host Memory} \rightarrow \text{GPU 1 HBM}.
+\]
+
+有 P2P 时，路径可以变成：
+
+\[
+  \text{GPU 0 HBM} \rightarrow \text{PCIe / NVLink} \rightarrow \text{GPU 1 HBM}.
+\]
+
+这看似只是少了一次 host staging，但工程影响很大。对于大模型训练中的高频通信，绕过 CPU host memory 可以降低延迟、减少 CPU 内存带宽压力、减少 CPU 参与度，并让 NCCL 等通信库更容易构造高效路径。
+
+在 CUDA 程序中，可以通过 peer access 相关 API 检查和启用 GPU 之间的 peer 访问能力。下面是一个概念示例：
+
+\begin{lstlisting}[language=C++,caption={检查并启用 GPU peer access 的概念代码},label={lst:cuda-peer-access}]
+int can_access_peer = 0;
+cudaDeviceCanAccessPeer(&can_access_peer, 0, 1);
+
+if (can_access_peer) {
+  cudaSetDevice(0);
+  cudaDeviceEnablePeerAccess(1, 0);
+
+  cudaSetDevice(1);
+  cudaDeviceEnablePeerAccess(0, 0);
+}
+\end{lstlisting}
+
+实际 AI 框架通常不会要求用户手写这些代码。PyTorch、NCCL、DeepSpeed、Megatron-LM、vLLM 等系统会在底层利用 CUDA runtime、driver 和 NCCL 能力。但作为 Infra 工程师，理解 P2P 的意义非常重要：当 P2P 不可用或拓扑不佳时，某些多卡通信性能会突然下降，甚至出现本该在 GPU 间完成的数据传输绕回 CPU 的情况。
+
+\subsection{Intra-node Bandwidth}
+\label{subsec:intra-node-bandwidth}
+
+Intra-node bandwidth 指同一台服务器内部 GPU 之间的通信带宽。它对以下并行策略尤其关键：
+
+\begin{itemize}
+  \item \textbf{Tensor Parallelism}：每层 Transformer 内部都可能发生 all-reduce、all-gather 或 reduce-scatter，对单机内 GPU 带宽极其敏感。
+  \item \textbf{Sequence Parallelism}：activation 沿 sequence 维切分后，需要额外 collective。
+  \item \textbf{Expert Parallelism}：MoE token dispatch 和 combine 会产生 all-to-all 通信。
+  \item \textbf{Pipeline Parallelism}：stage 之间要传递 activation 和 gradient，通信量通常小于 TP，但延迟仍然影响 bubble。
+  \item \textbf{Inference Tensor Parallel}：推理每生成一个 token 都会触发层内跨卡通信，TPOT 对通信延迟敏感。
+\end{itemize}
+
+一个常见误区是只看“总带宽”。多 GPU 通信还要关注路径是否均匀、是否全双工、是否需要经过共享 switch、是否跨 NUMA、是否被其他设备抢占、collective 算法是否匹配拓扑。对于 tensor parallel 这种频繁、小步、层内通信，延迟和拓扑均匀性同样重要。对于大 batch 数据并行梯度同步，带宽通常更重要。
+
+\subsection{通信拓扑对并行训练的影响}
+\label{subsec:topology-impact-training}
+
+通信拓扑会直接影响并行策略选择。假设一台机器有 8 张 GPU。如果它们通过 NVSwitch 构成高带宽 all-to-all fabric，那么 TP size = 8 可能是合理选择；如果它们只是通过 PCIe 分成两个相对独立的 4 GPU group，那么 TP size = 8 可能会跨越低带宽路径，性能反而不如 TP size = 4 加上更大的 DP 或 PP。
+
+对训练系统来说，rank mapping 是拓扑优化的关键。所谓 rank mapping，就是把全局 rank 分配到物理 GPU 上。错误的 rank mapping 可能让通信密集的 rank 被放在通信路径最差的 GPU pair 上。例如：
+
+\begin{itemize}
+  \item TP group 内 rank 应尽量放在同一高速互联域中；
+  \item PP 相邻 stage 应尽量减少跨慢链路传输；
+  \item DP group 的通信量通常较大但频率低于 TP，可根据节点间网络权衡；
+  \item MoE expert parallel 中 all-to-all 的 rank 分布需要结合节点内和节点间带宽。
+\end{itemize}
+
+\begin{figure}[H]
+  \centering
+  \begin{tikzpicture}[
+    font=\small,
+    gpu/.style={draw, rounded corners, minimum width=1.2cm, minimum height=0.65cm, align=center},
+    group/.style={draw, rounded corners, dashed, inner sep=0.25cm},
+    fast/.style={line width=1.2pt},
+    slow/.style={line width=0.5pt, dashed}
+  ]
+    \node[gpu] (g0) at (0,2.5) {GPU0};
+    \node[gpu] (g1) at (2,2.5) {GPU1};
+    \node[gpu] (g2) at (0,1.2) {GPU2};
+    \node[gpu] (g3) at (2,1.2) {GPU3};
+
+    \node[gpu] (g4) at (5,2.5) {GPU4};
+    \node[gpu] (g5) at (7,2.5) {GPU5};
+    \node[gpu] (g6) at (5,1.2) {GPU6};
+    \node[gpu] (g7) at (7,1.2) {GPU7};
+
+    \draw[fast] (g0) -- (g1);
+    \draw[fast] (g0) -- (g2);
+    \draw[fast] (g1) -- (g3);
+    \draw[fast] (g2) -- (g3);
+    \draw[fast] (g0) -- (g3);
+    \draw[fast] (g1) -- (g2);
+
+    \draw[fast] (g4) -- (g5);
+    \draw[fast] (g4) -- (g6);
+    \draw[fast] (g5) -- (g7);
+    \draw[fast] (g6) -- (g7);
+    \draw[fast] (g4) -- (g7);
+    \draw[fast] (g5) -- (g6);
+
+    \draw[slow] (g1) -- (g4);
+    \draw[slow] (g3) -- (g6);
+
+    \node[group, fit=(g0)(g1)(g2)(g3), label=below:{高速互联域 A}] {};
+    \node[group, fit=(g4)(g5)(g6)(g7), label=below:{高速互联域 B}] {};
+
+    \node[align=center] at (3.5,3.25) {错误的 TP group 跨越慢链路会放大通信瓶颈};
+  \end{tikzpicture}
+  \caption{拓扑感知 rank mapping 示例：通信密集的 group 应优先放在高速互联域内。}
+  \label{fig:topology-aware-rank-mapping}
+\end{figure}
+
+\section{NVLink}
+\label{sec:nvlink}
+
+NVLink 是 NVIDIA 面向 GPU-to-GPU 高速通信设计的互联技术。与 PCIe 相比，NVLink 更接近专用 GPU fabric，目标是为多 GPU 训练和推理提供更高带宽、更低延迟和更好的拓扑特性。
+
+需要注意的是，NVLink 不是一个固定带宽的单一产品。不同 GPU 架构、不同 NVLink 代际、不同服务器形态中，link 数量、单 link 带宽、拓扑连接方式都可能不同。本书更关注它在 AI Infra 中的抽象作用：为 GPU 之间提供比普通 PCIe 更适合大规模张量通信的高速路径。
+
+\subsection{点对点高速互联}
+\label{subsec:nvlink-p2p}
+
+最基本的 NVLink 可以理解为 GPU 与 GPU 之间的高速点对点链路。若 GPU0 和 GPU1 之间存在 NVLink 连接，那么它们之间的 P2P 传输可以走 NVLink，而不是走 PCIe。对于通信库来说，这意味着同样一次 peer copy、send/recv 或 collective chunk transfer 可以获得更高的传输能力。
+
+\begin{figure}[H]
+  \centering
+  \begin{tikzpicture}[
+    font=\small,
+    gpu/.style={draw, rounded corners, minimum width=1.4cm, minimum height=0.75cm, align=center},
+    nv/.style={line width=1.4pt},
+    pcie/.style={dashed, line width=0.6pt},
+    box/.style={draw, rounded corners, minimum width=3.8cm, minimum height=0.8cm, align=center}
+  ]
+    \node[box] (cpu) at (0,3.4) {CPU / PCIe Root};
+    \node[gpu] (g0) at (-3,1.7) {GPU0};
+    \node[gpu] (g1) at (-1,1.7) {GPU1};
+    \node[gpu] (g2) at (1,1.7) {GPU2};
+    \node[gpu] (g3) at (3,1.7) {GPU3};
+
+    \draw[pcie] (cpu.south) -- (g0.north);
+    \draw[pcie] (cpu.south) -- (g1.north);
+    \draw[pcie] (cpu.south) -- (g2.north);
+    \draw[pcie] (cpu.south) -- (g3.north);
+
+    \draw[nv] (g0) -- (g1);
+    \draw[nv] (g1) -- (g2);
+    \draw[nv] (g2) -- (g3);
+    \draw[nv] (g0) to[bend right=20] (g2);
+    \draw[nv] (g1) to[bend left=20] (g3);
+
+    \node[align=center] at (0,0.35) {实线：NVLink GPU-to-GPU 高速路径\\虚线：PCIe 到主机路径};
+  \end{tikzpicture}
+  \caption{NVLink 点对点互联的抽象示意：GPU 之间可通过专用高速链路直接通信。}
+  \label{fig:nvlink-point-to-point}
+\end{figure}
+
+在训练系统中，NVLink 对 tensor parallel 的影响尤其明显。以 Transformer 中的 row-parallel linear 为例，局部 matmul 后需要对 partial output 做 all-reduce。如果 TP group 内 GPU 之间有高带宽 NVLink，all-reduce 的开销可以显著降低；如果 TP group 跨越 PCIe 或跨节点网络，则通信可能成为每层的主瓶颈。
+
+\subsection{Bandwidth 与 Lane}
+\label{subsec:nvlink-bandwidth-lane}
+
+NVLink 的物理实现通常由多条 link 或 lane 组成。一个 GPU 可以通过多条 NVLink 连接到其他 GPU 或交换芯片。不同代际的 NVLink 在单 link 速率、每 GPU link 数量、总带宽、协议能力等方面不同。
+
+在工程分析中，与其死记某个型号的数字，不如关注三个问题：
+
+\begin{enumerate}
+  \item \textbf{某两个 GPU 之间是否存在 NVLink 路径？}
+  \item \textbf{这条路径是直接连接，还是需要经过 NVSwitch 或其他转发？}
+  \item \textbf{这条路径的有效带宽是否被 NCCL 或应用实际利用？}
+\end{enumerate}
+
+硬件规格表给出的是理论带宽，而训练作业看到的是有效通信性能。有效通信性能还受数据大小、collective 算法、协议、并发通信数量、GPU 拓扑、NCCL channel 数量、stream 调度、GPU 负载等影响。小消息更容易受延迟影响，大消息更容易受带宽影响。Tensor parallel 中的通信往往频繁且分布在每层中，因此对延迟和带宽都敏感。
+
+\subsection{Peer Access}
+\label{subsec:nvlink-peer-access}
+
+NVLink 常与 CUDA peer access 一起发挥作用。启用 peer access 后，GPU 可以通过统一虚拟地址空间访问其他 GPU 的显存。对用户来说，最直观的表现是 \texttt{cudaMemcpyPeerAsync} 或框架内部的 P2P copy 可以走更高效路径。
+
+但是，peer access 是否可用并不只取决于 API 调用，还取决于硬件拓扑、驱动、系统配置、IOMMU、虚拟化、容器权限等因素。某些环境中，即使物理上有多张 GPU，P2P 也可能不可用或受限。
+
+在实际排查中，可以使用以下方式检查：
+
+\begin{lstlisting}[language=bash,caption={检查 GPU 拓扑和 P2P 能力的常用命令},label={lst:check-topology-p2p}]
+# 查看 GPU 之间的拓扑关系
+nvidia-smi topo -m
+
+# 查看 GPU 设备基本信息
+nvidia-smi -L
+
+# 运行 CUDA samples 中的 p2pBandwidthLatencyTest
+./p2pBandwidthLatencyTest
+\end{lstlisting}
+
+如果 \texttt{nvidia-smi topo -m} 显示两个 GPU 之间是 \texttt{NV}、\texttt{NVL} 或类似 NVLink 路径，通常说明它们之间存在 NVLink 连接；如果显示 \texttt{PIX}、\texttt{PXB}、\texttt{PHB}、\texttt{SYS} 等，则说明路径可能经过不同层级的 PCIe switch、host bridge 或跨 socket。具体标记含义应以当前驱动文档和设备输出为准。
+
+\subsection{NCCL 如何利用 NVLink}
+\label{subsec:nccl-nvlink}
+
+NCCL 是深度学习中最常用的 GPU collective 通信库之一。PyTorch DDP、Megatron-LM、DeepSpeed、Horovod、vLLM 的多卡路径以及许多训练框架都会依赖 NCCL。NCCL 会检测机器拓扑，并根据 GPU 之间的连接关系选择通信路径和 collective 算法。
+
+常见 collective 包括：
+
+\begin{itemize}
+  \item \textbf{AllReduce}：所有 rank 输入张量求和后，每个 rank 得到完整结果。数据并行梯度同步常用。
+  \item \textbf{ReduceScatter}：先 reduce，再把结果切分给不同 rank。ZeRO、tensor parallel 和 sequence parallel 中常见。
+  \item \textbf{AllGather}：每个 rank 持有一部分数据，最终所有 rank 收集完整数据。
+  \item \textbf{AllToAll}：每个 rank 向每个其他 rank 发送不同数据。MoE token dispatch 常用。
+  \item \textbf{Broadcast}：一个 rank 的数据分发到所有 rank。
+  \item \textbf{Send / Recv}：点对点通信，pipeline parallel 中常见。
+\end{itemize}
+
+在 NVLink 拓扑下，NCCL 可以利用高速 GPU-to-GPU 链路构造 ring、tree 或其他拓扑感知通信计划。对于一个 8 GPU 节点，如果 GPU 之间通过 NVSwitch 形成高带宽互联，NCCL 的 all-reduce 和 all-gather 可以获得比普通 PCIe 拓扑更好的性能。
+
+下面是一个极简的 NCCL all-reduce 调用概念示例：
+
+\begin{lstlisting}[language=C++,caption={NCCL AllReduce 概念代码},label={lst:nccl-allreduce-concept}]
+ncclAllReduce(
+    sendbuff,
+    recvbuff,
+    count,
+    ncclFloat16,
+    ncclSum,
+    comm,
+    stream
+);
+\end{lstlisting}
+
+在 PyTorch 中，用户通常通过 \texttt{torch.distributed} 间接使用 NCCL：
+
+\begin{lstlisting}[language=Python,caption={PyTorch 中触发 NCCL AllReduce 的概念示例},label={lst:pytorch-allreduce}]
+import torch
+import torch.distributed as dist
+
+x = torch.ones(1024, device="cuda")
+dist.all_reduce(x, op=dist.ReduceOp.SUM)
+\end{lstlisting}
+
+上层代码看起来很简单，但底层性能高度依赖拓扑。相同的 \texttt{dist.all\_reduce}，在 PCIe、NVLink、NVSwitch、跨节点 InfiniBand / RoCE 上的性能可能完全不同。
+
+\section{NVSwitch}
+\label{sec:nvswitch}
+
+NVLink 解决了 GPU-to-GPU 高速互联问题，但如果只依赖点对点连接，拓扑会随着 GPU 数量增加而变复杂。每张 GPU 不可能无限制地直接连接所有其他 GPU，link 数量、布线复杂度、拓扑非均匀性都会成为问题。NVSwitch 的目标，就是把 NVLink 从点对点链路扩展为更大规模、更均匀的 GPU fabric。
+
+\subsection{All-to-All GPU Fabric}
+\label{subsec:all-to-all-gpu-fabric}
+
+NVSwitch 可以理解为面向 NVLink 的高速交换芯片。GPU 不再只通过点对点 NVLink 直接连接某几个邻居，而是连接到 NVSwitch，再由 NVSwitch 在 GPU 之间转发数据。这样可以在一个节点或一个更大的 scale-up domain 中构造更接近 all-to-all 的通信能力。
+
+\begin{figure}[H]
+  \centering
+  \begin{tikzpicture}[
+    font=\small,
+    gpu/.style={draw, rounded corners, minimum width=1.2cm, minimum height=0.65cm, align=center},
+    sw/.style={draw, rounded corners, minimum width=2.0cm, minimum height=0.8cm, align=center, fill=gray!10},
+    link/.style={line width=1.1pt}
+  ]
+    \node[sw] (s0) at (0,2.4) {NVSwitch 0};
+    \node[sw] (s1) at (4,2.4) {NVSwitch 1};
+
+    \node[gpu] (g0) at (-1.8,0.7) {GPU0};
+    \node[gpu] (g1) at (-0.6,0.7) {GPU1};
+    \node[gpu] (g2) at (0.6,0.7) {GPU2};
+    \node[gpu] (g3) at (1.8,0.7) {GPU3};
+
+    \node[gpu] (g4) at (2.8,0.7) {GPU4};
+    \node[gpu] (g5) at (4.0,0.7) {GPU5};
+    \node[gpu] (g6) at (5.2,0.7) {GPU6};
+    \node[gpu] (g7) at (6.4,0.7) {GPU7};
+
+    \foreach \g in {g0,g1,g2,g3,g4,g5,g6,g7} {
+      \draw[link] (\g.north) -- (s0.south);
+      \draw[link] (\g.north) -- (s1.south);
+    }
+
+    \draw[link, dashed] (s0) -- (s1);
+
+    \node[align=center] at (2.3,-0.3) {每张 GPU 通过 NVLink 连接到交换芯片，形成更均匀的 GPU fabric};
+  \end{tikzpicture}
+  \caption{NVSwitch 全互联抽象示意：GPU 通过 NVLink 接入交换芯片，由交换芯片转发 GPU-to-GPU 流量。}
+  \label{fig:nvswitch-all-to-all}
+\end{figure}
+
+在这种架构中，GPU-to-GPU 通信不再强依赖某两个 GPU 是否存在直接物理链路，而是通过交换 fabric 获得更均匀的路径。这对大模型训练非常重要，因为 tensor parallel、expert parallel 和一些 all-to-all workload 希望任意 GPU pair 之间都有可预测的通信性能。
+
+\subsection{HGX / DGX 拓扑}
+\label{subsec:hgx-dgx-topology}
+
+HGX 和 DGX 是 NVIDIA 数据中心多 GPU 平台中常见的系统形态。不同代际和型号的具体连接方式不同，但它们的共同目标是把多张 GPU、NVLink、NVSwitch、CPU、NIC、PCIe 等组件组织成适合 AI 训练与推理的节点。
+
+从 AI Infra 角度看，关心的不是平台名称本身，而是以下几个拓扑问题：
+
+\begin{itemize}
+  \item 节点内有多少张 GPU？
+  \item GPU 之间是否通过 NVSwitch 实现高带宽互联？
+  \item GPU 与 NIC 的距离如何？是否支持高效 GPU Direct RDMA？
+  \item GPU 与 CPU socket 的 NUMA 关系如何？
+  \item 多个 NVSwitch 或交换平面之间是否存在瓶颈？
+  \item 节点内拓扑是否对 NCCL 可见且被正确识别？
+\end{itemize}
+
+一个常见设计原则是：节点内的高速 GPU fabric 用于 scale-up，并优先承载 TP、EP 等通信密集型并行；节点间网络用于 scale-out，并承载 DP、PP 跨节点 stage 或更大规模的 EP 通信。换句话说，拓扑决定并行维度如何放置。
+
+\subsection{多 GPU 全互联}
+\label{subsec:multi-gpu-full-connectivity}
+
+NVSwitch 最大的工程价值之一，是让多 GPU 节点更接近“任意 GPU 到任意 GPU 都高带宽”的抽象。这种抽象简化了上层系统设计。例如在 8 GPU NVSwitch 节点中，TP group 可以自然设置为 8，模型每层内部的 collective 都在节点内高速 fabric 上完成。
+
+但是，“全互联”不等于通信无成本。即使 NVSwitch 提供了很高带宽，通信仍然需要时间，也仍然可能与计算争用资源。对于每层都通信的 tensor parallel，通信量和通信频率仍然需要谨慎估算。
+
+以 tensor parallel 中的 all-reduce 为例，假设每层输出 activation 大小为 $B \times S \times H$，其中 $B$ 是 micro batch size，$S$ 是 sequence length，$H$ 是 hidden size。如果 TP size 为 $p$，某些实现中每层可能需要对局部输出做 all-reduce。通信数据量大致与 activation size 成正比。随着层数增加，这类通信在 step time 中会累积成明显开销。
+
+\begin{figure}[H]
+  \centering
+  \begin{tikzpicture}[
+    font=\small,
+    gpu/.style={draw, rounded corners, minimum width=1.1cm, minimum height=0.6cm, align=center},
+    sw/.style={draw, rounded corners, minimum width=2.3cm, minimum height=0.8cm, align=center, fill=gray!10},
+    arrow/.style={-{Stealth[length=2mm]}, thick},
+    link/.style={line width=1.0pt}
+  ]
+    \node[sw] (sw) at (0,2.4) {NVSwitch Fabric};
+
+    \foreach \i/\x/\y in {
+      0/-3/0.6,
+      1/-2/0.6,
+      2/-1/0.6,
+      3/0/0.6,
+      4/1/0.6,
+      5/2/0.6,
+      6/3/0.6,
+      7/4/0.6
+    } {
+      \node[gpu] (g\i) at (\x,\y) {G\i};
+      \draw[link] (g\i.north) -- (sw.south);
+    }
+
+    \draw[arrow, bend left=35] (g0.south) to node[below] {\scriptsize collective chunk} (g7.south);
+    \draw[arrow, bend left=25] (g2.south) to (g5.south);
+    \draw[arrow, bend right=25] (g6.south) to (g1.south);
+
+    \node[align=center] at (0,-0.85) {NCCL collective 将大 tensor 切成多个 chunk，在 GPU fabric 中并行传输与归约};
+  \end{tikzpicture}
+  \caption{NVSwitch 节点中的 collective 抽象：通信库将数据切分并在 GPU fabric 中并行传输。}
+  \label{fig:nvswitch-collective}
+\end{figure}
+
+\subsection{对 TP / PP / DP 的意义}
+\label{subsec:nvswitch-parallelism-impact}
+
+NVSwitch 对不同并行策略的意义不同。
+
+\subsubsection{对 Tensor Parallelism 的意义}
+
+TP 是最依赖节点内高速互联的并行方式之一。因为 TP 把单层内部的矩阵计算切到多张 GPU 上，每一层都可能引入通信。如果节点内有 NVSwitch，TP group 内 GPU 之间通信更均匀、更高带宽，因此可以支持更大的 TP size 或更高效的层内通信。
+
+但是 TP size 不是越大越好。TP size 增大后，每张 GPU 上的 matmul 规模变小，Tensor Core 利用率可能下降；通信次数不一定减少，通信相对占比可能上升。因此，选择 TP size 时要同时考虑：
+
+\begin{itemize}
+  \item 单卡是否能放下 shard 后的参数和 activation；
+  \item shard 后的 GEMM shape 是否仍然高效；
+  \item all-reduce / all-gather / reduce-scatter 通信是否可接受；
+  \item TP group 是否完全位于 NVSwitch 高速域内；
+  \item 是否需要与 PP、DP、ZeRO 组合。
+\end{itemize}
+
+\subsubsection{对 Pipeline Parallelism 的意义}
+
+PP 把模型按层切分成多个 stage。相邻 stage 之间需要传递 activation 和 gradient。相比 TP，PP 的通信频率通常较低，但通信发生在 pipeline 边界上，延迟会影响 bubble。NVSwitch 可以降低同节点 PP stage 之间的数据传输成本，但 PP 的主要瓶颈往往还包括负载均衡、micro-batch 数量、bubble、activation memory 等。
+
+如果一个节点内有 8 张 GPU，可以把连续几个 pipeline stage 放在同一节点内，使 stage 间通信走 NVLink/NVSwitch；跨节点 PP 则需要走 RDMA 网络。通常应尽量避免高频、细粒度通信跨越低带宽路径。
+
+\subsubsection{对 Data Parallelism 的意义}
+
+DP 的主要通信是梯度同步。单节点内 DP 可以通过 NVLink/NVSwitch 加速 all-reduce；多节点 DP 则还要经过 NIC 和 RDMA 网络。大规模训练中，NCCL 通常会构造分层通信：节点内先利用 NVLink/NVSwitch 聚合，节点间再通过 InfiniBand / RoCE 通信，最后节点内广播或分发结果。
+
+这类 hierarchical collective 的效率取决于节点内和节点间两层网络是否都被正确利用。如果节点内 NVLink 可用但 NCCL 没有识别拓扑，或者节点间 NIC 绑定不合理，整体 all-reduce 性能都会下降。
+
+\begin{table}[H]
+  \centering
+  \caption{NVLink / NVSwitch 对不同并行策略的影响}
+  \label{tab:nvlink-parallelism-impact}
+  \begin{tabular}{p{3.0cm}p{4.0cm}p{4.2cm}p{3.5cm}}
+    \toprule
+    并行策略 & 主要通信 & 对节点内互联的依赖 & 拓扑建议 \\
+    \midrule
+    Tensor Parallel & all-reduce、all-gather、reduce-scatter & 极高，每层频繁通信 & TP group 尽量放在 NVSwitch / NVLink 高速域内 \\
+    Pipeline Parallel & send / recv activation 与 gradient & 中等，边界通信影响 bubble & 相邻 stage 尽量放在通信路径短的位置 \\
+    Data Parallel & gradient all-reduce 或 reduce-scatter & 中到高，取决于 batch 和 bucket & 节点内聚合利用 NVLink，节点间利用 RDMA \\
+    ZeRO & reduce-scatter、all-gather & 中到高，取决于 stage 和 bucket & 分层通信，避免频繁跨慢链路 \\
+    Expert Parallel & all-to-all token dispatch & 很高，尤其 MoE 场景 & EP group 需要高带宽、均匀拓扑 \\
+    Inference TP & 每层 collective & 很高，直接影响 TPOT & 推理 TP group 应优先保持在单节点高速 fabric 内 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\section{通信性能诊断}
+\label{sec:communication-diagnosis}
+
+多 GPU 通信问题经常表现为“GPU 利用率低”“训练扩展性差”“8 卡不比 4 卡快多少”“推理 TPOT 异常高”“NCCL 卡住或超时”。这些现象背后的原因可能是硬件拓扑、NCCL 配置、驱动、容器权限、NUMA、PCIe ACS、IB/RoCE、rank mapping、框架 bucket 设置、数据 shape 等。诊断时必须从事实出发。
+
+\subsection{\texttt{nvidia-smi topo}}
+\label{subsec:nvidia-smi-topo}
+
+\texttt{nvidia-smi topo -m} 是查看单机 GPU 拓扑的第一步。它会输出 GPU 与 GPU、GPU 与 NIC、GPU 与 CPU affinity 之间的关系。典型输出包含 GPU pair 之间的连接标记，以及 CPU affinity、NUMA affinity 等信息。
+
+\begin{lstlisting}[language=bash,caption={查看单机 GPU 拓扑},label={lst:nvidia-smi-topo}]
+nvidia-smi topo -m
+\end{lstlisting}
+
+一个简化的输出可能类似下面这样：
+
+\begin{lstlisting}[language=bash,caption={nvidia-smi topo -m 的简化示意输出},label={lst:nvidia-smi-topo-output}]
+        GPU0    GPU1    GPU2    GPU3    NIC0    CPU Affinity
+GPU0     X      NVL     NVL     SYS     PIX     0-31
+GPU1    NVL      X      NVL     SYS     PIX     0-31
+GPU2    NVL     NVL      X      SYS     PXB     0-31
+GPU3    SYS     SYS     SYS      X      PHB     32-63
+NIC0    PIX     PIX     PXB     PHB      X
+\end{lstlisting}
+
+上面的示例不是某台真实机器的标准输出，而是为了说明几个重点：
+
+\begin{itemize}
+  \item GPU0、GPU1、GPU2 之间存在较好的连接；
+  \item GPU3 与其他 GPU 之间路径较差，可能跨 socket 或 host bridge；
+  \item NIC0 与不同 GPU 的距离不同；
+  \item 如果把 TP group 放在 GPU0--GPU3 上，可能引入慢链路；
+  \item 如果跨节点通信主要使用 NIC0，那么 GPU 与 NIC 的亲和性也需要考虑。
+\end{itemize}
+
+在真实环境中，不同驱动版本、GPU 型号和系统拓扑显示的标记可能不同。关键不是记住所有缩写，而是理解它们反映的是通信路径差异。遇到性能问题时，应把 \texttt{nvidia-smi topo -m} 输出与 rank mapping、NCCL 日志和作业配置放在一起看。
+
+\subsection{NCCL Tests}
+\label{subsec:nccl-tests}
+
+NCCL tests 是测试 GPU collective 性能的常用工具。它可以测量 all-reduce、all-gather、reduce-scatter、broadcast、all-to-all 等操作在不同消息大小、不同 GPU 数量下的带宽和延迟。常见命令如下：
+
+\begin{lstlisting}[language=bash,caption={运行 NCCL all-reduce 性能测试的示例},label={lst:nccl-tests-allreduce}]
+# 8 GPU 单机 all-reduce 测试
+./build/all_reduce_perf -b 8 -e 4G -f 2 -g 8
+\end{lstlisting}
+
+其中：
+
+\begin{itemize}
+  \item \texttt{-b} 表示起始消息大小；
+  \item \texttt{-e} 表示结束消息大小；
+  \item \texttt{-f} 表示每轮消息大小的增长倍数；
+  \item \texttt{-g} 表示每个进程使用的 GPU 数量。
+\end{itemize}
+
+多节点测试时，通常会结合 MPI 或其他 launcher：
+
+\begin{lstlisting}[language=bash,caption={多节点 NCCL all-reduce 测试的概念示例},label={lst:nccl-tests-multinode}]
+mpirun -np 16 -H node0:8,node1:8 \
+  -x NCCL_DEBUG=INFO \
+  -x NCCL_SOCKET_IFNAME=eth0 \
+  ./build/all_reduce_perf -b 8M -e 4G -f 2 -g 1
+\end{lstlisting}
+
+单机 NVLink/NVSwitch 诊断时，应优先测试节点内 2 GPU、4 GPU、8 GPU 的 all-reduce、all-gather、reduce-scatter。若测试结果明显低于同类机器预期，则说明问题可能在硬件拓扑、驱动、NCCL、容器权限或系统配置，而不一定是训练框架问题。
+
+\subsection{Bus Bandwidth 与 Algorithm Bandwidth}
+\label{subsec:busbw-algbw}
+
+NCCL tests 输出中经常包含 \texttt{algbw} 和 \texttt{busbw}。很多初学者会困惑：为什么同一个通信操作有两个带宽？
+
+可以粗略理解为：
+
+\begin{itemize}
+  \item \textbf{Algorithm bandwidth}：从算法输入输出角度看到的有效数据处理速度。
+  \item \textbf{Bus bandwidth}：根据 collective 类型和通信模式折算出的底层链路带宽利用估计。
+\end{itemize}
+
+不同 collective 的数据移动量与用户 tensor size 不完全相同。例如 ring all-reduce 中，每个 rank 并不是简单发送一次完整 tensor，而是分块、多步传输、归约、再分发。NCCL tests 用 bus bandwidth 帮助用户更接近地理解底层互联是否被充分利用。
+
+对工程诊断来说，重点不是纠结某一个数字，而是比较：
+
+\begin{itemize}
+  \item 同一台机器上不同 GPU 数量的扩展曲线是否合理；
+  \item 不同消息大小下，带宽是否能在大消息时趋于稳定；
+  \item 单机结果是否明显优于跨节点结果；
+  \item NVLink/NVSwitch 节点是否明显优于普通 PCIe 节点；
+  \item 同类节点之间是否存在异常离群值。
+\end{itemize}
+
+如果 8 GPU all-reduce 的带宽远低于预期，可以进一步尝试：
+
+\begin{lstlisting}[language=bash,caption={打开 NCCL 调试日志和拓扑信息},label={lst:nccl-debug-topo}]
+export NCCL_DEBUG=INFO
+export NCCL_DEBUG_SUBSYS=INIT,GRAPH,TOPO,COLL
+./build/all_reduce_perf -b 8M -e 4G -f 2 -g 8
+\end{lstlisting}
+
+NCCL 日志中通常会显示拓扑识别、通信 channel、算法选择、网络接口选择等信息。虽然日志较长，但对排查拓扑误识别、P2P 不可用、NIC 选择错误非常有帮助。
+
+\subsection{常见拓扑误配置}
+\label{subsec:common-topology-misconfig}
+
+多 GPU 通信问题经常来自配置，而不是硬件本身。下面列出一些常见问题。
+
+\subsubsection{问题一：容器看不到完整拓扑}
+
+在容器环境中，如果 GPU device、驱动库、\texttt{/sys} 拓扑信息或相关权限没有正确挂载，NCCL 可能无法正确识别 GPU 拓扑。表现为：
+
+\begin{itemize}
+  \item NCCL 日志中拓扑信息异常；
+  \item GPU P2P 不可用；
+  \item 同一节点内通信性能远低于裸机；
+  \item \texttt{nvidia-smi topo -m} 在容器内外输出不同。
+\end{itemize}
+
+排查时应比较宿主机与容器内的 \texttt{nvidia-smi topo -m}、NCCL tests 和驱动库版本。
+
+\subsubsection{问题二：Rank Mapping 不符合拓扑}
+
+框架可能默认按 GPU index 分配 rank，但 GPU index 不一定与拓扑最优顺序一致。比如 GPU0--GPU3 是一个高速域，GPU4--GPU7 是另一个高速域，如果 TP group 被交错放置为 \{0,4,1,5\}，通信会跨越慢路径。解决方法包括：
+
+\begin{itemize}
+  \item 显式设置 \texttt{CUDA\_VISIBLE\_DEVICES} 的顺序；
+  \item 在 launcher 中控制 local rank 到 GPU 的映射；
+  \item 使用框架提供的 topology-aware rank mapping；
+  \item 根据 \texttt{nvidia-smi topo -m} 和 NCCL tests 验证 group 划分。
+\end{itemize}
+
+\subsubsection{问题三：GPU 与 NIC 亲和性错误}
+
+多节点训练中，GPU-to-NIC 的路径非常重要。如果某个 rank 使用的 GPU 离实际通信 NIC 很远，跨节点通信可能绕过不理想的 PCIe 或 NUMA 路径。表现为：
+
+\begin{itemize}
+  \item 单机 NCCL tests 正常，多机性能很差；
+  \item 某些 rank 带宽明显低；
+  \item NCCL 日志显示选择了非预期网卡；
+  \item 跨 socket 流量异常。
+\end{itemize}
+
+常用排查方向包括检查 \texttt{nvidia-smi topo -m} 中 GPU 与 NIC 的关系，设置 \texttt{NCCL\_IB\_HCA}、\texttt{NCCL\_SOCKET\_IFNAME} 等环境变量，并结合下一章的 RDMA / RoCE 网络诊断方法。
+
+\subsubsection{问题四：PCIe ACS 或 IOMMU 影响 P2P}
+
+某些服务器 BIOS 或系统配置可能启用 PCIe ACS、IOMMU 等功能，影响 P2P 或 GPUDirect 路径。具体行为与平台有关，不能一概而论。表现可能包括 P2P bandwidth 异常、GPU Direct RDMA 不可用、NCCL fallback 到较慢路径等。排查时应参考硬件厂商、驱动和 NCCL 文档，并与平台团队确认 BIOS 设置。
+
+\subsubsection{问题五：错误理解 GPU 利用率}
+
+通信瓶颈下，\texttt{nvidia-smi} 看到的 GPU utilization 可能不高，但这并不意味着 GPU “没有任务”。它可能在等待通信、等待同步、等待 CPU launch，或者 NCCL kernel 本身没有表现为高 SM utilization。此时应结合 Nsight Systems timeline 判断 GPU 是否处于通信等待，而不是只看单一利用率数字。
+
+\section{从通信视角重新理解并行策略}
+\label{sec:parallelism-from-communication}
+
+在前面的章节中，我们已经学习过 DP、TP、PP、ZeRO 和 3D 并行。本节从 NVLink/NVSwitch 的角度重新审视它们。
+
+\subsection{为什么 TP 更偏好节点内高速互联}
+\label{subsec:tp-prefers-intranode}
+
+TP 的通信特点是高频、细粒度、层内发生。以一个 decoder-only Transformer 为例，每一层 attention 和 FFN 内部都可能有 TP collective。假设模型有 80 层，那么一次 forward 可能触发大量跨 GPU 通信。训练还要加上 backward 中的通信。
+
+这意味着 TP group 跨越慢链路会非常昂贵。即使单次 all-reduce 数据量不算极大，层数乘以 micro-batch 数后，总通信开销也会变成 step time 的重要组成部分。因此：
+
+\begin{itemize}
+  \item 单机 8 GPU NVSwitch 节点上，TP size = 8 常常是自然选择；
+  \item 普通 PCIe 节点上，TP size 可能需要更谨慎；
+  \item 跨节点 TP 只有在节点间网络足够强且框架高度优化时才值得考虑；
+  \item 对推理服务，TP 跨节点通常会显著增加 TPOT，应尽量避免。
+\end{itemize}
+
+\subsection{为什么 DP 可以更自然地跨节点}
+\label{subsec:dp-cross-node}
+
+DP 的通信主要发生在 backward 梯度同步阶段。虽然梯度同步数据量很大，但它不像 TP 那样每层 forward 都要通信。通过 bucket、overlap、reduce-scatter 等技术，DP 通信可以与 backward 计算重叠。因此，DP 更适合作为跨节点扩展的维度。
+
+当然，这不意味着 DP 通信不重要。在千卡训练中，跨节点 all-reduce 仍可能成为主要瓶颈。只是从拓扑映射角度看，通常会优先把 TP 放在节点内 NVLink/NVSwitch 域，把 DP 扩展到节点间 RDMA 网络。
+
+\subsection{为什么 MoE 对 all-to-all 拓扑敏感}
+\label{subsec:moe-alltoall-topology}
+
+MoE 模型中的 expert parallel 会产生 token dispatch 和 combine。每个 rank 上的 token 根据 router 结果被发送到不同 expert 所在 rank，这通常对应 all-to-all 或类似通信模式。All-to-all 比 all-reduce 更依赖均匀拓扑，因为每个 rank 都可能与多个其他 rank 交换不同大小的数据。
+
+在 NVSwitch 节点内，all-to-all 的路径相对均匀；跨节点时，all-to-all 会给网络造成复杂的 east-west traffic。MoE 训练和推理中的很多系统优化，例如 expert placement、capacity factor、token dropping、grouped GEMM、hierarchical all-to-all，本质上都是为了同时处理计算不均衡和通信不均衡。
+
+\subsection{推理系统中的 NVLink / NVSwitch}
+\label{subsec:nvlink-serving}
+
+推理系统使用 NVLink/NVSwitch 的方式与训练不同。训练更关注 step time 和 scaling efficiency，推理更关注 TTFT、TPOT、吞吐、SLA 和成本。
+
+在 tensor parallel 推理中，每层都可能发生 collective，因此节点内高速互联直接影响 TPOT。尤其是 decode 阶段，每生成一个 token 都要跨过所有层。如果每层 collective 都增加一点延迟，最终会累积成用户可感知的响应变慢。
+
+NVLink/NVSwitch 对推理的典型价值包括：
+
+\begin{itemize}
+  \item 支持更大模型在单节点内 TP 部署；
+  \item 降低层内 collective 延迟，改善 TPOT；
+  \item 支持多 GPU 共享模型 shard，提高单实例吞吐；
+  \item 在多实例部署中减少跨 GPU 数据移动成本；
+  \item 对 prefill/decode 分离架构提供更灵活的节点内数据路径。
+\end{itemize}
+
+但是推理也会遇到新问题。比如同一节点上部署多个模型实例时，它们可能共享 NVLink/NVSwitch fabric 和 HBM 带宽。即使每个实例单独测试都正常，混部后也可能出现干扰。因此，AI serving 调度器不能只看 GPU 显存剩余量，还要关注通信和带宽压力。
+
+\section{实践：单机多卡通信排查流程}
+\label{sec:single-node-comm-debug-workflow}
+
+本节给出一个面向工程实践的排查流程。假设你发现一个 8 GPU 训练作业在某台机器上速度异常，比同型号机器慢很多，或者 8 卡扩展效率明显低于预期。
+
+\subsection{第一步：确认硬件与驱动可见性}
+\label{subsec:debug-step-hardware}
+
+首先确认 GPU 是否全部正常可见：
+
+\begin{lstlisting}[language=bash,caption={确认 GPU 可见性},label={lst:debug-gpu-visible}]
+nvidia-smi
+nvidia-smi -L
+\end{lstlisting}
+
+检查内容包括：
+
+\begin{itemize}
+  \item GPU 数量是否正确；
+  \item 是否有 GPU 处于异常状态；
+  \item ECC、温度、功耗、时钟是否异常；
+  \item 是否有其他进程占用 GPU；
+  \item MIG 是否被启用并改变了资源形态。
+\end{itemize}
+
+如果 GPU 基本状态异常，先不要分析 NCCL 或框架配置。
+
+\subsection{第二步：查看拓扑}
+\label{subsec:debug-step-topology}
+
+运行：
+
+\begin{lstlisting}[language=bash,caption={查看拓扑},label={lst:debug-topology}]
+nvidia-smi topo -m
+\end{lstlisting}
+
+保存输出，并重点观察：
+
+\begin{itemize}
+  \item GPU 之间是否存在 NVLink / NVSwitch 路径；
+  \item 是否有某些 GPU pair 显示为明显更差的路径；
+  \item GPU 与 NIC 的亲和性；
+  \item CPU affinity 与 NUMA affinity；
+  \item 容器内外输出是否一致。
+\end{itemize}
+
+\subsection{第三步：运行 P2P 测试}
+\label{subsec:debug-step-p2p}
+
+如果环境中有 CUDA samples，可以运行 P2P 带宽延迟测试：
+
+\begin{lstlisting}[language=bash,caption={运行 P2P bandwidth/latency 测试},label={lst:debug-p2p}]
+./p2pBandwidthLatencyTest
+\end{lstlisting}
+
+观察 GPU pair 之间带宽是否符合拓扑预期。若某些应走 NVLink 的 pair 表现很差，可能是 P2P 未启用、拓扑不可见、驱动或系统配置问题。
+
+\subsection{第四步：运行 NCCL 单机测试}
+\label{subsec:debug-step-nccl-single}
+
+运行 all-reduce、all-gather、reduce-scatter 测试：
+
+\begin{lstlisting}[language=bash,caption={单机 NCCL collective 测试},label={lst:debug-nccl-single}]
+export NCCL_DEBUG=INFO
+./build/all_reduce_perf -b 8M -e 4G -f 2 -g 8
+./build/all_gather_perf -b 8M -e 4G -f 2 -g 8
+./build/reduce_scatter_perf -b 8M -e 4G -f 2 -g 8
+\end{lstlisting}
+
+如果这些基础测试异常，则说明问题在框架之下。此时应先修复 NCCL / 拓扑 / 系统问题，而不是调模型代码。
+
+\subsection{第五步：检查 NCCL 日志}
+\label{subsec:debug-step-nccl-log}
+
+打开更详细的 NCCL 日志：
+
+\begin{lstlisting}[language=bash,caption={NCCL 拓扑调试日志},label={lst:debug-nccl-log}]
+export NCCL_DEBUG=INFO
+export NCCL_DEBUG_SUBSYS=INIT,GRAPH,TOPO,COLL
+export NCCL_TOPO_DUMP_FILE=/tmp/nccl_topo.xml
+\end{lstlisting}
+
+关注 NCCL 是否识别到预期的 NVLink/NVSwitch 路径，是否启用了 P2P，是否选择了合理的 channel 和算法。对于多节点，还要关注 NIC 选择和 IB/RoCE 路径。
+
+\subsection{第六步：对照训练框架配置}
+\label{subsec:debug-step-framework}
+
+基础通信正常后，再检查训练框架：
+
+\begin{itemize}
+  \item TP size、PP size、DP size 是否符合拓扑；
+  \item \texttt{CUDA\_VISIBLE\_DEVICES} 顺序是否合理；
+  \item local rank 到 GPU 的映射是否正确；
+  \item DDP bucket、ZeRO stage、overlap 设置是否合理；
+  \item micro batch size 是否过小导致计算无法覆盖通信；
+  \item 是否有意外 CPU/GPU 同步或数据拷贝。
+\end{itemize}
+
+最后用 Nsight Systems 观察真实训练 step 的 timeline，确认通信是否与计算重叠、是否存在 GPU 空洞、是否有 NCCL kernel 占据关键路径。
+
+\section{设计原则与经验法则}
+\label{sec:nvlink-design-principles}
+
+本节总结若干实践原则。
+
+\subsection{原则一：通信密集 group 优先放在高速域内}
+\label{subsec:principle-fast-domain}
+
+TP、EP、推理 TP 这类高频通信 group 应优先放在 NVLink/NVSwitch 域内。DP 可以更自然地跨节点扩展，PP 则要关注相邻 stage 的路径。
+
+\subsection{原则二：不要只看 GPU 数量，要看拓扑}
+\label{subsec:principle-not-just-gpu-count}
+
+两台机器都可能有 8 张 GPU，但如果一台是 NVSwitch all-to-all，另一台是普通 PCIe 拓扑，它们对 TP 和 MoE 的支持能力完全不同。调度系统在分配作业时，应把 GPU 拓扑作为资源属性，而不是只记录 GPU count。
+
+\subsection{原则三：先测 NCCL，再测框架}
+\label{subsec:principle-test-nccl-first}
+
+当训练扩展性异常时，先用 NCCL tests 验证基础通信，再分析框架。否则很容易在模型代码中浪费时间。基础通信不正常时，框架层调参通常无法根治问题。
+
+\subsection{原则四：通信和计算要一起看}
+\label{subsec:principle-comm-compute}
+
+高带宽互联不是为了让通信无限快，而是为了让通信更容易被计算覆盖。优化目标不是单独最大化 NCCL 带宽，而是最小化端到端 step time 或 TPOT。因此要结合 profiler 看通信是否在关键路径上。
+
+\subsection{原则五：推理调度也要拓扑感知}
+\label{subsec:principle-serving-topology}
+
+推理系统常常只按显存和 GPU 数量部署实例，但多卡推理实例对 NVLink/NVSwitch 依赖很强。TP 推理实例应尽量独占或稳定绑定高速互联 group，避免与其他通信密集 workload 混部。
+
+\section{本章小结}
+\label{sec:nvlink-nvswitch-summary}
+
+本章讨论了单机多卡通信中的核心硬件路径：PCIe、GPU Direct P2P、NVLink 与 NVSwitch。
+
+\begin{itemize}
+  \item PCIe 是通用 I/O 总线，生态成熟，但对频繁 GPU-to-GPU 通信来说，带宽、延迟和拓扑均匀性都可能成为瓶颈。
+  \item GPU Direct P2P 允许 GPU 之间直接访问 peer memory，避免不必要的 host staging，是高效 GPU-to-GPU 通信的基础能力。
+  \item NVLink 提供面向 GPU-to-GPU 的高速点对点互联，显著改善节点内通信能力，尤其适合 tensor parallel、pipeline stage 传输和多卡推理。
+  \item NVSwitch 把 NVLink 从点对点连接扩展为更均匀的 GPU fabric，使多 GPU 节点更接近 all-to-all 高带宽互联。
+  \item NCCL 会根据拓扑选择 collective 算法和通信路径。相同的 \texttt{all\_reduce}，在 PCIe、NVLink、NVSwitch 和跨节点 RDMA 上性能可能完全不同。
+  \item \texttt{nvidia-smi topo -m}、P2P bandwidth test、NCCL tests、NCCL debug log 和 Nsight Systems 是诊断单机多卡通信问题的核心工具。
+  \item 并行策略必须拓扑感知：TP 和 EP 优先放在节点内高速互联域，DP 更适合跨节点扩展，PP 要关注相邻 stage 的通信路径。
+\end{itemize}
+
+至此，我们已经理解了一台机器内部多张 GPU 如何通过高速互联形成 scale-up 计算域。下一章将继续向外扩展：当训练和推理跨越多台服务器时，GPU 之间的数据必须经过 NIC、交换机和数据中心网络。为了让跨节点通信不吞噬 GPU 利用率，我们需要理解 RDMA、RoCE、InfiniBand、GPUDirect RDMA、PFC、ECN 以及 AI 集群网络拓扑。这将进入第 19 章：RDMA / RoCE 网络基础。

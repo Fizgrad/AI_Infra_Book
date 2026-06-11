@@ -1,0 +1,1139 @@
+\chapter{数据并行 DP / DDP}
+\label{chap:data-parallelism}
+
+\section{为什么需要分布式训练}
+\label{sec:why-distributed-training}
+
+前两篇我们已经从数学、CUDA、深度学习原理、Transformer 架构和现代 Decoder-only LLM 结构出发，建立了大模型的基本计算图。现在开始进入第三篇：\textbf{分布式训练架构}。
+
+单卡训练适合理解算法，但无法支撑现代大模型的训练规模。原因并不只是“模型太大”，而是模型参数、优化器状态、激活、训练数据、训练时长和容错要求共同超过了单机单卡的能力边界。一个 AI Infrastructure 工程师必须能回答：
+
+\begin{itemize}
+\item 模型参数能否放进单卡显存？
+\item batch size 能否满足训练稳定性？
+\item 单卡训练需要多长时间？
+\item 多卡训练时梯度如何同步？
+\item 通信量如何估算？
+\item 什么时候数据并行足够，什么时候必须引入张量并行或流水线并行？
+\item 为什么 DDP 的性能可能被 bucket、通信重叠、拓扑和小参数层影响？
+\end{itemize}
+
+本章聚焦最基础也最常用的并行方式：\textbf{数据并行}。数据并行的思想非常直观：每张 GPU 保存一份完整模型副本，不同 GPU 处理不同 mini-batch 分片，然后在 backward 后同步梯度，使所有副本保持一致。
+
+\subsection{模型规模、数据规模与训练时间}
+\label{subsec:model-data-training-time}
+
+训练一个模型的总计算量大致与参数量和训练 token 数成正比。对于 dense Transformer，自回归预训练 FLOPs 可粗略估算为：
+[
+C \approx 6ND,
+]
+其中 $N$ 是模型参数量，$D$ 是训练 token 数。这个估算忽略了具体架构、激活重计算、通信、kernel 效率和实现细节，但足以说明规模问题。
+
+设训练任务总计算量为 $C$，单张 GPU 的有效算力为 $F_{\mathrm{eff}}$，单卡训练时间近似为：
+[
+T_1 \approx \frac{C}{F_{\mathrm{eff}}}.
+]
+如果使用 $P$ 张 GPU，并且扩展效率为 $\eta(P)$，则训练时间近似为：
+[
+T_P \approx \frac{C}{P\eta(P)F_{\mathrm{eff}}}.
+]
+
+这里的 $\eta(P)$ 非常重要。理想线性扩展时：
+[
+\eta(P)=1.
+]
+但真实训练中，通信、同步、数据加载、straggler、checkpoint 和调度开销都会降低效率：
+[
+0<\eta(P)<1.
+]
+
+因此，分布式训练的目标不是简单地“把 GPU 数量堆上去”，而是在给定硬件、网络和模型结构下，让每张 GPU 尽可能多地做有效计算，尽可能少地等待通信和同步。
+
+\subsection{单卡瓶颈}
+\label{subsec:single-gpu-bottlenecks}
+
+单卡训练常见瓶颈包括四类。
+
+第一类是 \textbf{显存瓶颈}。训练显存大致包括：
+
+\begin{itemize}
+\item 参数；
+\item 梯度；
+\item 优化器状态；
+\item 前向激活；
+\item 临时 buffer；
+\item CUDA runtime、allocator 和通信 workspace。
+\end{itemize}
+
+对于 AdamW，如果参数使用 BF16，梯度使用 BF16，同时保留 FP32 master weight、FP32 一阶矩和 FP32 二阶矩，参数相关训练状态粗略为：
+[
+M_{\mathrm{param\ states}}\approx 16N\ \mathrm{bytes}.
+]
+一个 $7$B 参数模型，仅这些状态就约为：
+[
+16\times 7\times 10^9\ \mathrm{bytes}
+\approx 112\ \mathrm{GB}.
+]
+这已经超过许多单卡显存，更不用说激活和临时 buffer。
+
+第二类是 \textbf{吞吐瓶颈}。即使模型能勉强放下，单卡训练可能需要过长时间。大模型预训练通常需要消耗数万亿 token，单卡训练时间不可接受。
+
+第三类是 \textbf{batch size 瓶颈}。训练稳定性往往需要足够大的 global batch size。若单卡 micro-batch 太小，训练噪声、归一化统计、梯度累积和吞吐都会受到影响。
+
+第四类是 \textbf{可靠性瓶颈}。训练时间越长，硬件故障、驱动问题、节点重启、网络抖动和存储错误的概率越高。分布式训练系统不仅要快，还要能保存 checkpoint、恢复作业，并在故障后保持一致性。
+
+\subsection{并行训练的基本分类}
+\label{subsec:parallel-training-taxonomy}
+
+大模型训练中的并行策略可以粗略分为三类：
+
+\begin{itemize}
+\item \textbf{数据并行 Data Parallelism, DP}：每张 GPU 保存完整模型副本，不同 GPU 处理不同数据分片，同步梯度。
+\item \textbf{张量并行 Tensor Parallelism, TP}：把一个算子的张量维度切到多张 GPU 上，例如把 Linear 层的权重按列或按行切分。
+\item \textbf{流水线并行 Pipeline Parallelism, PP}：把模型不同层切到不同 GPU 或节点上，使用 micro-batch 流水线执行。
+\end{itemize}
+
+数据并行最容易理解，也最通用。只要单张 GPU 能放下完整模型及训练状态，通常可以优先使用 DDP 或 FSDP/ZeRO 的数据并行变体。张量并行和流水线并行则用于模型太大、单卡放不下，或者需要更大规模扩展的场景。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+gpu/.style={draw, rounded corners=3pt, minimum width=1.35cm, minimum height=0.75cm, align=center, fill=blue!6},
+data/.style={draw, rounded corners=2pt, minimum width=1.15cm, minimum height=0.45cm, align=center, fill=orange!14},
+layer/.style={draw, rounded corners=2pt, minimum width=0.95cm, minimum height=0.48cm, align=center, fill=green!10},
+arrow/.style={-{Latex[length=2.2mm]}, thick}
+]
+
+```
+\node[font=\bfseries] at (0,3.4) {三类基础并行策略：DP、TP、PP};
+
+% DP
+\node[font=\bfseries] at (-4.7,2.65) {Data Parallel};
+\foreach \i/\y in {0/1.75,1/0.85,2/-0.05} {
+  \node[data] (d\i) at (-6.0,\y) {batch};
+  \node[gpu] (dp\i) at (-4.35,\y) {Full\\Model};
+  \draw[arrow] (d\i) -- (dp\i);
+}
+\draw[<->, thick, red!70] (-4.35,0.35) -- (-4.35,0.45);
+\node[align=center, text width=3.2cm] at (-4.8,-1.05) {模型复制\\数据切分\\梯度同步};
+
+% TP
+\node[font=\bfseries] at (0,2.65) {Tensor Parallel};
+\node[data] (td) at (-1.2,1.3) {batch};
+\node[gpu] (tp0) at (0.1,1.75) {$W_0$\\shard};
+\node[gpu] (tp1) at (0.1,0.85) {$W_1$\\shard};
+\node[gpu] (tp2) at (0.1,-0.05) {$W_2$\\shard};
+\draw[arrow] (td) -- (tp0);
+\draw[arrow] (td) -- (tp1);
+\draw[arrow] (td) -- (tp2);
+\node[align=center, text width=3.4cm] at (0,-1.05) {单层权重切分\\算子内部通信};
+
+% PP
+\node[font=\bfseries] at (4.7,2.65) {Pipeline Parallel};
+\foreach \i/\x in {1/3.1,2/4.25,3/5.4,4/6.55} {
+  \node[layer] (l\i) at (\x,1.3) {L\i};
+}
+\node[gpu] (pp0) at (3.65,0.2) {GPU0};
+\node[gpu] (pp1) at (5.95,0.2) {GPU1};
+\draw[arrow] (l1) -- (l2);
+\draw[arrow] (l2) -- (l3);
+\draw[arrow] (l3) -- (l4);
+\draw[dashed] (3.0,0.75) rectangle (4.65,1.85);
+\draw[dashed] (5.0,0.75) rectangle (6.95,1.85);
+\draw[arrow] (pp0) -- (pp1);
+\node[align=center, text width=3.5cm] at (4.9,-1.05) {按层切分\\micro-batch 流水线};
+
+\node[align=left, text width=10.6cm] at (0,-2.4) {
+  数据并行是最基础的扩展方式；张量并行解决单层算子过大问题；流水线并行解决模型层数太多、整体放不下的问题。
+  现代大模型训练常组合三者形成 3D 并行。
+};
+```
+
+\end{tikzpicture}
+\caption{数据并行、张量并行与流水线并行的基本区别}
+\label{fig:parallelism-overview-dp-tp-pp}
+\end{figure}
+
+本章只深入数据并行。后续章节会分别讨论张量并行、流水线并行和 3D 并行。
+
+\section{Data Parallel 基本原理}
+\label{sec:data-parallel-basics}
+
+\subsection{replica}
+\label{subsec:data-parallel-replica}
+
+数据并行中，每张 GPU 上都有一份完整模型副本，称为 replica。假设有 $P$ 张 GPU，每张 GPU 的模型参数初始相同：
+[
+\theta^{(0)}_0=\theta^{(0)}*1=\cdots=\theta^{(0)}*{P-1}.
+]
+第 $p$ 张 GPU 处理自己的数据分片 $\mathcal{B}_p$，计算本地 loss：
+[
+\mathcal{L}_p(\theta)
+=====================
+
+\frac{1}{|\mathcal{B}*p|}
+\sum*{x\in\mathcal{B}_p}
+\ell(x;\theta).
+]
+本地 backward 得到本地梯度：
+[
+\vect{g}_p
+==========
+
+\nabla_{\theta}\mathcal{L}_p(\theta).
+]
+
+为了让所有 replica 保持一致，需要对梯度做平均：
+[
+\bar{\vect{g}}
+==============
+
+\frac{1}{P}
+\sum_{p=0}^{P-1}
+\vect{g}_p.
+]
+然后每张 GPU 使用相同的平均梯度更新参数：
+[
+\theta^{(t+1)}_p
+================
+
+## \theta^{(t)}_p
+
+\eta \bar{\vect{g}},
+\quad
+p=0,\ldots,P-1.
+]
+只要初始参数相同、梯度同步一致、优化器状态更新一致，各 replica 就会保持相同参数。
+
+这也是数据并行的核心不变量：
+
+[
+\boxed{
+\theta_0^{(t)}=\theta_1^{(t)}=\cdots=\theta_{P-1}^{(t)}
+}
+]
+
+\subsection{mini-batch 切分}
+\label{subsec:minibatch-sharding}
+
+设 global batch size 为 $B_{\mathrm{global}}$，GPU 数量为 $P$，每张 GPU 的 local batch size 为 $B_{\mathrm{local}}$。若不使用梯度累积，则：
+[
+B_{\mathrm{global}}
+===================
+
+P\cdot B_{\mathrm{local}}.
+]
+
+如果使用 gradient accumulation，设累积步数为 $A$，则：
+[
+B_{\mathrm{global}}
+===================
+
+P\cdot B_{\mathrm{local}}\cdot A.
+]
+
+这个公式非常重要。很多训练配置表面上写的是 micro-batch size，但真正影响优化器更新的是 global batch size。学习率 schedule、warmup、梯度噪声、loss 曲线和收敛稳定性都与 global batch size 相关。
+
+在 PyTorch DDP 中，每个进程通常绑定一张 GPU。使用 \texttt{DistributedSampler} 时，数据集会按 rank 切分，每个 rank 读取不同样本。一个常见错误是忘记设置 sampler 的 epoch，导致不同 epoch 中 shuffle 不正确：
+
+\begin{lstlisting}[language=Python,caption={DistributedSampler 中设置 epoch 的重要性},label={lst:distributed-sampler-set-epoch}]
+from torch.utils.data.distributed import DistributedSampler
+
+sampler = DistributedSampler(dataset, shuffle=True)
+loader = DataLoader(dataset, sampler=sampler, batch_size=local_batch_size)
+
+for epoch in range(num_epochs):
+# Important: ensure each epoch uses a different shuffle order
+# while keeping all ranks aligned.
+sampler.set_epoch(epoch)
+
+```
+for batch in loader:
+    train_step(batch)
+```
+
+\end{lstlisting}
+
+如果多个 rank 读到相同样本，表面上训练仍然能跑，但有效数据吞吐会下降；如果不同 rank 的 step 数不一致，可能导致 collective communication hang，因为有些 rank 进入 all-reduce，而另一些 rank 已经退出。
+
+\subsection{梯度同步}
+\label{subsec:gradient-synchronization}
+
+数据并行的关键通信操作是梯度同步。假设模型有参数：
+[
+\theta={\theta_1,\theta_2,\ldots,\theta_K}.
+]
+每个 rank backward 后得到本地梯度：
+[
+\nabla\theta_k^{(p)}.
+]
+同步后希望每个 rank 都得到：
+[
+\nabla\theta_k
+==============
+
+\frac{1}{P}
+\sum_{p=0}^{P-1}
+\nabla\theta_k^{(p)}.
+]
+
+这通常通过 all-reduce 完成。All-reduce 的语义是：所有 rank 输入一个 tensor，执行规约操作，例如 sum，然后把规约结果返回给所有 rank。若先做 sum，再除以 world size，就得到平均梯度。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+gpu/.style={draw, rounded corners=3pt, minimum width=1.65cm, minimum height=0.78cm, align=center, fill=blue!6},
+grad/.style={draw, rounded corners=2pt, minimum width=1.35cm, minimum height=0.52cm, align=center, fill=orange!14},
+arrow/.style={-{Latex[length=2.2mm]}, thick}
+]
+
+```
+\node[font=\bfseries] at (0,3.2) {数据并行中的本地梯度与 AllReduce 同步};
+
+\foreach \i/\x in {0/-5.1,1/-2.2,2/0.7,3/3.6} {
+  \node[gpu] (gpu\i) at (\x,1.6) {GPU \i\\Model};
+  \node[grad] (grad\i) at (\x,0.65) {$g_\i$};
+  \draw[arrow] (gpu\i) -- node[right,font=\scriptsize] {backward} (grad\i);
+}
+
+\node[draw, rounded corners=4pt, fill=green!10, minimum width=3.1cm, minimum height=0.85cm, align=center] (ar) at (-0.75,-0.45)
+  {AllReduce\\$\bar{g}=\frac{1}{P}\sum_p g_p$};
+
+\foreach \i in {0,1,2,3} {
+  \draw[arrow] (grad\i) -- (ar);
+}
+
+\foreach \i/\x in {0/-5.1,1/-2.2,2/0.7,3/3.6} {
+  \node[grad, fill=purple!10] (avg\i) at (\x,-1.65) {$\bar{g}$};
+  \draw[arrow] (ar) -- (avg\i);
+  \draw[arrow] (avg\i) -- node[right,font=\scriptsize] {optimizer step} (\x,-2.45);
+}
+
+\node[align=left, text width=10.4cm] at (-0.75,-3.05) {
+  每张 GPU 先独立计算本地梯度，再通过 all-reduce 得到平均梯度。
+  之后所有 replica 使用相同梯度更新，因此参数继续保持一致。
+};
+```
+
+\end{tikzpicture}
+\caption{数据并行中的梯度同步}
+\label{fig:data-parallel-gradient-sync}
+\end{figure}
+
+需要注意，实际实现中不一定等所有参数 backward 完成后才一次性同步所有梯度。PyTorch DDP 会把参数梯度组织成 bucket，当某个 bucket 中的梯度都 ready 后，就可以立即发起 all-reduce，从而与后续 backward 计算重叠。
+
+\subsection{all-reduce}
+\label{subsec:all-reduce}
+
+All-reduce 可以理解为两个逻辑阶段：
+
+\begin{enumerate}
+\item \textbf{Reduce}：把所有 rank 的 tensor 做求和；
+\item \textbf{Broadcast}：把求和结果发回所有 rank。
+\end{enumerate}
+
+但高性能实现通常不会真的先集中到一个 rank 再广播，因为这会产生中心瓶颈。Ring AllReduce、Tree AllReduce、CollNet、NVLink/NVSwitch 拓扑感知算法等都用于提高通信效率。
+
+All-reduce 的时间常用带宽-延迟模型估算：
+[
+T_{\mathrm{comm}}
+\approx
+\alpha\cdot n_{\mathrm{steps}}
++
+\frac{\mathrm{bytes}}{\beta_{\mathrm{eff}}},
+]
+其中：
+
+\begin{itemize}
+\item $\alpha$ 是每轮通信的延迟成本；
+\item $n_{\mathrm{steps}}$ 是通信步数；
+\item $\beta_{\mathrm{eff}}$ 是有效带宽；
+\item $\mathrm{bytes}$ 是每个 rank 需要发送或接收的数据量。
+\end{itemize}
+
+对于大梯度 tensor，带宽项占主导；对于很多小 tensor，延迟项和 kernel launch/API 开销更明显。因此 DDP 使用 bucket 把多个小梯度合并为较大通信单元，减少小消息开销。
+
+\section{PyTorch DDP}
+\label{sec:pytorch-ddp}
+
+PyTorch DistributedDataParallel，简称 DDP，是最常用的数据并行实现之一。DDP 的基本模式是：每个进程绑定一张 GPU，加载同样的模型，处理不同数据分片，并在 backward 时自动同步梯度。
+
+\subsection{process group}
+\label{subsec:process-group}
+
+Process group 是分布式通信的基本上下文。它定义哪些进程参与 collective communication。例如，一个 8 卡单机训练中，通常有 8 个进程组成一个默认 process group。
+
+初始化 process group 的典型代码如下：
+
+\begin{lstlisting}[language=Python,caption={初始化 PyTorch Process Group},label={lst:init-process-group}]
+import os
+import torch
+import torch.distributed as dist
+
+def init_distributed():
+# Environment variables are usually set by torchrun.
+rank = int(os.environ["RANK"])
+world_size = int(os.environ["WORLD_SIZE"])
+local_rank = int(os.environ["LOCAL_RANK"])
+
+```
+torch.cuda.set_device(local_rank)
+
+dist.init_process_group(
+    backend="nccl",
+    init_method="env://",
+    rank=rank,
+    world_size=world_size,
+)
+
+return rank, world_size, local_rank
+```
+
+\end{lstlisting}
+
+在 GPU 训练中，backend 通常使用 NCCL。CPU 通信或调试场景可使用其他 backend，但大模型训练基本依赖 NCCL 进行高性能 GPU collective。
+
+Process group 不一定只有一个。后续张量并行、流水线并行和 3D 并行中，会创建多个不同 group：
+
+\begin{itemize}
+\item data parallel group；
+\item tensor parallel group；
+\item pipeline parallel group；
+\item expert parallel group；
+\item sequence parallel group。
+\end{itemize}
+
+每个 group 代表一组 rank 的通信边界。理解 group 是理解分布式训练框架的基础。
+
+\subsection{rank、world size、local rank}
+\label{subsec:rank-world-size-local-rank}
+
+分布式训练中有三个常见概念：
+
+\begin{itemize}
+\item \textbf{rank}：全局进程编号，范围为 $0,\ldots,P-1$；
+\item \textbf{world size}：全局进程总数 $P$；
+\item \textbf{local rank}：当前节点内的进程编号，通常用于选择本地 GPU。
+\end{itemize}
+
+例如有 2 台机器，每台 8 张 GPU，共 16 个进程。则：
+
+[
+\mathrm{world\ size}=16.
+]
+第一台机器上的 local rank 为 $0,\ldots,7$，第二台机器上的 local rank 也为 $0,\ldots,7$，但全局 rank 可能为 $8,\ldots,15$。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+nodebox/.style={draw, rounded corners=4pt, minimum width=4.3cm, minimum height=2.1cm, fill=blue!3},
+gpu/.style={draw, rounded corners=2pt, minimum width=0.72cm, minimum height=0.48cm, align=center, fill=orange!12}
+]
+
+```
+\node[font=\bfseries] at (0,3.0) {rank、world size 与 local rank};
+
+\node[nodebox, label={[font=\bfseries]above:Node 0}] (n0) at (-3.0,1.0) {};
+\node[nodebox, label={[font=\bfseries]above:Node 1}] (n1) at (3.0,1.0) {};
+
+\foreach \i/\x in {0/-4.2,1/-3.4,2/-2.6,3/-1.8} {
+  \node[gpu] at (\x,1.35) {G\i};
+  \node[font=\scriptsize] at (\x,0.75) {rank \i};
+  \node[font=\scriptsize] at (\x,0.35) {local \i};
+}
+
+\foreach \i/\x/\r in {0/1.8/4,1/2.6/5,2/3.4/6,3/4.2/7} {
+  \node[gpu] at (\x,1.35) {G\i};
+  \node[font=\scriptsize] at (\x,0.75) {rank \r};
+  \node[font=\scriptsize] at (\x,0.35) {local \i};
+}
+
+\node[align=left, text width=10.2cm] at (0,-1.05) {
+  local rank 用于绑定本机 GPU；rank 用于全局通信排序；world size 决定 collective 的参与进程数。
+  多节点训练问题中，rank mapping 与物理拓扑会影响通信性能。
+};
+```
+
+\end{tikzpicture}
+\caption{两节点八进程示例中的 rank 与 local rank}
+\label{fig:rank-world-size-local-rank}
+\end{figure}
+
+一个常见启动方式是：
+
+\begin{lstlisting}[language=bash,caption={使用 torchrun 启动单机 8 卡 DDP},label={lst:torchrun-single-node}]
+torchrun 
+--nproc_per_node=8 
+train_ddp.py 
+--config config.yaml
+\end{lstlisting}
+
+多机启动时，还需要指定节点数、节点 rank、master 地址和端口：
+
+\begin{lstlisting}[language=bash,caption={使用 torchrun 启动多机 DDP 的示意},label={lst:torchrun-multi-node}]
+torchrun 
+--nnodes=2 
+--nproc_per_node=8 
+--node_rank=0 
+--master_addr=10.0.0.1 
+--master_port=29500 
+train_ddp.py
+\end{lstlisting}
+
+第二台机器将 \texttt{--node_rank} 设置为 \texttt{1}，其余 master 配置保持一致。
+
+\subsection{gradient bucket}
+\label{subsec:gradient-bucket}
+
+如果模型有很多参数 tensor，逐个参数 all-reduce 会产生大量小消息，延迟开销很高。DDP 的做法是把多个参数梯度打包成 bucket。一个 bucket 满足条件后，就作为一个较大的 tensor 发起 all-reduce。
+
+在 backward 中，梯度不是同时产生的，而是按照计算图从后往前逐步 ready。DDP 会在 autograd hook 中捕获参数梯度 ready 事件。当某个 bucket 里的所有梯度都 ready 后，DDP 可以立即发起该 bucket 的 all-reduce。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+param/.style={draw, rounded corners=2pt, minimum width=0.82cm, minimum height=0.45cm, align=center, fill=blue!6},
+bucket/.style={draw, rounded corners=3pt, minimum width=2.8cm, minimum height=0.7cm, align=center, fill=orange!12},
+arrow/.style={-{Latex[length=2.0mm]}, thick}
+]
+
+```
+\node[font=\bfseries] at (0,3.0) {Gradient Bucket：将多个小梯度合并通信};
+
+\foreach \i/\x in {1/-5.0,2/-4.1,3/-3.2,4/-2.3,5/-1.4,6/-0.5,7/0.4,8/1.3,9/2.2,10/3.1} {
+  \node[param] (p\i) at (\x,1.55) {$g_{\i}$};
+}
+
+\node[bucket] (b0) at (-3.65,0.3) {Bucket 0};
+\node[bucket] (b1) at (-0.95,0.3) {Bucket 1};
+\node[bucket] (b2) at (1.75,0.3) {Bucket 2};
+
+\foreach \i in {1,2,3} {
+  \draw[arrow] (p\i) -- (b0);
+}
+\foreach \i in {4,5,6} {
+  \draw[arrow] (p\i) -- (b1);
+}
+\foreach \i in {7,8,9,10} {
+  \draw[arrow] (p\i) -- (b2);
+}
+
+\node[draw, rounded corners=3pt, fill=green!10, minimum width=2.6cm, minimum height=0.65cm, align=center] (ar) at (-0.95,-1.05) {AllReduce buckets};
+
+\draw[arrow] (b0) -- (ar);
+\draw[arrow] (b1) -- (ar);
+\draw[arrow] (b2) -- (ar);
+
+\node[align=left, text width=10.2cm] at (-0.4,-2.15) {
+  Bucket 太小会导致大量小通信；bucket 太大则可能延迟通信启动，减少与 backward 的重叠机会。
+  DDP 性能调优中，bucket 大小是一个重要参数。
+};
+```
+
+\end{tikzpicture}
+\caption{DDP 中的梯度 bucket 机制}
+\label{fig:ddp-gradient-bucket}
+\end{figure}
+
+Bucket 大小会影响性能：
+
+\begin{itemize}
+\item bucket 太小：通信次数多，延迟开销大；
+\item bucket 太大：必须等待更多梯度 ready，通信启动晚，重叠减少；
+\item 参数顺序不合理：ready 时间相差大的梯度被放在同一 bucket，导致等待；
+\item 模型中存在很多小层：更容易受到 bucket 和延迟影响。
+\end{itemize}
+
+DDP 的默认 bucket 策略对大多数模型有效，但在大规模模型或特殊结构中，仍可能需要调优。
+
+\subsection{overlap communication and computation}
+\label{subsec:overlap-communication-computation}
+
+DDP 的关键优化是通信与计算重叠。Backward 从最后一层开始向前计算梯度。假设后几层梯度已经 ready，DDP 可以立即发起这些梯度 bucket 的 all-reduce，同时 GPU 继续计算更前面层的 backward。
+
+理想情况下，通信时间被隐藏在 backward 计算时间中。若总 backward 计算时间为 $T_{\mathrm{bwd}}$，总通信时间为 $T_{\mathrm{comm}}$，可重叠部分为 $T_{\mathrm{overlap}}$，则 step 时间中的 backward+communication 近似为：
+[
+T_{\mathrm{bwd+comm}}
+\approx
+T_{\mathrm{bwd}}
++
+T_{\mathrm{comm}}
+-----------------
+
+T_{\mathrm{overlap}}.
+]
+若通信完全被隐藏，则：
+[
+T_{\mathrm{overlap}}\approx T_{\mathrm{comm}}.
+]
+若无法重叠，则：
+[
+T_{\mathrm{overlap}}\approx 0.
+]
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+comp/.style={draw, rounded corners=2pt, minimum height=0.5cm, fill=blue!12},
+comm/.style={draw, rounded corners=2pt, minimum height=0.38cm, fill=orange!16},
+axis/.style={-{Latex[length=2.1mm]}, thick}
+]
+
+```
+\node[font=\bfseries] at (0,3.1) {DDP 中 backward 与 gradient all-reduce 的重叠};
+
+\draw[axis] (-5.6,2.1) -- (5.6,2.1) node[right] {time};
+
+\node[comp, minimum width=1.45cm] (b4) at (-4.4,1.35) {Bwd L4};
+\node[comp, minimum width=1.45cm] (b3) at (-2.85,1.35) {Bwd L3};
+\node[comp, minimum width=1.45cm] (b2) at (-1.3,1.35) {Bwd L2};
+\node[comp, minimum width=1.45cm] (b1) at (0.25,1.35) {Bwd L1};
+
+\node[comm, minimum width=2.1cm] (c4) at (-2.7,0.55) {AllReduce bucket 4};
+\node[comm, minimum width=2.1cm] (c3) at (-1.0,0.05) {AllReduce bucket 3};
+\node[comm, minimum width=2.1cm] (c2) at (0.7,-0.45) {AllReduce bucket 2};
+\node[comm, minimum width=2.1cm] (c1) at (2.4,-0.95) {AllReduce bucket 1};
+
+\draw[dashed] (-3.65,1.1) -- (-3.65,0.75);
+\draw[dashed] (-2.1,1.1) -- (-2.1,0.25);
+\draw[dashed] (-0.55,1.1) -- (-0.55,-0.25);
+\draw[dashed] (1.0,1.1) -- (1.0,-0.75);
+
+\node[align=left, text width=10.4cm] at (0,-2.15) {
+  后层梯度先 ready，对应 bucket 可以先开始 all-reduce。
+  如果网络通信能与前面层 backward 重叠，DDP 的 step time 会显著降低。
+};
+```
+
+\end{tikzpicture}
+\caption{DDP 中通信与计算重叠的时间线}
+\label{fig:ddp-overlap-timeline}
+\end{figure}
+
+通信重叠并不总是有效。常见失败原因包括：
+
+\begin{itemize}
+\item bucket 太大，导致 all-reduce 启动太晚；
+\item backward 计算太短，无法隐藏通信；
+\item 网络带宽不足，通信尾部暴露；
+\item 参数依赖或 autograd 图结构导致梯度 ready 顺序不理想；
+\item GPU 上计算 kernel 与通信 kernel 资源竞争；
+\item 小模型或小 batch 下，通信延迟占比过高。
+\end{itemize}
+
+下面给出一个最小 DDP 训练脚本骨架：
+
+\begin{lstlisting}[language=Python,caption={PyTorch DDP 训练循环骨架},label={lst:pytorch-ddp-training-loop}]
+import os
+import torch
+import torch.distributed as dist
+import torch.nn as nn
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+
+def setup_distributed():
+rank = int(os.environ["RANK"])
+world_size = int(os.environ["WORLD_SIZE"])
+local_rank = int(os.environ["LOCAL_RANK"])
+
+```
+torch.cuda.set_device(local_rank)
+dist.init_process_group(backend="nccl", init_method="env://")
+return rank, world_size, local_rank
+```
+
+def train():
+rank, world_size, local_rank = setup_distributed()
+
+```
+dataset = build_dataset()
+sampler = DistributedSampler(
+    dataset,
+    num_replicas=world_size,
+    rank=rank,
+    shuffle=True,
+)
+loader = DataLoader(
+    dataset,
+    batch_size=local_batch_size,
+    sampler=sampler,
+    num_workers=4,
+    pin_memory=True,
+)
+
+model = MyModel().cuda(local_rank)
+
+# Each process owns one GPU.
+model = DDP(
+    model,
+    device_ids=[local_rank],
+    output_device=local_rank,
+    bucket_cap_mb=25,
+    find_unused_parameters=False,
+)
+
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+
+for epoch in range(num_epochs):
+    sampler.set_epoch(epoch)
+
+    for batch in loader:
+        batch = move_to_cuda(batch, local_rank)
+
+        optimizer.zero_grad(set_to_none=True)
+
+        output = model(batch["input_ids"])
+        loss = compute_loss(output, batch["labels"])
+
+        loss.backward()
+        optimizer.step()
+
+        if rank == 0:
+            print("loss:", loss.item())
+
+dist.destroy_process_group()
+```
+
+if **name** == "**main**":
+train()
+\end{lstlisting}
+
+实际工程中还需要处理 AMP、gradient clipping、checkpoint、resume、logging、evaluation、异常退出和多节点启动等问题。
+
+\section{通信复杂度分析}
+\label{sec:communication-complexity-analysis}
+
+数据并行的计算很容易理解：每张 GPU 处理自己的 local batch。真正决定扩展性的，是梯度同步通信。假设模型梯度总大小为 $G$ bytes，GPU 数为 $P$。每个训练 step 至少需要让所有 rank 获得平均梯度，因此通信不可避免。
+
+\subsection{Ring AllReduce}
+\label{subsec:ring-allreduce}
+
+Ring AllReduce 是常见 all-reduce 算法之一。它把 $P$ 个 rank 组织成一个环，并把梯度 tensor 切成 $P$ 个 chunk。算法分为两个阶段：
+
+\begin{enumerate}
+\item \textbf{Reduce-Scatter}：每个 rank 逐步把 chunk 沿环传递并累加，最终每个 rank 得到一个 reduced chunk；
+\item \textbf{All-Gather}：每个 rank 再把 reduced chunk 沿环传播，最终所有 rank 得到完整规约结果。
+\end{enumerate}
+
+每个阶段有 $P-1$ 步，每步每个 rank 发送和接收一个大小为 $G/P$ 的 chunk。因此每个 rank 的发送数据量近似为：
+[
+V_{\mathrm{send}}
+=================
+
+# 2(P-1)\frac{G}{P}
+
+\frac{2(P-1)}{P}G.
+]
+接收量相同。
+
+通信时间粗略为：
+[
+T_{\mathrm{ring}}
+\approx
+2(P-1)\alpha
++
+\frac{2(P-1)}{P}\frac{G}{\beta},
+]
+其中 $\alpha$ 是每步延迟，$\beta$ 是有效链路带宽。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+rank/.style={draw, circle, minimum size=0.9cm, align=center, fill=blue!8},
+arrow/.style={-{Latex[length=2.2mm]}, thick},
+chunk/.style={draw, rounded corners=2pt, minimum width=0.55cm, minimum height=0.35cm, fill=orange!14}
+]
+
+```
+\node[font=\bfseries] at (0,3.2) {Ring AllReduce：环形传递 chunk};
+
+\node[rank] (r0) at (0,2.0) {R0};
+\node[rank] (r1) at (2.7,0.9) {R1};
+\node[rank] (r2) at (1.7,-1.7) {R2};
+\node[rank] (r3) at (-1.7,-1.7) {R3};
+\node[rank] (r4) at (-2.7,0.9) {R4};
+
+\draw[arrow] (r0) -- (r1);
+\draw[arrow] (r1) -- (r2);
+\draw[arrow] (r2) -- (r3);
+\draw[arrow] (r3) -- (r4);
+\draw[arrow] (r4) -- (r0);
+
+\foreach \i/\x in {0/-0.85,1/-0.28,2/0.28,3/0.85} {
+  \node[chunk] at (\x,0.25) {\scriptsize c\i};
+}
+
+\node[align=center] at (0,-0.45) {gradient tensor\\split into chunks};
+
+\node[align=left, text width=10.4cm] at (0,-3.0) {
+  Ring AllReduce 带宽利用率高，适合大 tensor 通信。
+  但通信步数随 $P$ 增长，延迟项在大规模或小消息场景中会变得明显。
+};
+```
+
+\end{tikzpicture}
+\caption{Ring AllReduce 的环形通信结构}
+\label{fig:ring-allreduce}
+\end{figure}
+
+Ring AllReduce 的优势是带宽效率高，所有 rank 同时发送和接收，避免中心节点瓶颈。缺点是延迟步数为 $O(P)$。当 GPU 数很大、梯度 bucket 较小或跨节点链路延迟高时，延迟项会影响扩展效率。
+
+\subsection{Tree AllReduce}
+\label{subsec:tree-allreduce}
+
+Tree AllReduce 使用树结构做 reduce 和 broadcast。其延迟步数通常为：
+[
+O(\log P).
+]
+因此在小消息或大规模 rank 数场景中，tree-based 算法可能更有优势。
+
+可以把 Tree AllReduce 理解为：
+
+\begin{enumerate}
+\item 叶子 rank 把数据发送给父节点；
+\item 父节点累加子节点数据并向上发送；
+\item 根节点得到总和；
+\item 根节点再沿树向下广播结果。
+\end{enumerate}
+
+Tree 的缺点是某些链路或节点可能承载更多数据，带宽利用可能不如 ring 均衡。现代通信库通常会根据消息大小、拓扑和硬件选择不同算法，而不是固定使用一种。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+rank/.style={draw, circle, minimum size=0.78cm, align=center, fill=green!10},
+arrow/.style={-{Latex[length=2.1mm]}, thick}
+]
+
+```
+\node[font=\bfseries] at (0,3.0) {Tree AllReduce 的 Reduce 与 Broadcast};
+
+\node[rank] (r0) at (0,2.0) {R0};
+\node[rank] (r1) at (-2.0,0.9) {R1};
+\node[rank] (r2) at (2.0,0.9) {R2};
+\node[rank] (r3) at (-3.0,-0.3) {R3};
+\node[rank] (r4) at (-1.0,-0.3) {R4};
+\node[rank] (r5) at (1.0,-0.3) {R5};
+\node[rank] (r6) at (3.0,-0.3) {R6};
+
+\draw[arrow, blue!70] (r3) -- (r1);
+\draw[arrow, blue!70] (r4) -- (r1);
+\draw[arrow, blue!70] (r5) -- (r2);
+\draw[arrow, blue!70] (r6) -- (r2);
+\draw[arrow, blue!70] (r1) -- (r0);
+\draw[arrow, blue!70] (r2) -- (r0);
+
+\draw[arrow, orange!80!black, dashed] (r0) .. controls (-1.1,1.8) .. (r1);
+\draw[arrow, orange!80!black, dashed] (r0) .. controls (1.1,1.8) .. (r2);
+\draw[arrow, orange!80!black, dashed] (r1) .. controls (-2.3,0.3) .. (r3);
+\draw[arrow, orange!80!black, dashed] (r1) .. controls (-1.5,0.3) .. (r4);
+\draw[arrow, orange!80!black, dashed] (r2) .. controls (1.5,0.3) .. (r5);
+\draw[arrow, orange!80!black, dashed] (r2) .. controls (2.3,0.3) .. (r6);
+
+\node[align=left, text width=10.2cm] at (0,-1.85) {
+  蓝色实线表示 reduce 方向，橙色虚线表示 broadcast 方向。
+  Tree AllReduce 延迟步数较低，但带宽利用和链路负载取决于树形拓扑。
+};
+```
+
+\end{tikzpicture}
+\caption{Tree AllReduce 的树形通信模式}
+\label{fig:tree-allreduce}
+\end{figure}
+
+\subsection{带宽、延迟与扩展性}
+\label{subsec:bandwidth-latency-scalability}
+
+分布式训练的扩展效率可写为：
+[
+\eta(P)
+=======
+
+\frac{T_1}{P T_P}.
+]
+如果 $P$ 张 GPU 的 step time 为：
+[
+T_P
+===
+
+T_{\mathrm{compute}}
++
+T_{\mathrm{comm}}
+-----------------
+
+T_{\mathrm{overlap}}
++
+T_{\mathrm{other}},
+]
+那么扩展效率取决于通信和其他开销占比。
+
+当模型较大、计算量充足时，communication 可以被 backward 部分隐藏，DDP 扩展效率较好。当模型较小或 batch 较小时，计算时间不足以覆盖通信，效率下降。
+
+几个关键比值：
+
+[
+\rho_{\mathrm{comm}}
+====================
+
+\frac{T_{\mathrm{comm}}-T_{\mathrm{overlap}}}{T_P},
+]
+表示暴露通信占 step time 的比例。若 $\rho_{\mathrm{comm}}$ 很高，说明 GPU 大量时间在等待通信。
+
+[
+\rho_{\mathrm{data}}
+====================
+
+\frac{T_{\mathrm{data}}}{T_P},
+]
+表示数据加载占比。若数据加载慢，即使通信优化很好，GPU 仍会空等。
+
+[
+\rho_{\mathrm{checkpoint}}
+==========================
+
+\frac{T_{\mathrm{checkpoint}}}{N_{\mathrm{steps\ per\ ckpt}}T_P},
+]
+表示摊销到每步的 checkpoint 成本。大规模训练中，checkpoint 体积可能达到 TB 级，不能忽略。
+
+\begin{table}[H]
+\centering
+\small
+\caption{影响 DDP 扩展效率的常见因素}
+\label{tab:ddp-scaling-factors}
+\begin{tabular}{p{0.22\textwidth}p{0.34\textwidth}p{0.34\textwidth}}
+\toprule
+\textbf{因素} & \textbf{表现} & \textbf{优化方向} \
+\midrule
+网络带宽不足
+& all-reduce 暴露时间长，GPU 等待通信
+& 使用更高速互联，优化 bucket，拓扑感知 rank mapping。 \
+\midrule
+通信延迟高
+& 小 bucket、小参数层扩展差
+& 合并小梯度，调整 bucket size，减少同步频率。 \
+\midrule
+batch 太小
+& 计算时间短，无法隐藏通信
+& 增大 local batch 或使用 gradient accumulation。 \
+\midrule
+数据加载慢
+& GPU utilization 周期性下降
+& 提升 dataloader、缓存、预取、存储吞吐。 \
+\midrule
+straggler
+& 某些 rank 慢，所有 rank 等待
+& 检查硬件健康、数据倾斜、网络拥塞、节点温度。 \
+\midrule
+checkpoint 慢
+& 周期性训练停顿
+& 异步 checkpoint、分片保存、并行写入、降低频率。 \
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{NCCL 的角色}
+\label{subsec:nccl-role}
+
+NCCL 是 NVIDIA GPU 集群中最常用的 collective communication 库之一。PyTorch DDP 使用 NCCL backend 时，all-reduce、broadcast、reduce-scatter、all-gather 等操作通常由 NCCL 执行。
+
+NCCL 的作用包括：
+
+\begin{itemize}
+\item 根据 GPU 拓扑选择通信路径；
+\item 利用 NVLink、NVSwitch、PCIe、InfiniBand 或 RoCE；
+\item 实现 ring、tree 等 collective 算法；
+\item 支持 GPU Direct P2P 和 GPUDirect RDMA；
+\item 提供高性能 GPU buffer 之间通信。
+\end{itemize}
+
+AI Infra 工程中，NCCL 问题非常常见。例如：
+
+\begin{itemize}
+\item 某个 rank 卡在 all-reduce；
+\item 多机通信带宽远低于预期；
+\item 单机 8 卡快，多机扩展后效率骤降；
+\item rank mapping 与 NVLink/NIC 拓扑不匹配；
+\item 防火墙、网卡、驱动、容器权限或环境变量配置错误；
+\item 某个节点硬件异常导致 collective hang。
+\end{itemize}
+
+在定位 NCCL 问题时，常用思路是先脱离训练框架，使用最小通信测试确认集群基础通信能力，再回到训练任务分析 bucket、overlap 和拓扑。
+
+\section{数据并行的工程实践与常见陷阱}
+\label{sec:data-parallel-engineering-practices}
+
+\subsection{global batch size 与学习率}
+\label{subsec:global-batch-size-and-lr}
+
+数据并行改变了 global batch size。如果保持 local batch 不变，GPU 数从 $P$ 增加到 $2P$，global batch size 也会翻倍：
+[
+B_{\mathrm{global}}=P B_{\mathrm{local}} A.
+]
+这会改变优化过程。常见经验是随着 batch size 增大适当调整学习率，但具体策略取决于模型、数据和优化器。
+
+在大模型训练中，global batch 通常以 token 数衡量：
+[
+B_{\mathrm{tokens}}
+===================
+
+P\cdot B_{\mathrm{local}}\cdot A\cdot S.
+]
+其中 $S$ 是序列长度。许多训练配置会写成每 step 多少 tokens，而不是多少 samples。
+
+如果恢复训练时 world size、gradient accumulation 或 sequence length 变化，需要特别小心学习率 schedule、optimizer state 和 consumed tokens 的一致性。否则虽然程序能跑，但训练曲线可能出现异常。
+
+\subsection{梯度累积与 no_sync}
+\label{subsec:gradient-accumulation-no-sync}
+
+当显存不足以使用较大 local batch 时，可以使用 gradient accumulation。假设累积 $A$ 步，每步只做 forward/backward，不立即 optimizer step，累积到第 $A$ 步再更新参数。
+
+在 DDP 中，如果每个 micro-step 都同步梯度，会产生不必要通信。可以使用 \texttt{no_sync()} 在前 $A-1$ 个 micro-step 跳过 all-reduce，只在最后一步同步。
+
+\begin{lstlisting}[language=Python,caption={DDP 中使用 no_sync 做梯度累积},label={lst:ddp-no-sync-gradient-accumulation}]
+accum_steps = 4
+
+for step, batch in enumerate(loader):
+micro_step = step % accum_steps
+
+```
+# Avoid gradient synchronization for intermediate accumulation steps.
+if micro_step < accum_steps - 1:
+    context = model.no_sync()
+else:
+    context = nullcontext()
+
+with context:
+    output = model(batch["input_ids"])
+    loss = compute_loss(output, batch["labels"])
+    loss = loss / accum_steps
+    loss.backward()
+
+if micro_step == accum_steps - 1:
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+```
+
+\end{lstlisting}
+
+这里有两个关键点：
+
+\begin{itemize}
+\item loss 需要除以 \texttt{accum_steps}，否则梯度尺度会变大；
+\item 只有最后一个 micro-step 才同步梯度并执行 optimizer step。
+\end{itemize}
+
+如果忘记使用 \texttt{no_sync()}，训练结果可能仍然正确，但通信量增加 $A$ 倍，吞吐明显下降。
+
+\subsection{unused parameters 与动态图}
+\label{subsec:unused-parameters-and-dynamic-graph}
+
+DDP 默认假设所有参数都会在每次 forward/backward 中参与计算。如果某些参数没有产生梯度，可能导致同步等待异常。可以设置：
+[
+\texttt{find_unused_parameters=True}.
+]
+但这会引入额外图遍历开销，不应随意开启。
+
+unused parameters 常见于：
+
+\begin{itemize}
+\item 条件分支模型；
+\item 多任务模型中某些 head 不参与当前 batch；
+\item MoE 中部分 expert 未被选中；
+\item 冻结部分参数但未正确设置 \texttt{requires_grad=False}；
+\item 返回值中某些 loss 没有连接到所有参数。
+\end{itemize}
+
+对于大模型训练，动态图和 unused parameters 会影响 DDP bucket 构建和通信重叠。若模型结构固定，尽量保持每步计算图一致；若必须使用条件计算，需要理解通信框架如何处理未使用参数。
+
+\subsection{checkpoint 与 rank 0 陷阱}
+\label{subsec:checkpoint-rank0-pitfall}
+
+在普通 DDP 中，每张 GPU 保存完整模型参数，理论上只需 rank 0 保存 checkpoint。但这有几个注意点：
+
+\begin{itemize}
+\item optimizer state 在每个 rank 上也相同，可以 rank 0 保存；
+\item scheduler、global step、consumed samples/tokens 必须保存；
+\item 如果使用 AMP，需要保存 scaler；
+\item 多节点训练时 rank 0 写 checkpoint 可能成为单点 IO 瓶颈；
+\item 如果结合 ZeRO/FSDP，checkpoint 可能是分片的，不能简单只保存 rank 0。
+\end{itemize}
+
+一个简化 checkpoint 写法如下：
+
+\begin{lstlisting}[language=Python,caption={DDP 中仅 rank 0 保存 checkpoint 的简化示意},label={lst:ddp-rank0-checkpoint}]
+def save_checkpoint(model, optimizer, scheduler, step, rank, path):
+if rank != 0:
+return
+
+```
+# DDP wraps the original model under .module.
+state = {
+    "model": model.module.state_dict(),
+    "optimizer": optimizer.state_dict(),
+    "scheduler": scheduler.state_dict(),
+    "step": step,
+}
+
+torch.save(state, path)
+```
+
+\end{lstlisting}
+
+恢复时，所有 rank 都需要加载相同 checkpoint，或者 rank 0 加载后 broadcast 参数。简单单机实验可以每个 rank 从共享文件系统读取；大规模训练中，这可能造成存储风暴，需要分布式 checkpoint 方案。
+
+\subsection{DDP 适用边界}
+\label{subsec:ddp-applicability-boundary}
+
+DDP 的前提是每张 GPU 能保存完整模型、梯度和优化器状态。如果模型太大，DDP 就不够了。此时需要：
+
+\begin{itemize}
+\item \textbf{ZeRO / FSDP}：在数据并行维度切分 optimizer state、gradient 和 parameter；
+\item \textbf{Tensor Parallel}：切分单层矩阵；
+\item \textbf{Pipeline Parallel}：按层切分模型；
+\item \textbf{Activation Checkpointing}：降低激活显存；
+\item \textbf{Offload}：把部分状态移到 CPU 或 NVMe。
+\end{itemize}
+
+可以把 DDP 的适用条件写成显存不等式：
+[
+M_{\mathrm{params}}
++
+M_{\mathrm{grads}}
++
+M_{\mathrm{optimizer}}
++
+M_{\mathrm{activations}}
++
+M_{\mathrm{buffers}}
+\le
+M_{\mathrm{HBM}}.
+]
+若这个不等式不成立，就必须引入更复杂的并行或分片技术。
+
+\section{本章小结}
+\label{sec:chapter07-summary}
+
+本章系统介绍了数据并行和 PyTorch DDP 的基本原理、通信机制与工程实践。
+
+\begin{itemize}
+\item \textbf{分布式训练的动机} 来自显存、吞吐、batch size、训练时长和可靠性等多重瓶颈。
+\item \textbf{数据并行} 的核心思想是每张 GPU 保存完整模型副本，处理不同数据分片，并同步平均梯度。
+\item \textbf{global batch size} 满足 $B_{\mathrm{global}}=P\cdot B_{\mathrm{local}}\cdot A$，其中 $P$ 是 GPU 数，$A$ 是梯度累积步数。
+\item \textbf{梯度同步} 通常通过 all-reduce 完成，所有 rank 得到相同平均梯度后执行相同 optimizer step。
+\item \textbf{PyTorch DDP} 使用 process group 管理通信，使用 rank/world size/local rank 描述分布式进程。
+\item \textbf{gradient bucket} 将多个梯度合并通信，减少小消息开销，并允许通信与 backward 计算重叠。
+\item \textbf{Ring AllReduce} 带宽效率高，每个 rank 通信量约为 $\frac{2(P-1)}{P}G$，但延迟步数随 $P$ 增长。
+\item \textbf{Tree AllReduce} 具有较低延迟步数，适合某些小消息或大规模场景，但带宽利用取决于树形拓扑。
+\item \textbf{NCCL} 是 GPU collective communication 的核心库，负责利用 NVLink、NVSwitch、PCIe、InfiniBand 或 RoCE 执行高性能通信。
+\item \textbf{DDP 的边界} 是单卡必须能保存完整模型和训练状态；当模型太大时，需要 ZeRO、FSDP、TP、PP 或 3D 并行。
+\end{itemize}
+
+下一章将进入张量并行。我们会分析为什么数据并行在模型太大时不够，如何把 Linear 层按列或按行切分到多张 GPU，Megatron-LM 如何在 Transformer 内部组织 tensor parallel group，以及前向和反向传播中 all-reduce、all-gather、reduce-scatter 分别出现在什么位置。

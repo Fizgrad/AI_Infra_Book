@@ -1,0 +1,1775 @@
+\chapter{PagedAttention 与 vLLM}
+\label{chap:paged-attention-vllm}
+
+\section{Serving 系统中的内存碎片问题}
+\label{sec:serving-memory-fragmentation}
+
+上一章我们讨论了 KV Cache：在自回归推理中，prefill 阶段为 prompt 建立每一层的 Key/Value 缓存，decode 阶段每生成一个新 token 都读取历史 KV，并追加新的 K/V。KV Cache 的基本显存公式为：
+
+[
+M_{\mathrm{KV}}
+===============
+
+2
+\cdot
+L
+\cdot
+B
+\cdot
+S
+\cdot
+n_{kv}
+\cdot
+d_h
+\cdot
+s_{\mathrm{dtype}}.
+]
+
+这个公式描述的是“真实有效 token”需要的理论显存。但在线 serving 系统中的难点并不只是理论显存，而是\textbf{如何在动态请求中高效分配、增长、复用和释放 KV Cache}。
+
+如果所有请求长度相同、同时开始、同时结束，那么 KV Cache 管理会非常简单。系统只需要分配一个规则的矩形张量：
+
+[
+[L,B,n_{kv},S,d_h].
+]
+
+然而真实 LLM serving 中，请求具有高度动态性：
+
+\begin{itemize}
+\item 每个请求的 prompt length 不同；
+\item 每个请求的 output length 不同；
+\item 请求随时到达；
+\item 请求随时结束；
+\item 有些请求会被取消；
+\item 有些请求会进入多轮对话；
+\item 有些请求共享 prefix，有些请求完全不同；
+\item 有些请求只生成几个 token，有些请求生成几千 token。
+\end{itemize}
+
+因此，KV Cache 更像一个在线内存分配系统，而不是一个静态张量。PagedAttention 的核心价值，正是把 KV Cache 管理从“连续大块分配”改造成“分页式 block 管理”，从而显著减少碎片和 over-reservation。
+
+\subsection{不同请求长度导致的浪费}
+\label{subsec:waste-from-variable-request-lengths}
+
+考虑一个简单场景：系统同时服务 $B$ 个请求，每个请求最多允许上下文长度为 $S_{\max}$。若使用最朴素的连续分配方式，系统可能为每个请求都预留 $S_{\max}$ 个 token 的 KV Cache。
+
+第 $i$ 个请求实际使用长度为：
+
+[
+S_i=S_{\mathrm{prompt},i}+S_{\mathrm{generated},i}.
+]
+
+如果为每个请求预留 $S_{\max}$，则第 $i$ 个请求的 cache 利用率为：
+
+[
+u_i=\frac{S_i}{S_{\max}}.
+]
+
+整个 batch 的平均利用率为：
+
+[
+U
+=
+
+\frac{\sum_{i=1}^{B}S_i}
+{B S_{\max}}.
+]
+
+当请求长度差异很大时，$U$ 可能非常低。例如，一个 batch 中有如下请求：
+
+[
+[128,\ 256,\ 512,\ 2048,\ 4096]
+]
+
+若都按 $4096$ 预留，则总预留 token slots 为：
+
+[
+5\times 4096=20480.
+]
+
+真实使用 token slots 为：
+
+[
+128+256+512+2048+4096=7040.
+]
+
+利用率为：
+
+[
+U=\frac{7040}{20480}\approx 34.4%.
+]
+
+也就是说，超过一半的 KV Cache 显存只是被预留，却没有存放有效 token。
+
+这类浪费在在线服务中非常常见。很多用户请求很短，例如“解释一个概念”“改写一句话”“写一个 SQL”；也有一些请求很长，例如“总结一篇长文档”“分析代码仓库”“多轮对话历史很长”。如果系统为了兼容长请求而给所有请求预留最大长度，短请求会造成大量内部浪费。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+cell/.style={draw, minimum width=0.42cm, minimum height=0.38cm},
+label/.style={font=\scriptsize},
+used/.style={fill=blue!12},
+unused/.style={fill=gray!18}
+]
+
+```
+\node[font=\bfseries] at (0,3.05) {连续 KV Cache 预留导致的空间浪费};
+
+\foreach \r/\y/\usedcells in {1/1.65/2,2/1.05/4,3/0.45/6,4/-0.15/10,5/-0.75/16} {
+  \node[label] at (-4.8,\y) {Req \r};
+  \foreach \i in {0,...,15} {
+    \ifnum\i<\usedcells
+      \node[cell, used] at ({-3.9+0.45*\i},\y) {};
+    \else
+      \node[cell, unused] at ({-3.9+0.45*\i},\y) {};
+    \fi
+  }
+}
+
+\node[draw, rounded corners=2pt, fill=blue!12, minimum width=0.55cm, minimum height=0.35cm] at (3.8,1.45) {};
+\node[anchor=west] at (4.2,1.45) {used KV};
+\node[draw, rounded corners=2pt, fill=gray!18, minimum width=0.55cm, minimum height=0.35cm] at (3.8,0.85) {};
+\node[anchor=west] at (4.2,0.85) {reserved unused};
+
+\node[align=left, text width=10.5cm] at (0,-2.0) {
+  所有请求都按最大长度预留时，短请求会占用大量未使用 slots。
+  对长短请求混部的在线 serving，这种 over-reservation 会显著降低可并发请求数。
+};
+```
+
+\end{tikzpicture}
+\caption{传统连续 KV Cache 分配中的长度浪费}
+\label{fig:traditional-contiguous-fragmentation}
+\end{figure}
+
+\subsection{over-reservation}
+\label{subsec:over-reservation}
+
+Over-reservation 指系统为了避免未来扩容困难，提前为请求预留超过当前需要的 KV Cache 空间。它通常来自两个考虑：
+
+\begin{itemize}
+\item 请求未来还会继续 decode，cache 会增长；
+\item 连续分配难以原地扩展，因此一开始预留最大长度更简单。
+\end{itemize}
+
+设请求当前长度为 $S_{\mathrm{cur}}$，最大允许长度为 $S_{\max}$。连续分配通常分配：
+
+[
+A_{\mathrm{contiguous}}=S_{\max}.
+]
+
+真实当前使用：
+
+[
+U_{\mathrm{cur}}=S_{\mathrm{cur}}.
+]
+
+当前浪费：
+
+[
+W_{\mathrm{over}}
+=================
+
+S_{\max}-S_{\mathrm{cur}}.
+]
+
+如果请求最终只生成到 $S_{\mathrm{final}}$，则最终浪费为：
+
+[
+W_{\mathrm{final}}
+==================
+
+S_{\max}-S_{\mathrm{final}}.
+]
+
+这类浪费尤其影响 admission control。假设 GPU 上剩余 KV Cache token capacity 为 $C_{\mathrm{free}}$。如果系统按最大长度预留，则新请求能否进入取决于：
+
+[
+S_{\max}\le C_{\mathrm{free}}.
+]
+
+但如果按实际增长分配，进入条件可能只需要：
+
+[
+S_{\mathrm{prompt}}+\Delta \le C_{\mathrm{free}},
+]
+
+其中 $\Delta$ 是少量初始 decode 余量。连续预留会使系统过早拒绝请求，降低吞吐。
+
+Over-reservation 的本质是用显存换实现简单性。对于小模型或低并发服务，这可能可以接受；对于长上下文、高并发、GPU 显存昂贵的 LLM serving，它会成为主要成本来源。
+
+\begin{table}[H]
+\centering
+\small
+\caption{连续预留与按需分配的差异}
+\label{tab:over-reservation-vs-demand-allocation}
+\begin{tabular}{p{0.24\textwidth}p{0.34\textwidth}p{0.32\textwidth}}
+\toprule
+\textbf{维度} & \textbf{连续最大长度预留} & \textbf{按需增长分配} \
+\midrule
+实现复杂度
+& 简单
+& 需要动态内存管理 \
+\midrule
+访存模式
+& 连续，kernel 读取简单
+& 需要地址映射或 block table \
+\midrule
+显存利用率
+& 长短请求混部时较低
+& 通常更高 \
+\midrule
+请求扩容
+& 无需扩容，已预留
+& 生成过程中申请新 block \
+\midrule
+碎片风险
+& 内部浪费严重，外部碎片也可能出现
+& 主要是最后一个 block 的内部碎片 \
+\midrule
+适用场景
+& 固定长度、离线批处理、低并发
+& 在线 serving、长短请求混部、高并发 \
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{internal fragmentation}
+\label{subsec:internal-fragmentation}
+
+Internal fragmentation 指已经分配给某个请求的内存块内部，有一部分没有被使用。连续预留中的内部碎片可能非常大，因为每个请求都预留到最大长度。
+
+PagedAttention 使用固定大小 block 后，仍然存在内部碎片，但碎片被限制在最后一个 block 内。
+
+设 block size 为 $B_{\mathrm{blk}}$，请求实际长度为 $S_i$。需要分配的 block 数为：
+
+[
+N_{\mathrm{blk},i}
+==================
+
+\left\lceil
+\frac{S_i}{B_{\mathrm{blk}}}
+\right\rceil.
+]
+
+分配的 token slots 为：
+
+[
+A_i
+===
+
+N_{\mathrm{blk},i}B_{\mathrm{blk}}.
+]
+
+内部碎片为：
+
+[
+W_i
+===
+
+A_i-S_i.
+]
+
+因为只可能最后一个 block 没用满，所以：
+
+[
+0\le W_i < B_{\mathrm{blk}}.
+]
+
+这意味着每个请求最多浪费 $B_{\mathrm{blk}}-1$ 个 token slots。若 block size 为 $16$，每个请求最多浪费 $15$ 个 token slots；若 block size 为 $32$，最多浪费 $31$ 个 token slots。
+
+与按 $S_{\max}$ 连续预留相比，这个浪费上界小得多。
+
+[
+W_{\mathrm{paged}}
+<
+B_{\mathrm{blk}},
+]
+[
+W_{\mathrm{contiguous}}
+=======================
+
+S_{\max}-S_i.
+]
+
+当 $S_{\max}$ 为几千或几万，而 $B_{\mathrm{blk}}$ 只有几十时，分页式分配的空间效率优势非常明显。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+cell/.style={draw, minimum width=0.38cm, minimum height=0.34cm},
+blockbox/.style={draw, rounded corners=2pt, dashed, thick},
+used/.style={fill=green!12},
+unused/.style={fill=gray!18}
+]
+
+```
+\node[font=\bfseries] at (0,3.0) {Block-based 分配中的内部碎片只出现在最后一个 block};
+
+\node[anchor=east] at (-4.7,1.35) {logical tokens};
+\foreach \i in {0,...,18} {
+  \node[cell, used] at ({-4.1+0.4*\i},1.35) {};
+}
+
+\foreach \i in {19,...,23} {
+  \node[cell, unused] at ({-4.1+0.4*\i},1.35) {};
+}
+
+\draw[blockbox] (-4.32,1.08) rectangle (-1.02,1.62);
+\draw[blockbox] (-0.92,1.08) rectangle (2.38,1.62);
+\draw[blockbox] (2.48,1.08) rectangle (5.78,1.62);
+
+\node[font=\scriptsize] at (-2.67,0.75) {block 0 full};
+\node[font=\scriptsize] at (0.73,0.75) {block 1 full};
+\node[font=\scriptsize] at (4.13,0.75) {last block partially used};
+
+\node[draw, rounded corners=2pt, fill=green!12, minimum width=0.55cm, minimum height=0.35cm] at (-1.0,-0.15) {};
+\node[anchor=west] at (-0.6,-0.15) {used};
+\node[draw, rounded corners=2pt, fill=gray!18, minimum width=0.55cm, minimum height=0.35cm] at (1.2,-0.15) {};
+\node[anchor=west] at (1.6,-0.15) {internal fragmentation};
+
+\node[align=left, text width=10.4cm] at (0,-1.45) {
+  请求长度不是 block size 的整数倍时，最后一个 block 会有少量未使用 slots。
+  这种浪费上界由 block size 决定，而不是由最大上下文长度决定。
+};
+```
+
+\end{tikzpicture}
+\caption{Block-based allocation 中的内部碎片}
+\label{fig:block-internal-fragmentation}
+\end{figure}
+
+\subsection{为什么传统 batch 管理低效}
+\label{subsec:why-traditional-batch-management-is-inefficient}
+
+传统 batch 管理通常假设一个 batch 内的请求同步执行。对于普通深度学习推理，这很自然：一批输入进入模型，一次 forward 后全部完成。但 LLM decode 是迭代式的，一个请求可能生成 5 个 token，另一个请求可能生成 500 个 token。如果仍按静态 batch 管理，会出现严重低效。
+
+静态 batch 的典型问题包括：
+
+\begin{itemize}
+\item \textbf{padding waste}：为了对齐长度，短请求被 padding 到长请求长度；
+\item \textbf{head-of-line blocking}：短请求已经结束，但必须等长请求完成才能释放 batch；
+\item \textbf{GPU 利用率波动}：batch 内请求逐渐结束，实际活跃请求数下降；
+\item \textbf{KV Cache 释放不及时}：结束请求的 cache 不能立刻被新请求复用；
+\item \textbf{新请求无法及时加入}：需要等整个 batch 结束；
+\item \textbf{长请求拖慢短请求}：短请求 tail latency 被长请求影响。
+\end{itemize}
+
+Continuous batching 的思想是 iteration-level scheduling：每个 decode iteration 都可以让新请求加入，让完成请求退出。PagedAttention 提供了内存管理基础，使这种动态调度可行。因为请求不再绑定到固定连续 slot，而是持有一组可动态增长和释放的 blocks。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+cell/.style={draw, minimum width=0.58cm, minimum height=0.42cm, align=center},
+active/.style={fill=blue!12},
+done/.style={fill=gray!18},
+wait/.style={fill=orange!14}
+]
+
+```
+\node[font=\bfseries] at (0,3.05) {Static Batching 中短请求等待长请求};
+
+\foreach \t in {0,...,9} {
+  \node[font=\scriptsize] at ({-3.7+0.65*\t},2.25) {t\t};
+}
+
+\foreach \r/\y/\len in {1/1.55/3,2/0.95/5,3/0.35/9} {
+  \node[font=\scriptsize] at (-4.55,\y) {Req \r};
+  \foreach \t in {0,...,9} {
+    \ifnum\t<\len
+      \node[cell, active] at ({-3.7+0.65*\t},\y) {run};
+    \else
+      \node[cell, done] at ({-3.7+0.65*\t},\y) {};
+    \fi
+  }
+}
+
+\node[cell, wait, minimum width=1.6cm] at (3.85,0.95) {new req waits};
+
+\node[align=left, text width=10.4cm] at (0,-1.0) {
+  静态 batch 中，新请求通常要等当前 batch 结束才能加入。
+  短请求虽然已经完成，但资源释放和新请求调度都被长请求阻塞。
+};
+```
+
+\end{tikzpicture}
+\caption{传统静态 batch 管理中的 head-of-line blocking}
+\label{fig:static-batching-head-of-line-blocking}
+\end{figure}
+
+\section{PagedAttention 核心思想}
+\label{sec:paged-attention-core-idea}
+
+PagedAttention 的名字来自操作系统中的分页内存管理。它不是改变 attention 的数学公式，而是改变 KV Cache 的\textbf{物理存储方式}和 attention kernel 的\textbf{读取方式}。
+
+标准 attention 仍然是：
+
+[
+\operatorname{Attention}(Q,K,V)
+===============================
+
+\softmax
+\left(
+\frac{QK^{\mathsf{T}}}{\sqrt{d_h}}
+\right)V.
+]
+
+PagedAttention 改变的是：逻辑上连续的 $K,V$ 序列，不再要求物理上连续存储。每个请求的逻辑 token 序列被切成多个 logical blocks；系统从全局 physical block pool 中分配 physical blocks；block table 记录 logical block 到 physical block 的映射。Attention kernel 在读取历史 K/V 时，通过 block table 做地址翻译。
+
+\subsection{操作系统分页类比}
+\label{subsec:os-paging-analogy}
+
+操作系统虚拟内存中，进程看到的是连续虚拟地址空间。实际物理内存可能是不连续的 page frames。页表 page table 负责把虚拟页号映射到物理页框。
+
+PagedAttention 中，请求看到的是连续 token positions：
+
+[
+0,1,2,\ldots,S-1.
+]
+
+但这些 token 的 KV Cache 可以分散存放在不同 physical blocks 中。Block table 类似页表：
+
+[
+\text{logical block id}
+\rightarrow
+\text{physical block id}.
+]
+
+类比如下：
+
+\begin{table}[H]
+\centering
+\small
+\caption{操作系统分页与 PagedAttention 的类比}
+\label{tab:os-paging-pagedattention-analogy}
+\begin{tabular}{p{0.28\textwidth}p{0.30\textwidth}p{0.32\textwidth}}
+\toprule
+\textbf{概念} & \textbf{操作系统分页} & \textbf{PagedAttention} \
+\midrule
+地址空间
+& 进程虚拟地址空间
+& 请求的逻辑 token 序列 \
+\midrule
+页
+& virtual page
+& logical KV block \
+\midrule
+物理页框
+& physical page frame
+& physical KV block \
+\midrule
+页表
+& page table
+& block table \
+\midrule
+地址翻译
+& virtual address $\rightarrow$ physical address
+& token position $\rightarrow$ physical KV address \
+\midrule
+共享页
+& 多进程共享只读页
+& 多请求共享 prefix blocks \
+\midrule
+Copy-on-write
+& 写共享页前复制
+& 请求分叉或 beam search 时复制 block \
+\bottomrule
+\end{tabular}
+\end{table}
+
+这个类比非常重要，因为它解释了 PagedAttention 的设计哲学：不要要求每个请求在物理显存中连续，而是让 kernel 支持一次轻量级地址翻译。用少量寻址开销换取更高显存利用率和更灵活的调度。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+box/.style={draw, rounded corners=3pt, minimum width=1.9cm, minimum height=0.65cm, align=center},
+page/.style={draw, rounded corners=2pt, minimum width=0.68cm, minimum height=0.46cm, align=center},
+arrow/.style={-{Latex[length=2.1mm]}, thick}
+]
+
+```
+\node[font=\bfseries] at (0,3.25) {操作系统分页与 PagedAttention 的结构类比};
+
+% OS side
+\node[font=\bfseries] at (-3.7,2.45) {OS Paging};
+\foreach \i/\x in {0/-5.0,1/-4.25,2/-3.5,3/-2.75} {
+  \node[page, fill=blue!10] (vp\i) at (\x,1.75) {VP\i};
+}
+\node[box, fill=orange!14] (pt) at (-3.85,0.75) {Page Table};
+\foreach \i/\x in {0/-5.0,1/-4.25,2/-3.5,3/-2.75} {
+  \node[page, fill=green!10] (pf\i) at (\x,-0.35) {PF\i};
+}
+\foreach \i in {0,1,2,3} {
+  \draw[arrow] (vp\i) -- (pt);
+  \draw[arrow] (pt) -- (pf\i);
+}
+
+% PA side
+\node[font=\bfseries] at (3.7,2.45) {PagedAttention};
+\foreach \i/\x in {0/2.35,1/3.1,2/3.85,3/4.6} {
+  \node[page, fill=blue!10] (lb\i) at (\x,1.75) {LB\i};
+}
+\node[box, fill=orange!14] (bt) at (3.5,0.75) {Block Table};
+\foreach \i/\x/\pid in {0/2.35/7,1/3.1/2,2/3.85/9,3/4.6/5} {
+  \node[page, fill=green!10] (pb\i) at (\x,-0.35) {PB\pid};
+}
+\foreach \i in {0,1,2,3} {
+  \draw[arrow] (lb\i) -- (bt);
+  \draw[arrow] (bt) -- (pb\i);
+}
+
+\draw[dashed, thick] (0,-0.9) -- (0,2.7);
+
+\node[align=left, text width=10.5cm] at (0,-1.95) {
+  请求逻辑上看到连续 token positions，但物理 KV blocks 可以分散存放。
+  block table 扮演页表角色，把逻辑位置映射到物理显存地址。
+};
+```
+
+\end{tikzpicture}
+\caption{操作系统分页与 PagedAttention 的类比}
+\label{fig:os-paging-vs-pagedattention}
+\end{figure}
+
+\subsection{logical block 与 physical block}
+\label{subsec:logical-block-and-physical-block}
+
+设 block size 为：
+
+[
+B_{\mathrm{blk}}.
+]
+
+请求的逻辑 token 位置 $s$ 可以分解为：
+
+[
+b_{\mathrm{logical}}
+====================
+
+\left\lfloor
+\frac{s}{B_{\mathrm{blk}}}
+\right\rfloor,
+]
+[
+o
+=
+
+s\bmod B_{\mathrm{blk}}.
+]
+
+其中 $b_{\mathrm{logical}}$ 是 logical block id，$o$ 是 block 内 offset。
+
+Block table 给出：
+
+[
+b_{\mathrm{physical}}
+=====================
+
+\operatorname{BlockTable}[r,b_{\mathrm{logical}}],
+]
+
+其中 $r$ 是 request id 或 sequence id。
+
+最终物理地址可以抽象为：
+
+[
+\operatorname{addr}
+===================
+
+\operatorname{Base}
++
+b_{\mathrm{physical}}
+\cdot
+\operatorname{BlockStride}
++
+o
+\cdot
+\operatorname{TokenStride}
++
+h
+\cdot
+\operatorname{HeadStride}
++
+d
+\cdot
+\operatorname{DimStride}.
+]
+
+这里 $h$ 是 KV head index，$d$ 是 head dimension index。真实 kernel 会根据具体 layout 优化 stride 和向量化加载。
+
+Logical block 和 physical block 的分离带来三个重要能力：
+
+\begin{itemize}
+\item \textbf{非连续物理存储}：请求的逻辑 blocks 可以映射到任意 physical blocks；
+\item \textbf{按需增长}：请求需要更多 cache 时，只需追加新的 physical block；
+\item \textbf{共享与复制}：多个请求可以引用相同 physical block，写入时再 copy-on-write。
+\end{itemize}
+
+\subsection{block table}
+\label{subsec:block-table}
+
+Block table 是 PagedAttention 的核心元数据。对于每个请求，它记录每个 logical block 对应的 physical block：
+
+[
+\operatorname{BlockTable}
+\in
+\mathbb{N}^{N_{\mathrm{req}}\times N_{\mathrm{max_blocks}}}.
+]
+
+例如，请求 $r$ 的 block table 为：
+
+[
+[7,\ 2,\ 9,\ 5].
+]
+
+这表示：
+
+[
+\text{logical block }0\rightarrow\text{physical block }7,
+]
+[
+\text{logical block }1\rightarrow\text{physical block }2,
+]
+[
+\text{logical block }2\rightarrow\text{physical block }9,
+]
+[
+\text{logical block }3\rightarrow\text{physical block }5.
+]
+
+请求逻辑序列仍然是连续的，但 physical blocks 可以任意分散。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+lb/.style={draw, rounded corners=2pt, minimum width=0.85cm, minimum height=0.48cm, align=center, fill=blue!10},
+pb/.style={draw, rounded corners=2pt, minimum width=0.85cm, minimum height=0.48cm, align=center, fill=green!10},
+table/.style={draw, rounded corners=3pt, minimum width=2.5cm, minimum height=1.3cm, align=center, fill=orange!14},
+arrow/.style={-{Latex[length=2.1mm]}, thick}
+]
+
+```
+\node[font=\bfseries] at (0,3.25) {PagedAttention block table 映射};
+
+\foreach \i/\x in {0/-5.0,1/-4.0,2/-3.0,3/-2.0} {
+  \node[lb] (lb\i) at (\x,1.65) {LB \i};
+}
+
+\node[table] (bt) at (-3.5,0.45) {
+  Block Table\\
+  \begin{tabular}{c|c}
+  LB & PB\\
+  0 & 7\\
+  1 & 2\\
+  2 & 9\\
+  3 & 5
+  \end{tabular}
+};
+
+\foreach \i/\x/\pid in {0/1.2/2,1/2.2/5,2/3.2/7,3/4.2/9} {
+  \node[pb] (pb\pid) at (\x,1.65) {PB \pid};
+}
+
+\foreach \i in {0,1,2,3} {
+  \draw[arrow] (lb\i) -- (bt);
+}
+
+\draw[arrow] (bt) -- (pb7);
+\draw[arrow] (bt) -- (pb2);
+\draw[arrow] (bt) -- (pb9);
+\draw[arrow] (bt) -- (pb5);
+
+\node[align=left, text width=10.4cm] at (0,-1.35) {
+  block table 把请求的逻辑 block 映射到全局 physical block pool 中的任意 block。
+  Attention kernel 根据该表读取逻辑上连续、物理上不连续的 KV Cache。
+};
+```
+
+\end{tikzpicture}
+\caption{PagedAttention 中 logical block 到 physical block 的映射}
+\label{fig:pagedattention-block-table}
+\end{figure}
+
+Block table 的大小通常远小于 KV Cache 本身。若每个 block 存 $B_{\mathrm{blk}}$ 个 token，一个请求长度为 $S$，则 block table 只需要：
+
+[
+\left\lceil\frac{S}{B_{\mathrm{blk}}}\right\rceil
+]
+
+个整数。相比每个 token 的 K/V 向量，metadata 开销很小。
+
+\subsection{attention kernel 如何读取分页 KV}
+\label{subsec:how-attention-kernel-reads-paged-kv}
+
+PagedAttention kernel 的核心是在遍历历史 token 时进行地址翻译。对于当前 query token，attention 需要遍历历史位置：
+
+[
+s=0,1,\ldots,S-1.
+]
+
+对于每个 $s$，kernel 计算：
+
+[
+b=\left\lfloor\frac{s}{B_{\mathrm{blk}}}\right\rfloor,
+\quad
+o=s\bmod B_{\mathrm{blk}}.
+]
+
+然后从 block table 读取 physical block id：
+
+[
+p=\operatorname{BlockTable}[r,b].
+]
+
+再从物理 KV Cache 中读取：
+
+[
+\mat{K}*{phys}[p,o,h,:],
+\quad
+\mat{V}*{phys}[p,o,h,:].
+]
+
+因此，PagedAttention 的读取路径可以写成：
+
+[
+s
+\rightarrow
+(b,o)
+\rightarrow
+p
+\rightarrow
+\operatorname{addr}(p,o,h,d)
+\rightarrow
+K/V.
+]
+
+下面是一个高度简化的伪代码，用于说明逻辑，不代表高性能 kernel。
+
+\begin{lstlisting}[language=Python,caption={PagedAttention 中根据 block table 读取 KV 的伪代码},label={lst:pagedattention-read-kv-pseudocode}]
+def read_kv_for_position(
+request_id,
+position,
+kv_head,
+block_size,
+block_table,
+k_blocks,
+v_blocks,
+):
+logical_block = position // block_size
+offset = position % block_size
+
+```
+physical_block = block_table[request_id][logical_block]
+
+# k_blocks/v_blocks:
+# [num_physical_blocks, num_kv_heads, block_size, head_dim]
+k = k_blocks[physical_block, kv_head, offset, :]
+v = v_blocks[physical_block, kv_head, offset, :]
+
+return k, v
+```
+
+\end{lstlisting}
+
+真正的 PagedAttention kernel 需要处理：
+
+\begin{itemize}
+\item 多个 requests；
+\item 多个 heads；
+\item 每个请求不同 context length；
+\item 向量化加载 K/V；
+\item block 内连续访存；
+\item softmax 的数值稳定；
+\item warp/block 级并行；
+\item shared memory 与 register 使用；
+\item GQA/MQA head mapping；
+\item causal mask；
+\item 最后一个 block 未满的边界；
+\item tensor parallel 下的 head shard。
+\end{itemize}
+
+PagedAttention 的挑战在于：它必须在引入 block table 间接寻址的同时，保持 attention kernel 的访存和并行效率。若地址翻译开销过大，显存节省可能被 kernel 开销抵消。因此 block size、layout、kernel tiling 和调度策略必须共同设计。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+box/.style={draw, rounded corners=3pt, minimum width=1.75cm, minimum height=0.65cm, align=center},
+arrow/.style={-{Latex[length=2.1mm]}, thick}
+]
+
+```
+\node[font=\bfseries] at (0,3.25) {PagedAttention kernel 的 KV 读取路径};
+
+\node[box, fill=blue!6] (pos) at (-5.2,1.1) {logical\\position $s$};
+\node[box, fill=orange!14] (split) at (-3.0,1.1) {$s\rightarrow(b,o)$};
+\node[box, fill=green!10] (table) at (-0.75,1.1) {Block\\Table};
+\node[box, fill=yellow!16] (phys) at (1.55,1.1) {physical\\block $p$};
+\node[box, fill=purple!10] (addr) at (3.8,1.1) {KV memory\\address};
+\node[box, fill=red!8] (kv) at (5.85,1.1) {$K,V$};
+
+\draw[arrow] (pos) -- (split);
+\draw[arrow] (split) -- (table);
+\draw[arrow] (table) -- (phys);
+\draw[arrow] (phys) -- (addr);
+\draw[arrow] (addr) -- (kv);
+
+\node[align=left, text width=10.6cm] at (0,-1.0) {
+  PagedAttention 在 attention kernel 内部完成逻辑位置到物理 block 的地址翻译。
+  逻辑序列连续，物理存储可以离散，从而避免大块连续 KV Cache 分配。
+};
+```
+
+\end{tikzpicture}
+\caption{PagedAttention kernel 通过 block table 读取分页 KV}
+\label{fig:pagedattention-kernel-read-path}
+\end{figure}
+
+\subsection{copy-on-write 与共享 block}
+\label{subsec:copy-on-write-shared-blocks}
+
+PagedAttention 也天然支持共享 prefix。多个请求如果共享相同前缀，可以让它们的 block table 指向相同 physical blocks。每个 physical block 维护引用计数：
+
+[
+\operatorname{refcount}(p).
+]
+
+当多个请求共享 block 时：
+
+[
+\operatorname{refcount}(p)>1.
+]
+
+如果某个请求需要写入一个共享 block，而该写入会改变 block 内容，就不能直接原地修改，否则会影响其他请求。此时需要 copy-on-write：
+
+[
+p_{\mathrm{new}}=\operatorname{AllocateBlock}(),
+]
+[
+\operatorname{Copy}(p_{\mathrm{old}},p_{\mathrm{new}}),
+]
+[
+\operatorname{BlockTable}[r,b]\leftarrow p_{\mathrm{new}}.
+]
+
+在 LLM decode 中，通常只会向最后一个 block 追加 token。共享 prefix blocks 大多是只读的；分叉、beam search、parallel sampling 或 speculative decoding 可能会产生共享后再分叉的场景，此时 copy-on-write 很有用。
+
+\begin{lstlisting}[language=Python,caption={Block 引用计数与 copy-on-write 的简化伪代码},label={lst:block-copy-on-write-pseudocode}]
+def ensure_writable_block(request, logical_block_id, block_manager):
+physical_block = request.block_table[logical_block_id]
+
+```
+if block_manager.ref_count[physical_block] == 1:
+    return physical_block
+
+# Copy-on-write.
+new_block = block_manager.allocate_block()
+copy_block(src=physical_block, dst=new_block)
+
+block_manager.ref_count[physical_block] -= 1
+block_manager.ref_count[new_block] = 1
+
+request.block_table[logical_block_id] = new_block
+return new_block
+```
+
+\end{lstlisting}
+
+Copy-on-write 的意义不只是节省显存，也让复杂 decoding 策略更容易实现。例如 beam search 中多个 beams 共享同一个 prompt prefix，直到它们生成不同 suffix。若每个 beam 都复制完整 KV Cache，显存会迅速膨胀；若共享 prefix blocks，只复制分叉后的 blocks，就能显著降低开销。
+
+\section{vLLM 架构}
+\label{sec:vllm-architecture}
+
+vLLM 是围绕高吞吐 LLM serving 设计的推理系统。它的核心思想之一是使用 PagedAttention 管理 KV Cache，并配合 continuous batching、scheduler、worker、block manager 等组件，让在线请求能动态加入、退出和共享 cache。
+
+本节不追逐某个版本的具体代码结构，而从系统架构角度解释一个 vLLM 风格 serving engine 通常如何组织。
+
+\subsection{总体架构}
+\label{subsec:vllm-overall-architecture}
+
+一个 vLLM 风格的 serving 系统可以抽象为以下组件：
+
+\begin{itemize}
+\item \textbf{API Server / Frontend}：接收 HTTP/gRPC/OpenAI-compatible 请求，处理鉴权、限流、请求解析和流式输出；
+\item \textbf{Tokenizer}：将文本转为 token ids，将生成 token 转回文本；
+\item \textbf{Scheduler}：决定每个 iteration 哪些请求运行 prefill，哪些请求运行 decode，哪些请求等待；
+\item \textbf{Block Manager}：管理 KV Cache physical blocks 的分配、释放、引用计数和 block table；
+\item \textbf{Worker / Executor}：在 GPU 上执行模型 forward、PagedAttention kernel、sampling 等；
+\item \textbf{Model Runner}：封装模型权重、attention backend、KV Cache layout 和 CUDA graph 等执行细节；
+\item \textbf{Output Processor}：处理采样、stop condition、流式 token 返回和请求结束逻辑。
+\end{itemize}
+
+它们的关系如下图所示。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+comp/.style={draw, rounded corners=4pt, minimum width=2.05cm, minimum height=0.75cm, align=center},
+gpu/.style={draw, rounded corners=4pt, minimum width=2.15cm, minimum height=0.85cm, align=center, fill=blue!6},
+arrow/.style={-{Latex[length=2.2mm]}, thick}
+]
+
+```
+\node[font=\bfseries] at (0,3.5) {vLLM 风格 Serving 架构};
+
+\node[comp, fill=orange!12] (api) at (-5.2,1.95) {API Server\\Frontend};
+\node[comp, fill=green!10] (tok) at (-2.75,1.95) {Tokenizer};
+\node[comp, fill=yellow!16] (sched) at (-0.25,1.95) {Scheduler};
+\node[comp, fill=purple!10] (bm) at (2.35,1.95) {Block\\Manager};
+\node[gpu] (worker) at (4.95,1.95) {GPU Worker\\Model Runner};
+
+\node[comp, fill=red!8] (out) at (-0.25,0.35) {Output\\Processor};
+\node[comp, fill=blue!8] (kv) at (2.35,0.35) {KV Blocks\\Block Tables};
+\node[gpu] (kernels) at (4.95,0.35) {PagedAttention\\Sampling Kernels};
+
+\draw[arrow] (api) -- (tok);
+\draw[arrow] (tok) -- (sched);
+\draw[arrow] (sched) -- (bm);
+\draw[arrow] (bm) -- (worker);
+\draw[arrow] (worker) -- (kernels);
+\draw[arrow] (bm) -- (kv);
+\draw[arrow] (kv) -- (kernels);
+\draw[arrow] (kernels) -- (out);
+\draw[arrow] (out.west) .. controls (-2.2,0.15) and (-4.6,0.6) .. (api.south);
+
+\node[align=left, text width=10.6cm] at (0,-1.25) {
+  Scheduler 决定每个 iteration 的请求集合；Block Manager 为请求分配 KV blocks 并维护 block table；
+  Worker 在 GPU 上执行模型和 PagedAttention kernel，Output Processor 处理采样结果与流式返回。
+};
+```
+
+\end{tikzpicture}
+\caption{vLLM 风格 serving engine 的核心组件}
+\label{fig:vllm-serving-architecture}
+\end{figure}
+
+\subsection{scheduler}
+\label{subsec:vllm-scheduler}
+
+Scheduler 是 LLM serving 的大脑。它每个 iteration 都要决定：
+
+\begin{itemize}
+\item 哪些新请求可以进入系统；
+\item 哪些请求执行 prefill；
+\item 哪些请求执行 decode；
+\item 哪些请求需要等待；
+\item 哪些请求因为资源不足被延迟；
+\item 哪些请求已经完成，需要释放资源；
+\item 本 iteration 的 token budget 如何分配。
+\end{itemize}
+
+与传统 batch scheduler 不同，LLM scheduler 的基本调度单位不是“整个请求”，而是“本 iteration 的 token”。对于 decode 请求，每个 running request 通常只生成一个 token；对于 prefill 请求，一个 prompt 可能包含很多 token，系统可能一次处理完整 prompt，也可能使用 chunked prefill 将长 prompt 分块处理。
+
+Scheduler 常维护几类队列：
+
+\begin{itemize}
+\item \textbf{waiting queue}：新到达但尚未分配资源的请求；
+\item \textbf{running set}：已经拥有 KV blocks、正在 decode 或 prefill 的请求；
+\item \textbf{finished set}：已完成，需要释放 blocks 并返回结果；
+\item \textbf{paused/swapped set}：资源压力下暂时暂停或迁出的请求。
+\end{itemize}
+
+一个简化调度目标可以写成：
+
+[
+\max
+\quad
+\operatorname{tokens_scheduled}
+]
+
+同时满足：
+
+[
+\operatorname{KVBlocksNeeded}
+\le
+\operatorname{FreeBlocks},
+]
+
+[
+\operatorname{BatchedTokens}
+\le
+T_{\max},
+]
+
+[
+\operatorname{NumSequences}
+\le
+N_{\max}.
+]
+
+其中 $T_{\max}$ 是每 iteration 最大 token budget，$N_{\max}$ 是最大并发序列数。调度器需要在吞吐和延迟之间折中：多塞请求可以提升吞吐，但可能增加单请求延迟；优先短请求可以改善平均延迟，但可能让长请求饥饿；优先 decode 可以降低 TPOT，但可能让新请求 TTFT 变差。
+
+\begin{lstlisting}[language=Python,caption={Iteration-level scheduler 的简化伪代码},label={lst:vllm-scheduler-pseudocode}]
+def schedule_iteration(waiting, running, block_manager, token_budget, max_seqs):
+scheduled_prefills = []
+scheduled_decodes = []
+
+```
+remaining_tokens = token_budget
+remaining_slots = max_seqs - len(running)
+
+# 1. Schedule decode for already running requests.
+for req in list(running):
+    if req.is_finished():
+        continue
+
+    if not block_manager.can_append_slot(req):
+        continue
+
+    scheduled_decodes.append(req)
+    remaining_tokens -= 1
+
+    if remaining_tokens <= 0:
+        break
+
+# 2. Admit new requests if there is budget and KV memory.
+while waiting and remaining_tokens > 0 and remaining_slots > 0:
+    req = waiting[0]
+    prefill_tokens = req.prompt_len
+
+    if prefill_tokens > remaining_tokens:
+        break
+
+    if not block_manager.can_allocate_for_prefill(req):
+        break
+
+    waiting.pop(0)
+    block_manager.allocate_for_prefill(req)
+    running.add(req)
+
+    scheduled_prefills.append(req)
+    remaining_tokens -= prefill_tokens
+    remaining_slots -= 1
+
+return scheduled_prefills, scheduled_decodes
+```
+
+\end{lstlisting}
+
+真实 scheduler 会更复杂。它会考虑 chunked prefill、prefix cache 命中、优先级、超时、beam search、多模态输入、LoRA adapter、speculative decoding、抢占和资源回收。但核心仍然是：在每个 iteration 中，根据 KV Cache 资源和 token budget 选择请求集合。
+
+\subsection{worker}
+\label{subsec:vllm-worker}
+
+Worker 负责在 GPU 上执行实际计算。它通常接收 scheduler 产生的执行计划，包括：
+
+\begin{itemize}
+\item 本次 prefill 的 requests；
+\item 本次 decode 的 requests；
+\item input token ids；
+\item position ids；
+\item slot mapping；
+\item block tables；
+\item sequence lengths；
+\item sampling parameters；
+\item LoRA 或其他 adapter 信息。
+\end{itemize}
+
+Worker 的执行流程可以抽象为：
+
+\begin{enumerate}
+\item 根据调度计划准备输入张量；
+\item 调用模型 forward；
+\item attention kernel 根据 block table 读取 KV Cache；
+\item 将新 token 的 K/V 写入对应 physical blocks；
+\item 计算 logits；
+\item 执行 sampling；
+\item 返回 sampled tokens 和请求状态。
+\end{enumerate}
+
+Worker 的关键性能目标是减少 CPU/GPU 同步、减少小 kernel、减少动态 shape 造成的开销，并尽量让 GPU 一直有足够工作。
+
+在高性能实现中，worker 可能使用 CUDA graph 固化部分执行路径，以减少 launch overhead。但 LLM serving 的动态性很强，batch size、sequence length、请求组合都在变化，CUDA graph 捕获和复用需要做 shape bucketing 或其他工程折中。
+
+\subsection{block manager}
+\label{subsec:vllm-block-manager}
+
+Block Manager 是 PagedAttention 系统中的内存管理器。它维护全局 physical block pool，并为每个请求维护 block table。
+
+Block Manager 的职责包括：
+
+\begin{itemize}
+\item 初始化 GPU KV block pool；
+\item 为 prefill 请求分配足够 blocks；
+\item 为 decode 追加 token 时分配新 block；
+\item 维护 request 到 block table 的映射；
+\item 维护 physical block 引用计数；
+\item 请求结束时释放 blocks；
+\item prefix cache 命中时共享 blocks；
+\item copy-on-write；
+\item 在资源不足时触发 eviction、pause 或拒绝请求。
+\end{itemize}
+
+一个极简 Block Manager 可以写成：
+
+\begin{lstlisting}[language=Python,caption={Block Manager 的简化实现骨架},label={lst:block-manager-skeleton}]
+import math
+from collections import deque
+
+class BlockManager:
+def **init**(self, num_blocks, block_size):
+self.num_blocks = num_blocks
+self.block_size = block_size
+
+```
+    self.free_blocks = deque(range(num_blocks))
+    self.ref_count = [0 for _ in range(num_blocks)]
+
+    # request_id -> list of physical block ids
+    self.block_tables = {}
+
+def num_required_blocks(self, num_tokens):
+    return math.ceil(num_tokens / self.block_size)
+
+def can_allocate(self, num_tokens):
+    return len(self.free_blocks) >= self.num_required_blocks(num_tokens)
+
+def allocate(self, request_id, num_tokens):
+    n = self.num_required_blocks(num_tokens)
+    if len(self.free_blocks) < n:
+        raise RuntimeError("not enough KV blocks")
+
+    blocks = []
+    for _ in range(n):
+        block = self.free_blocks.popleft()
+        self.ref_count[block] = 1
+        blocks.append(block)
+
+    self.block_tables[request_id] = blocks
+    return blocks
+
+def append_slot(self, request_id, current_length):
+    blocks = self.block_tables[request_id]
+
+    # Allocate a new block when current length reaches a block boundary.
+    if current_length % self.block_size == 0:
+        if not self.free_blocks:
+            raise RuntimeError("no free block for decode")
+        block = self.free_blocks.popleft()
+        self.ref_count[block] = 1
+        blocks.append(block)
+
+    return blocks
+
+def release(self, request_id):
+    blocks = self.block_tables.pop(request_id, [])
+
+    for block in blocks:
+        self.ref_count[block] -= 1
+        if self.ref_count[block] == 0:
+            self.free_blocks.append(block)
+```
+
+\end{lstlisting}
+
+真实 Block Manager 还要处理共享 prefix、copy-on-write、CPU swap、并发安全、GPU/CPU metadata 同步和调度器交互。它是 serving 系统中最容易影响稳定性和显存利用率的组件之一。
+
+\subsection{continuous batching}
+\label{subsec:vllm-continuous-batching}
+
+Continuous batching 指系统在每个 decode iteration 重新组织 batch，让新请求可以加入，让完成请求可以退出。它与 PagedAttention 是互补关系：
+
+\begin{itemize}
+\item Continuous batching 解决\textbf{请求调度动态性}；
+\item PagedAttention 解决\textbf{动态请求的 KV Cache 内存管理}。
+\end{itemize}
+
+如果没有 PagedAttention，continuous batching 仍然会遇到连续 KV Cache 分配困难：请求加入和退出会导致 batch slot 移动、cache 拷贝、碎片和 over-reservation。PagedAttention 让请求的 cache 独立于 batch slot，只需要更新 block table 和调度 metadata。
+
+一个 iteration-level timeline 如下：
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\scriptsize,
+cell/.style={draw, minimum width=0.7cm, minimum height=0.42cm, align=center},
+decode/.style={fill=blue!12},
+prefill/.style={fill=green!12},
+done/.style={fill=gray!18},
+newreq/.style={fill=orange!14}
+]
+
+```
+\node[font=\bfseries\small] at (0,3.0) {vLLM 风格 Continuous Batching 时间线};
+
+\foreach \t in {0,...,8} {
+  \node at ({-3.6+0.78*\t},2.35) {iter \t};
+}
+
+\foreach \r/\y in {A/1.65,B/1.1,C/0.55,D/0.0} {
+  \node at (-4.45,\y) {Req \r};
+}
+
+% A decode then finish
+\foreach \t in {0,1,2,3} {
+  \node[cell, decode] at ({-3.6+0.78*\t},1.65) {D};
+}
+\foreach \t in {4,...,8} {
+  \node[cell, done] at ({-3.6+0.78*\t},1.65) {};
+}
+
+% B long decode
+\foreach \t in {0,...,8} {
+  \node[cell, decode] at ({-3.6+0.78*\t},1.1) {D};
+}
+
+% C joins at 2
+\foreach \t in {0,1} {
+  \node[cell, done] at ({-3.6+0.78*\t},0.55) {};
+}
+\node[cell, prefill] at ({-3.6+0.78*2},0.55) {P};
+\foreach \t in {3,...,8} {
+  \node[cell, decode] at ({-3.6+0.78*\t},0.55) {D};
+}
+
+% D joins at 5
+\foreach \t in {0,...,4} {
+  \node[cell, done] at ({-3.6+0.78*\t},0.0) {};
+}
+\node[cell, prefill] at ({-3.6+0.78*5},0.0) {P};
+\foreach \t in {6,...,8} {
+  \node[cell, decode] at ({-3.6+0.78*\t},0.0) {D};
+}
+
+\node[draw, rounded corners=2pt, fill=green!12, minimum width=0.5cm, minimum height=0.32cm] at (3.8,1.5) {};
+\node[anchor=west] at (4.15,1.5) {Prefill};
+\node[draw, rounded corners=2pt, fill=blue!12, minimum width=0.5cm, minimum height=0.32cm] at (3.8,1.0) {};
+\node[anchor=west] at (4.15,1.0) {Decode};
+\node[draw, rounded corners=2pt, fill=gray!18, minimum width=0.5cm, minimum height=0.32cm] at (3.8,0.5) {};
+\node[anchor=west] at (4.15,0.5) {inactive};
+
+\node[align=left, text width=10.5cm, font=\small] at (0,-1.35) {
+  每个 iteration 都可以重新组成 batch。已完成请求释放 blocks，新请求分配 blocks 后加入。
+  PagedAttention 让这种动态调度不需要移动已有请求的 KV Cache。
+};
+```
+
+\end{tikzpicture}
+\caption{Continuous batching 中请求动态加入和退出}
+\label{fig:vllm-continuous-batching-timeline}
+\end{figure}
+
+图中 P 表示 prefill，D 表示 decode。Req C 和 Req D 在不同 iteration 加入；Req A 结束后释放资源；Req B 持续 decode。每个 iteration 的实际 batch 都不同。
+
+\subsection{prefix caching 与 speculative decoding}
+\label{subsec:vllm-prefix-caching-speculative-decoding}
+
+Prefix caching 与 PagedAttention 结合得很自然，因为共享 prefix 可以通过共享 physical blocks 实现。多个请求的 block table 前缀指向相同 blocks，refcount 增加即可。只有当请求在共享 prefix 后继续生成自己的 suffix 时，才分配新的 blocks。
+
+Speculative decoding 则引入另一类 cache 管理问题。它通常包含 draft model 和 target model：draft model 先快速生成多个候选 token，target model 验证这些 token。若候选 token 被接受，则可以一次提交多个 token；若被拒绝，需要回滚到某个位置。
+
+从 KV Cache 管理角度看，speculative decoding 需要处理：
+
+\begin{itemize}
+\item 草稿 token 的临时 KV；
+\item 被接受 token 的 KV 提交；
+\item 被拒绝 token 的 KV 回滚；
+\item draft 和 target 的 cache 是否分开；
+\item 多 token 提交时 block table 的更新；
+\item 回滚时释放未提交 blocks。
+\end{itemize}
+
+Paged block 管理对这些场景有帮助，因为未提交 token 可能只占用少量 blocks；回滚时释放这些 blocks 即可，而不需要移动连续大 cache。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+block/.style={draw, rounded corners=2pt, minimum width=0.55cm, minimum height=0.38cm, align=center},
+arrow/.style={-{Latex[length=2.0mm]}, thick}
+]
+
+```
+\node[font=\bfseries] at (0,3.15) {Speculative Decoding 中的提交与回滚};
+
+\foreach \i/\x in {0/-4.0,1/-3.4,2/-2.8,3/-2.2} {
+  \node[block, fill=green!12] (c\i) at (\x,1.4) {$c$};
+}
+\node[anchor=east] at (-4.5,1.4) {committed};
+
+\foreach \i/\x in {0/-1.2,1/-0.6,2/0.0,3/0.6} {
+  \node[block, fill=orange!14] (d\i) at (\x,1.4) {$d$};
+}
+\node[anchor=south] at (-0.3,1.85) {draft tokens};
+
+\foreach \i/\x in {0/1.8,1/2.4} {
+  \node[block, fill=blue!12] at (\x,1.4) {$a$};
+}
+\foreach \i/\x in {0/3.0,1/3.6} {
+  \node[block, fill=gray!18] at (\x,1.4) {$r$};
+}
+
+\draw[arrow] (0.9,0.9) -- node[below] {verify} (1.55,0.9);
+
+\node[align=center, font=\scriptsize] at (2.1,0.65) {accepted};
+\node[align=center, font=\scriptsize] at (3.35,0.65) {rollback};
+
+\node[align=left, text width=10.5cm] at (0,-0.95) {
+  Speculative decoding 会产生临时 token。验证通过的 token 提交到正式 KV Cache；
+  未通过的 token 对应 blocks 需要释放或回滚。分页式 block 管理让这种操作更自然。
+};
+```
+
+\end{tikzpicture}
+\caption{Speculative decoding 中 KV blocks 的提交与回滚}
+\label{fig:speculative-decoding-kv-commit-rollback}
+\end{figure}
+
+\section{PagedAttention 的性能收益}
+\label{sec:pagedattention-performance-benefits}
+
+PagedAttention 的收益不能简单理解为“attention 算法更少 FLOPs”。它的主要价值在于\textbf{提高 KV Cache 显存利用率}，从而允许更多请求同时运行，并使 continuous batching 更有效。吞吐提升往往来自更高并发、更低内存浪费和更好的调度，而不是单个 attention step 的数学计算减少。
+
+\subsection{显存利用率提升}
+\label{subsec:pagedattention-memory-utilization}
+
+连续分配中，每个请求分配 $S_{\max}$ token slots：
+
+[
+A_{\mathrm{contiguous},i}=S_{\max}.
+]
+
+PagedAttention 中，每个请求按 block 分配：
+
+[
+A_{\mathrm{paged},i}
+====================
+
+B_{\mathrm{blk}}
+\left\lceil
+\frac{S_i}{B_{\mathrm{blk}}}
+\right\rceil.
+]
+
+总利用率分别为：
+
+[
+U_{\mathrm{contiguous}}
+=======================
+
+\frac{\sum_i S_i}
+{\sum_i S_{\max}},
+]
+
+[
+U_{\mathrm{paged}}
+==================
+
+\frac{\sum_i S_i}
+{\sum_i B_{\mathrm{blk}}
+\left\lceil
+\frac{S_i}{B_{\mathrm{blk}}}
+\right\rceil}.
+]
+
+当 $B_{\mathrm{blk}}\ll S_{\max}$ 时，PagedAttention 的利用率通常显著更高。
+
+下面用一个简单例子说明。假设 block size 为 $16$，请求长度为：
+
+[
+[128,\ 256,\ 512,\ 2048,\ 4096].
+]
+
+PagedAttention 分配 slots 为：
+
+[
+[128,\ 256,\ 512,\ 2048,\ 4096],
+]
+
+因为这些长度恰好是 16 的倍数，利用率接近 $100%$。若长度为：
+
+[
+[130,\ 257,\ 519,\ 2050,\ 4097],
+]
+
+则分配 slots 为：
+
+[
+[144,\ 272,\ 528,\ 2064,\ 4112].
+]
+
+总使用为：
+
+[
+7053.
+]
+
+总分配为：
+
+[
+7120.
+]
+
+利用率为：
+
+[
+\frac{7053}{7120}\approx 99.1%.
+]
+
+相比连续最大长度预留的约 $34%$，差异非常大。当然真实系统中还有 metadata、block table、alignment 和其他 buffer，但核心趋势成立。
+
+\begin{table}[H]
+\centering
+\small
+\caption{连续预留与 PagedAttention 分配 token slots 对比}
+\label{tab:contiguous-vs-paged-slots}
+\begin{tabular}{rrrrr}
+\toprule
+\textbf{请求} & \textbf{实际长度} & \textbf{连续预留} & \textbf{Paged block size 16} & \textbf{Paged 浪费} \
+\midrule
+1 & 130 & 4096 & 144 & 14 \
+2 & 257 & 4096 & 272 & 15 \
+3 & 519 & 4096 & 528 & 9 \
+4 & 2050 & 4096 & 2064 & 14 \
+5 & 4097 & 4096 & 4112 & 15 \
+\bottomrule
+\end{tabular}
+\end{table}
+
+表中第 5 个请求超过了 $4096$，说明连续预留若固定为 $4096$ 甚至无法容纳；若把 $S_{\max}$ 提高到更大，短请求浪费会更严重。Paged allocation 则可以随请求增长追加 blocks。
+
+\subsection{吞吐提升}
+\label{subsec:pagedattention-throughput-improvement}
+
+PagedAttention 提升吞吐的核心路径可以写成：
+
+[
+\text{更高 KV 利用率}
+\rightarrow
+\text{同样显存容纳更多请求}
+\rightarrow
+\text{decode batch 更大}
+\rightarrow
+\text{GPU 利用率更高}
+\rightarrow
+\text{tokens/s 提升}.
+]
+
+Decode 阶段每个请求每次只生成一个 token。如果 batch 太小，GEMM 和 attention kernel 难以充分利用 GPU。通过降低 KV Cache 浪费，系统可以保留更多 running requests，从而提高 decode batch size。
+
+但吞吐提升不是无限的。Decode batch 变大后，KV Cache 读取量也增加。最终系统可能受 HBM 带宽、attention kernel、sampling、CPU scheduler 或网络输出限制。PagedAttention 解决的是 KV Cache 分配和调度瓶颈，不会消除 decode attention 本身随上下文长度增长的读取成本。
+
+可以把单 GPU serving 吞吐粗略看作：
+
+[
+\operatorname{Throughput}
+\approx
+\frac{
+\operatorname{ActiveRequests}
+}
+{
+T_{\mathrm{iteration}}
+}.
+]
+
+PagedAttention 增加的是可同时活跃的请求数，但 $T_{\mathrm{iteration}}$ 也可能随着 batch 和上下文增长而上升。实际收益取决于请求长度分布、模型大小、GPU 显存、block size、kernel 实现和 scheduler 策略。
+
+\subsection{长短请求混部}
+\label{subsec:mixed-long-short-requests}
+
+长短请求混部是在线 serving 的常态。PagedAttention 对混部尤其重要，因为它避免了短请求被长请求的最大长度预留拖累。
+
+在连续分配中，如果 batch 内允许一个长请求达到 $S_{\max}=32768$，那么短请求也可能被迫预留接近这个上限。这样会严重降低短请求并发能力。
+
+在 paged allocation 中，短请求只分配少量 blocks；长请求随着生成或 prefill 逐步占用更多 blocks。两类请求可以更自然地共存。
+
+这对实际服务有几个影响：
+
+\begin{itemize}
+\item 短请求不会因为系统支持长上下文而付出巨大显存预留；
+\item 长请求不会要求一开始就占用所有最大上下文 cache；
+\item 请求结束后 blocks 可立即回收；
+\item scheduler 可以根据剩余 blocks 做 admission control；
+\item prefix cache 可让多个长请求共享共同前缀；
+\item chunked prefill 可减少超长 prompt 对 decode 的阻塞。
+\end{itemize}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+cell/.style={draw, minimum width=0.35cm, minimum height=0.32cm},
+long/.style={fill=green!12},
+short/.style={fill=blue!12},
+free/.style={fill=gray!16}
+]
+
+```
+\node[font=\bfseries] at (0,3.0) {PagedAttention 支持长短请求混部};
+
+\node[anchor=east] at (-4.8,1.55) {Short reqs};
+\foreach \r/\y/\len in {1/1.75/3,2/1.25/2,3/0.75/4} {
+  \foreach \i in {0,...,5} {
+    \ifnum\i<\len
+      \node[cell, short] at ({-4.2+0.38*\i},\y) {};
+    \else
+      \node[cell, free] at ({-4.2+0.38*\i},\y) {};
+    \fi
+  }
+}
+
+\node[anchor=east] at (0.5,1.25) {Long req};
+\foreach \i in {0,...,17} {
+  \node[cell, long] at ({1.0+0.38*\i},1.25) {};
+}
+
+\node[align=left, text width=10.4cm] at (0,-0.8) {
+  短请求只占用少量 blocks；长请求占用更多 blocks。
+  二者不需要按同一个最大长度预留，因此显存利用率更高。
+};
+```
+
+\end{tikzpicture}
+\caption{长短请求在 paged KV Cache 中自然共存}
+\label{fig:mixed-long-short-requests-paged-kv}
+\end{figure}
+
+\subsection{trade-off 与适用边界}
+\label{subsec:pagedattention-tradeoffs-boundaries}
+
+PagedAttention 不是免费的。它用间接寻址和更复杂的内存管理换取更高显存利用率。主要 trade-off 包括：
+
+\begin{itemize}
+\item \textbf{地址翻译开销}：kernel 需要通过 block table 找到 physical block；
+\item \textbf{metadata 开销}：需要维护 block table、refcount、request state；
+\item \textbf{kernel 复杂度}：attention 读取不再是简单连续地址；
+\item \textbf{block size 选择困难}：太大浪费多，太小 metadata 和寻址开销大；
+\item \textbf{最后 block 仍有碎片}：内部碎片上界为 block size；
+\item \textbf{prefill 长 prompt 仍然昂贵}：PagedAttention 不改变 $S^2$ prefill attention 成本；
+\item \textbf{decode 长上下文仍然 memory-bound}：它不消除读取历史 KV 的线性成本；
+\item \textbf{多 GPU 下更复杂}：TP/PP、prefix cache、block table 同步需要额外设计。
+\end{itemize}
+
+Block size 是一个典型权衡。设 block size 为 $B_{\mathrm{blk}}$。较大的 block size：
+
+\begin{itemize}
+\item block table 更小；
+\item kernel 内 block 处理更规整；
+\item metadata 更少；
+\item 但最后 block 内部碎片更大。
+\end{itemize}
+
+较小的 block size：
+
+\begin{itemize}
+\item 内部碎片更小；
+\item 按需增长更精细；
+\item 但 block table 更大；
+\item 地址翻译更多；
+\item kernel 可能更难高效向量化。
+\end{itemize}
+
+因此 PagedAttention 适合动态在线 serving、请求长度差异大、高并发、KV Cache 显存紧张的场景。对于离线批处理、请求长度固定、显存充足或 kernel 极端追求连续访存的场景，简单连续布局可能也有竞争力。
+
+\section{PagedAttention 的工程实现细节}
+\label{sec:pagedattention-engineering-details}
+
+为了让本章更贴近工程实践，本节进一步展开 PagedAttention 落地时的几个关键问题：block size、物理内存布局、slot mapping、prefill 写入、decode 追加、以及与采样策略的交互。
+
+\subsection{block size 选择}
+\label{subsec:block-size-choice}
+
+Block size 是 PagedAttention 的核心超参数之一。它决定了每个 physical block 能存多少 token 的 K/V。设 block size 为 $B_{\mathrm{blk}}$，每个 token 的 KV Cache 大小为：
+
+[
+M_{\mathrm{token}}
+==================
+
+2
+\cdot
+L
+\cdot
+n_{kv}
+\cdot
+d_h
+\cdot
+s_{\mathrm{dtype}}.
+]
+
+如果每个 block 覆盖一个请求的 $B_{\mathrm{blk}}$ 个 token，则每个请求级 block 的 KV 大小为：
+
+[
+M_{\mathrm{block}}
+==================
+
+B_{\mathrm{blk}}
+\cdot
+M_{\mathrm{token}}.
+]
+
+实际系统中，物理 KV block 可能按 layer、head 或 worker 内部 layout 切分，因此实现细节会不同。但从逻辑上看，block size 越大，单次分配粒度越粗。
+
+选择 block size 时需要同时考虑：
+
+\begin{itemize}
+\item 平均请求长度；
+\item 最后 block 内部碎片；
+\item block table metadata 大小；
+\item attention kernel block 内连续读取效率；
+\item GPU memory alignment；
+\item prefix sharing 粒度；
+\item copy-on-write 粒度；
+\item 调度器分配和释放开销。
+\end{itemize}
+
+一个简单的期望碎片估算是：如果请求长度对 block size 的余数近似均匀分布，则每个请求最后 block 的平均浪费约为：
+
+[
+\mathbb{E}[W]
+\approx
+\frac{B_{\mathrm{blk}}-1}{2}.
+]
+
+因此 block size 从 $16$ 增加到 $32$，平均每请求浪费 token slots 约增加一倍。但如果 block size 太小，kernel 每次处理的连续 token 过少，metadata 和地址翻译开销上升。
+
+\subsection{physical block layout}
+\label{subsec:physical-block-layout}
+
+Paged KV Cache 的物理 layout 需要服务 attention kernel。一个可能的 layout 是：
+
+[
+\mat{K}*{blocks}
+\in
+\mathbb{R}^{
+N*{\mathrm{blocks}}
+\times
+n_{kv}
+\times
+B_{\mathrm{blk}}
+\times
+d_h
+}.
+]
+
+V Cache 同理。也可以把 layer 维放在外面：
+
+[
+[L,N_{\mathrm{blocks}},n_{kv},B_{\mathrm{blk}},d_h].
+]
+
+或者为每层单独维护 block pool。不同 layout 的取舍包括：
+
+\begin{itemize}
+\item 每层独立 block pool 管理简单，但 metadata 多；
+\item 所有层合并的 block 可以减少请求级 metadata，但 block 更大；
+\item head 维连续有利于某些向量化加载；
+\item block 内 token 维连续有利于顺序扫描历史位置；
+\item head_dim 维连续通常有利于 vectorized load。
+\end{itemize}
+
+高性能 kernel 通常会对 layout 做非常具体的优化。本书不展开某个实现的所有细节，但读者应记住：PagedAttention 的设计不是只有 block table，\textbf{block table、memory layout 和 attention kernel 必须一起设计}。
+
+\subsection{slot mapping}
+\label{subsec:slot-mapping}
+
+在每个 iteration 中，scheduler 选出一批要执行的 tokens。每个 token 的新 K/V 需要写入某个 physical block 的某个 offset。为了让 GPU kernel 知道写到哪里，系统通常会构造 slot mapping。
+
+对一个 token，slot mapping 记录：
+
+[
+\text{token}
+\rightarrow
+(\text{physical block id},\ \text{offset}).
+]
+
+对于 decode，每个请求通常追加一个 token。设请求当前长度为 $S_i$，新 token 位置为 $S_i$。则：
+
+[
+b=\left\lfloor\frac{S_i}{B_{\mathrm{blk}}}\right\rfloor,
+\quad
+o=S_i\bmod B_{\mathrm{blk}}.
+]
+
+若 $o=0$，说明需要申请新 block。之后从 block table 得到 physical block id：
+
+[
+p=\operatorname{BlockTable}[i,b].
+]
+
+Slot mapping 为：
+
+[
+(p,o).
+]
+
+对于 prefill，一个请求一次写入多个 token。系统可以为这些 token 批量生成 slot mapping。若 prompt 跨多个 blocks，slot mapping 会跨越多个 physical blocks。
+
+\begin{lstlisting}[language=Python,caption={为 decode token 构造 slot mapping 的简化伪代码},label={lst:decode-slot-mapping-pseudocode}]
+def build_decode_slot_mapping(requests, block_manager, block_size):
+slot_mapping = []
+
+```
+for req in requests:
+    pos = req.current_length
+    logical_block = pos // block_size
+    offset = pos % block_size
+
+    if offset == 0:
+        block_manager.append_slot(req.request_id, pos)
+
+    physical_block = req.block_table[logical_block]
+    slot_mapping.append((physical_block, offset))
+
+return slot_mapping
+```
+
+\end{lstlisting}
+
+Slot mapping 是连接 scheduler、block manager 和 model runner 的关键桥梁。Scheduler 只知道请求要生成 token；Block Manager 知道请求的 blocks；Model Runner 需要具体写入地址。Slot mapping 把这三者连接起来。
+
+\subsection{prefill 与 decode 的不同路径}
+\label{subsec:prefill-and-decode-different-paths}
+
+Prefill 和 decode 对 PagedAttention 的要求不同。
+
+Prefill 中，一个请求可能一次写入很多 token。系统需要：
+
+\begin{itemize}
+\item 为 prompt 长度申请足够 blocks；
+\item 批量写入 K/V；
+\item 对 prompt 内部执行 causal attention；
+\item 生成最后位置 logits；
+\item 处理长 prompt 的 chunking。
+\end{itemize}
+
+Decode 中，每个请求每 iteration 通常只写入一个 token。系统需要：
+
+\begin{itemize}
+\item 检查当前 block 是否有空位；
+\item 必要时申请新 block；
+\item 读取完整历史 blocks；
+\item 写入新 token K/V；
+\item 执行 sampling；
+\item 更新请求长度和 stop 状态。
+\end{itemize}
+
+因此，serving engine 可能为 prefill 和 decode 使用不同的 attention kernel 或不同调度策略。Prefill 更接近大矩阵计算，decode 更受 KV 读取和 batch 组织影响。PagedAttention 主要解决两者共同的 KV Cache 存储问题，但它在 decode 阶段的收益往往更直接，因为 decode 请求持续增长、加入和退出最频繁。
+
+\section{本章小结}
+\label{sec:chapter13-summary}
+
+本章系统介绍了 PagedAttention 与 vLLM 风格 serving 架构。核心思想可以概括为：\textbf{把 KV Cache 从连续大块分配改造成分页式 block 管理，并让 attention kernel 通过 block table 读取逻辑连续、物理离散的 K/V。}
+
+\begin{itemize}
+\item \textbf{LLM serving 中的 KV Cache 是动态内存管理问题}：请求长度不同、到达时间不同、结束时间不同，cache 会不断增长和释放。
+\item \textbf{连续 KV Cache 分配会产生 over-reservation}：如果每个请求都按最大上下文长度预留，短请求会浪费大量显存。
+\item \textbf{Block-based allocation 将浪费限制在最后一个 block}：若 block size 为 $B_{\mathrm{blk}}$，每个请求最多浪费 $B_{\mathrm{blk}}-1$ 个 token slots。
+\item \textbf{PagedAttention 类似操作系统分页}：请求逻辑 token 序列对应 logical blocks，物理 KV Cache 对应 physical blocks，block table 类似 page table。
+\item \textbf{Block table 是核心元数据}：它记录每个请求的 logical block 到 physical block 的映射，使请求无需连续显存。
+\item \textbf{Attention kernel 需要通过 block table 读取 KV}：逻辑位置 $s$ 被分解为 logical block id 和 offset，再映射到 physical block 地址。
+\item \textbf{共享 prefix 可以通过共享 physical blocks 实现}：多个请求的 block table 指向相同 prefix blocks，并使用 refcount 管理生命周期。
+\item \textbf{Copy-on-write 支持分叉场景}：beam search、parallel sampling、speculative decoding 等场景可以共享前缀，只在写入分叉时复制 block。
+\item \textbf{vLLM 风格架构由 scheduler、block manager、worker、model runner 等组件组成}：scheduler 负责 iteration-level 调度，block manager 负责 KV blocks，worker 在 GPU 上执行模型。
+\item \textbf{Continuous batching 与 PagedAttention 相互配合}：前者让请求动态加入和退出，后者让这种动态调度不需要移动连续 KV Cache。
+\item \textbf{PagedAttention 的吞吐收益主要来自更高显存利用率和更大有效并发}，而不是改变 attention 的数学 FLOPs。
+\item \textbf{PagedAttention 也有 trade-off}：block table 间接寻址、metadata 管理、kernel 复杂度和 block size 选择都需要工程权衡。
+\item \textbf{Prefill 与 decode 的需求不同}：prefill 更偏大块计算和批量写入，decode 更偏动态追加、历史 KV 读取和调度效率。
+\end{itemize}
+
+下一章将进入 FlashAttention。PagedAttention 解决的是 KV Cache 的内存管理和动态调度问题；FlashAttention 解决的是 Attention 计算中的 IO 瓶颈。我们会从标准 Attention 需要物化 $S\times S$ attention matrix 的问题出发，推导 online softmax，理解为什么把 Q/K/V 分块搬入 SRAM 计算可以显著减少 HBM 读写，并最终形成高性能 fused attention kernel。

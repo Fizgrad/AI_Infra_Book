@@ -1,0 +1,1038 @@
+\chapter{大语言模型发展史与主流范式}
+\label{chap:llm-history}
+
+\section{语言模型的任务定义}
+\label{sec:language-modeling-task-definition}
+
+上一章我们从结构层面拆解了 Transformer：Self-Attention、Multi-Head Attention、FFN、位置编码、Pre-Norm、RMSNorm、RoPE、GQA 等组件共同构成了现代 Decoder-only LLM 的主体。但仅仅理解结构还不够。一个模型为什么要做 next-token prediction？为什么 GPT 系列把“预训练 + 提示”变成主流范式？为什么后来的模型又需要 instruction tuning、RLHF、DPO 或其他偏好优化？为什么开源模型生态对 AI Infrastructure 产生如此大的推动？
+
+本章要回答的是：\textbf{大语言模型作为一种工程系统，是如何从统计语言模型、神经语言模型、Transformer 预训练，逐步演化到今天的基础模型、聊天模型、推理模型和多模态模型的。}
+
+对于 AI Infra 工程师而言，了解模型发展史不是为了背诵年份和名称，而是为了理解工作负载的变化：
+
+\begin{itemize}
+\item 从 N-gram 到神经语言模型，计算从查表统计转向矩阵运算；
+\item 从小模型 fine-tuning 到大模型 prompting，服务方式从离线训练转向在线推理；
+\item 从预训练模型到 Chat Model，训练流水线从单阶段变成多阶段；
+\item 从 dense model 到 MoE，系统瓶颈从单纯矩阵计算扩展到路由、负载均衡和 all-to-all 通信；
+\item 从封闭模型到开源模型，部署形态从 API 调用扩展到私有化训练、微调、量化和本地推理。
+\end{itemize}
+
+本章会沿着模型范式的演进路线展开，并在每个阶段指出它对 AI Infra 的具体影响。
+
+\subsection{N-gram 到神经语言模型}
+\label{subsec:ngram-to-neural-lm}
+
+语言模型的基本任务是估计一个 token 序列出现的概率。给定序列：
+[
+x_1,x_2,\ldots,x_T,
+]
+语言模型希望建模联合概率：
+[
+p(x_1,x_2,\ldots,x_T).
+]
+根据概率链式法则：
+[
+p(x_1,x_2,\ldots,x_T)
+=====================
+
+\prod_{t=1}^{T}
+p(x_t\mid x_1,x_2,\ldots,x_{t-1}).
+]
+
+N-gram 语言模型做了一个强假设：当前 token 只依赖前面有限的 $n-1$ 个 token：
+[
+p(x_t\mid x_{<t})
+\approx
+p(x_t\mid x_{t-n+1},\ldots,x_{t-1}).
+]
+例如 trigram 模型中：
+[
+p(x_t\mid x_{<t})
+\approx
+p(x_t\mid x_{t-2},x_{t-1}).
+]
+
+N-gram 的优点是简单、可解释、训练成本低；缺点也很明显：
+
+\begin{itemize}
+\item \textbf{上下文窗口短}：无法有效建模长距离依赖；
+\item \textbf{稀疏性严重}：许多 token 组合在训练集中从未出现；
+\item \textbf{泛化能力弱}：无法理解语义相似性，例如“猫”和“狗”在统计表中是完全不同的符号；
+\item \textbf{存储成本高}：高阶 N-gram 表会急剧膨胀。
+\end{itemize}
+
+神经语言模型的重要突破，是用连续向量表示 token。每个 token 不再只是离散 id，而是 embedding table 中的一行：
+[
+\mat{E}\in\mathbb{R}^{V\times H}.
+]
+token id $x_t$ 对应向量：
+[
+\vect{e}*t=\mat{E}*{x_t,:}.
+]
+这样，语义相近的 token 可以在向量空间中接近，模型能够更好地泛化。
+
+从系统角度看，这一步把语言建模从离散计数表转化为矩阵乘法、非线性网络和梯度下降。也就是说，语言模型开始成为 GPU 友好的工作负载。Embedding lookup、矩阵乘法、softmax 和反向传播，逐渐取代了传统统计表查询。
+
+\subsection{自回归语言建模}
+\label{subsec:autoregressive-language-modeling}
+
+自回归语言模型是现代 Decoder-only LLM 的核心任务。它按从左到右的方式分解序列概率：
+[
+p(x_1,x_2,\ldots,x_T)
+=====================
+
+\prod_{t=1}^{T}
+p(x_t\mid x_{<t}).
+]
+训练目标是最大化真实序列的对数似然：
+[
+\max_{\theta}
+\sum_{t=1}^{T}
+\log p_{\theta}(x_t\mid x_{<t}).
+]
+等价地，最小化负对数似然：
+[
+\mathcal{L}(\theta)
+===================
+
+*
+
+\sum_{t=1}^{T}
+\log p_{\theta}(x_t\mid x_{<t}).
+]
+
+在 Transformer Decoder 中，训练时可以并行计算所有位置的 logits。给定输入：
+[
+x_1,x_2,\ldots,x_{T-1},
+]
+模型预测：
+[
+x_2,x_3,\ldots,x_T.
+]
+这常被称为 shift-one-token 训练：
+
+[
+\text{input}=[x_1,x_2,\ldots,x_{T-1}],
+]
+[
+\text{label}=[x_2,x_3,\ldots,x_T].
+]
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+token/.style={draw, rounded corners=2pt, minimum width=0.85cm, minimum height=0.5cm, align=center, fill=blue!6},
+label/.style={draw, rounded corners=2pt, minimum width=0.85cm, minimum height=0.5cm, align=center, fill=orange!14},
+arrow/.style={-{Latex[length=2.2mm]}, thick}
+]
+
+```
+\node[font=\bfseries] at (0,2.8) {自回归语言建模：输入与标签右移一位};
+
+\foreach \i/\txt/\x in {1/从/-4.8,2/基础/-3.6,3/到/-2.4,4/深渊/-1.2,5/：/0.0,6/AI/1.2,7/Infra/2.4} {
+  \node[token] (in\i) at (\x,1.2) {\txt};
+}
+
+\foreach \i/\txt/\x in {1/基础/-4.8,2/到/-3.6,3/深渊/-2.4,4/：/-1.2,5/AI/0.0,6/Infra/1.2,7/指南/2.4} {
+  \node[label] (lab\i) at (\x,0.0) {\txt};
+  \draw[arrow] (in\i) -- (lab\i);
+}
+
+\node[align=right] at (-5.95,1.2) {input};
+\node[align=right] at (-5.95,0.0) {label};
+
+\node[align=left, text width=9.8cm] at (0,-1.35) {
+  训练时所有位置的预测可并行计算，但 causal mask 保证每个位置只能使用它之前的上下文。
+  推理时则必须逐 token 生成，并依赖 KV Cache 降低重复计算。
+};
+```
+
+\end{tikzpicture}
+\caption{自回归语言建模中的输入与标签对齐方式}
+\label{fig:autoregressive-shifted-label}
+\end{figure}
+
+自回归建模对 AI Infra 有两个重要影响。第一，训练阶段可以高效并行，因为完整序列一次进入 GPU；第二，推理阶段天然是逐 token 递推，因为生成的 token 会成为下一步输入。这正是 LLM serving 与普通分类模型 serving 的根本差异。
+
+\subsection{Masked Language Modeling}
+\label{subsec:masked-language-modeling}
+
+Masked Language Modeling，简称 MLM，是 BERT 等 Encoder-only 模型采用的经典任务。它不是从左到右预测下一个 token，而是在输入中随机 mask 一部分 token，让模型根据双向上下文恢复它们。
+
+给定序列：
+[
+x_1,x_2,\ldots,x_T,
+]
+随机选择 mask 集合 $\mathcal{M}$，将对应位置替换为特殊 token \texttt{[MASK]}。训练目标是：
+[
+\mathcal{L}_{\mathrm{MLM}}
+==========================
+
+*
+
+\sum_{t\in\mathcal{M}}
+\log p_{\theta}(x_t\mid x_{\setminus \mathcal{M}}).
+]
+
+MLM 的优点是能够使用双向上下文，适合理解类任务，例如文本分类、句子匹配、命名实体识别等。缺点是它不直接对应生成式推理过程。对于需要逐 token 生成的任务，自回归语言模型更自然。
+
+从系统角度看，Encoder-only 模型和 Decoder-only 模型的推理形态不同：
+
+\begin{itemize}
+\item Encoder-only 模型通常一次性编码完整输入，输出分类或 token-level 结果；
+\item Decoder-only 模型需要自回归生成，decode 阶段不断读取和扩展 KV Cache；
+\item Encoder-Decoder 模型在翻译、摘要等任务中仍常见，但大规模通用聊天模型更偏向 Decoder-only。
+\end{itemize}
+
+\subsection{Causal LM 与 Chat LM}
+\label{subsec:causal-lm-and-chat-lm}
+
+Causal Language Model 是基础的自回归模型。它只学习：
+[
+p(x_t\mid x_{<t}).
+]
+它可以生成文本、补全代码、续写故事，但并不天然理解“用户指令”。例如用户输入“请总结下面这段话”，基础 LM 可能继续写类似训练语料中的文本，而不是稳定地执行总结任务。
+
+Chat LM 则是在 Causal LM 的基础上，经过指令微调、偏好优化和安全对齐，使模型更倾向于遵循用户意图。它的输入通常被组织成对话格式：
+
+[
+\texttt{<system>} \quad \text{系统指令}
+]
+[
+\texttt{<user>} \quad \text{用户问题}
+]
+[
+\texttt{<assistant>} \quad \text{模型回答}
+]
+
+从数学上看，Chat LM 仍然是自回归模型，仍然预测下一个 token。但数据分布和训练目标发生了变化：模型不再只是拟合互联网文本，而是拟合“在给定指令和对话上下文下生成有帮助回答”的分布。
+
+这一区分对 Infra 很重要。Base Model 和 Chat Model 的服务模式不同：
+
+\begin{itemize}
+\item Base Model 常用于续写、评测、微调和作为后续训练起点；
+\item Chat Model 常用于在线对话服务，需要安全策略、系统提示、工具调用、上下文管理和多轮对话缓存；
+\item Chat serving 中 prompt 模板、role token、stop token、采样策略都会影响实际输出。
+\end{itemize}
+
+\section{GPT 系列架构演进}
+\label{sec:gpt-family-evolution}
+
+GPT 系列推动了现代 Decoder-only LLM 的主流范式。这里的重点不是逐一复述每个模型细节，而是理解范式变化：从预训练加微调，到规模扩展，再到 few-shot prompting、instruction tuning 和 RLHF。
+
+\subsection{GPT-1：预训练与微调}
+\label{subsec:gpt1-pretrain-finetune}
+
+GPT-1 的重要意义在于确立了“先在大规模无标注文本上预训练，再在下游任务上微调”的路线。这个范式可以写作：
+
+[
+\theta_{\mathrm{pretrain}}
+==========================
+
+\arg\min_{\theta}
+\mathcal{L}*{\mathrm{LM}}(\theta;\mathcal{D}*{\mathrm{text}}),
+]
+然后：
+[
+\theta_{\mathrm{task}}
+======================
+
+\arg\min_{\theta}
+\mathcal{L}*{\mathrm{task}}(\theta;\mathcal{D}*{\mathrm{task}}).
+]
+
+预训练阶段学习通用语言表示，微调阶段适配具体任务。这个思想极大提高了样本效率，因为下游任务不再需要从随机初始化开始训练。
+
+在 Infra 层面，这一阶段的模型规模还远小于今天的 LLM，但已经显露出预训练的工程特点：
+
+\begin{itemize}
+\item 需要大规模文本数据清洗和 tokenization；
+\item 训练任务以长时间 GPU 计算为主；
+\item checkpoint 和 experiment tracking 开始变得重要；
+\item 下游任务微调需要可复用模型权重。
+\end{itemize}
+
+\subsection{GPT-2：规模扩展}
+\label{subsec:gpt2-scaling}
+
+GPT-2 进一步强调规模扩展。模型参数量、训练数据量和训练计算量都显著增加。它展示了一个重要趋势：在相同架构下，扩大模型和数据可以带来更强的生成能力。
+
+这对 AI Infra 的含义非常直接：模型能力开始越来越依赖大规模计算。训练系统不再只是“能跑起来”，而要关注：
+
+\begin{itemize}
+\item 多 GPU 数据并行；
+\item 高吞吐数据加载；
+\item 稳定 checkpoint；
+\item 长时间训练容错；
+\item tokenizer 与数据管线的可复现性；
+\item 日志与监控体系。
+\end{itemize}
+
+GPT-2 时代已经能看到一个趋势：语言模型训练不只是机器学习问题，也开始成为大规模系统工程问题。
+
+\subsection{GPT-3：In-Context Learning}
+\label{subsec:gpt3-in-context-learning}
+
+GPT-3 的关键影响，是让人们看到大模型在无需参数更新的情况下，通过 prompt 中的少量示例完成任务。这被称为 In-Context Learning。
+
+传统 fine-tuning 的形式是：
+[
+\theta'
+=======
+
+\theta-\eta\nabla_{\theta}\mathcal{L}_{\mathrm{task}},
+]
+即通过梯度更新参数适配任务。而 in-context learning 的形式是：
+[
+y
+=
+
+f_{\theta}
+(
+\text{instruction},
+\text{examples},
+x
+),
+]
+参数 $\theta$ 不变，任务信息通过上下文提供。
+
+这带来了使用方式的巨大变化。用户不一定需要训练新模型，而可以通过 prompt engineering、few-shot examples、chain-of-thought 提示、工具调用说明等方式引导模型行为。对于 Infra 来说，这意味着：
+
+\begin{itemize}
+\item 在线推理负载迅速增长；
+\item prompt 长度成为成本因素；
+\item 上下文窗口越长，prefill 成本越高；
+\item 多租户服务需要处理高度动态的请求长度；
+\item 缓存、批处理、限流和计费粒度需要围绕 token 设计。
+\end{itemize}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+block/.style={draw, rounded corners=3pt, minimum width=2.35cm, minimum height=0.78cm, align=center, fill=blue!6},
+example/.style={draw, rounded corners=2pt, minimum width=2.2cm, minimum height=0.55cm, align=center, fill=orange!12},
+arrow/.style={-{Latex[length=2.2mm]}, thick}
+]
+
+```
+\node[font=\bfseries] at (0,3.0) {In-Context Learning：不更新参数，通过上下文描述任务};
+
+\node[example] (inst) at (-4.4,1.55) {Instruction};
+\node[example] (ex1) at (-2.0,1.55) {Example 1};
+\node[example] (ex2) at (0.4,1.55) {Example 2};
+\node[example] (query) at (2.8,1.55) {Query};
+
+\draw[arrow] (inst) -- (ex1);
+\draw[arrow] (ex1) -- (ex2);
+\draw[arrow] (ex2) -- (query);
+
+\node[block, fill=green!8] (model) at (0,0.2) {Frozen LLM\\parameters unchanged};
+
+\draw[arrow] (query.south) .. controls (2.4,0.65) and (1.4,0.2) .. (model.east);
+\draw[arrow] (inst.south) .. controls (-3.2,0.65) and (-1.6,0.2) .. (model.west);
+
+\node[block, fill=purple!10] (out) at (0,-1.25) {Generated Answer};
+\draw[arrow] (model) -- (out);
+
+\node[align=left, text width=10.4cm] at (0,-2.55) {
+  In-context learning 把任务适配从训练时参数更新转移到推理时上下文构造。
+  这使 prompt 长度、prefill 计算和上下文管理成为 serving infra 的核心问题。
+};
+```
+
+\end{tikzpicture}
+\caption{In-Context Learning 的任务适配方式}
+\label{fig:in-context-learning}
+\end{figure}
+
+\subsection{Instruction Tuning}
+\label{subsec:instruction-tuning}
+
+基础语言模型虽然强大，但它的目标只是预测下一个 token。若训练语料中出现问答格式，它可能学会回答；若没有明确格式，它可能只是续写。Instruction Tuning 的目标，是让模型更稳定地遵循自然语言指令。
+
+监督指令微调，简称 SFT，可以写作：
+[
+\mathcal{D}_{\mathrm{SFT}}
+==========================
+
+{
+(p_i,r_i)
+}*{i=1}^{N},
+]
+其中 $p_i$ 是指令或对话 prompt，$r_i$ 是高质量参考回答。训练目标仍然是交叉熵：
+[
+\mathcal{L}*{\mathrm{SFT}}
+==========================
+
+*
+
+\sum_{i}
+\sum_{t}
+\log p_{\theta}(r_{i,t}\mid p_i,r_{i,<t}).
+]
+
+Instruction Tuning 的关键不是改变模型架构，而是改变数据分布。模型学习到：当输入是一条用户指令时，应该输出满足指令的回答，而不是随意续写。
+
+下面给出一个简化的 SFT 数据构造示意：
+
+\begin{lstlisting}[language=Python,caption={监督指令微调 SFT 数据格式示意},label={lst:sft-data-format}]
+def build_chat_sample(system_prompt, user_prompt, assistant_answer, tokenizer):
+text = (
+"<system>\n" + system_prompt + "\n"
+"<user>\n" + user_prompt + "\n"
+"<assistant>\n" + assistant_answer
+)
+
+```
+tokens = tokenizer.encode(text)
+
+# In SFT, loss is often computed only on assistant tokens.
+# Tokens belonging to system/user prompt can be masked out with label = -100.
+labels = build_labels_masking_non_assistant_tokens(tokens)
+
+return {
+    "input_ids": tokens[:-1],
+    "labels": labels[1:],
+}
+```
+
+\end{lstlisting}
+
+SFT 对 Infra 的影响包括：
+
+\begin{itemize}
+\item 训练数据从网页文本转向高质量指令/对话样本；
+\item 训练序列通常具有 role token、模板和 loss mask；
+\item 数据质量比数据规模更敏感；
+\item 微调可使用 LoRA、QLoRA、FSDP、ZeRO 等节省资源；
+\item 多任务混合比例会影响模型行为。
+\end{itemize}
+
+\subsection{RLHF 与对齐训练}
+\label{subsec:rlhf-alignment-training}
+
+RLHF，即 Reinforcement Learning from Human Feedback，是 Chat Model 发展的关键技术之一。它的基本流程通常包含三个阶段：
+
+\begin{enumerate}
+\item \textbf{SFT}：用人工示范回答监督微调基础模型；
+\item \textbf{Reward Model 训练}：收集人类对多个回答的偏好排序，训练奖励模型；
+\item \textbf{RL 优化}：使用 PPO 等强化学习方法，让策略模型生成更符合偏好的回答。
+\end{enumerate}
+
+偏好数据通常形式为：
+[
+(p, r^+, r^-),
+]
+其中 $p$ 是 prompt，$r^+$ 是更受偏好的回答，$r^-$ 是较差回答。Reward Model 训练目标可写为：
+[
+\mathcal{L}_{\mathrm{RM}}
+=========================
+
+*
+
+\log
+\sigma
+\left(
+R_{\phi}(p,r^+)-R_{\phi}(p,r^-)
+\right).
+]
+它鼓励奖励模型给更好回答更高分。
+
+RL 阶段希望最大化奖励，同时避免模型偏离 SFT 模型太远。目标可以抽象为：
+[
+\max_{\theta}
+\mathbb{E}*{r\sim \pi*{\theta}(\cdot\mid p)}
+\left[
+R_{\phi}(p,r)
+-
+\beta
+D_{\mathrm{KL}}
+\left(
+\pi_{\theta}(\cdot\mid p)
+|
+\pi_{\mathrm{ref}}(\cdot\mid p)
+\right)
+\right].
+]
+
+这里的 KL 惩罚用于限制策略模型不要为了追求 reward 而产生过度偏移。RLHF 在工程上比普通 SFT 复杂得多，因为它涉及多个模型、在线生成、奖励打分、KL 控制和强化学习更新。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+stage/.style={draw, rounded corners=3pt, minimum width=2.35cm, minimum height=0.85cm, align=center, fill=blue!6},
+data/.style={draw, rounded corners=2pt, minimum width=2.0cm, minimum height=0.58cm, align=center, fill=orange!12},
+model/.style={draw, rounded corners=3pt, minimum width=2.2cm, minimum height=0.72cm, align=center, fill=green!8},
+arrow/.style={-{Latex[length=2.3mm]}, thick}
+]
+
+```
+\node[font=\bfseries] at (0,3.5) {预训练、SFT、RLHF 三阶段流程};
+
+\node[data] (raw) at (-5.4,2.2) {Raw Text\\Corpus};
+\node[stage] (pretrain) at (-3.0,2.2) {Pretraining\\next-token loss};
+\node[model] (base) at (-0.6,2.2) {Base LM};
+
+\draw[arrow] (raw) -- (pretrain);
+\draw[arrow] (pretrain) -- (base);
+
+\node[data] (demo) at (-5.4,0.75) {Human\\Demos};
+\node[stage] (sft) at (-3.0,0.75) {SFT\\CE loss};
+\node[model] (sftmodel) at (-0.6,0.75) {SFT Model};
+
+\draw[arrow] (demo) -- (sft);
+\draw[arrow] (base) -- (sft);
+\draw[arrow] (sft) -- (sftmodel);
+
+\node[data] (pref) at (-5.4,-0.8) {Preference\\Ranking};
+\node[stage] (rmtrain) at (-3.0,-0.8) {Reward Model\\Training};
+\node[model] (rm) at (-0.6,-0.8) {Reward\\Model};
+
+\draw[arrow] (pref) -- (rmtrain);
+\draw[arrow] (rmtrain) -- (rm);
+
+\node[stage, fill=purple!10, minimum width=2.5cm] (rl) at (2.0,0.0) {RLHF / PPO\\KL-regularized};
+\node[model, fill=yellow!16] (chat) at (4.9,0.0) {Chat Model};
+
+\draw[arrow] (sftmodel) -- (rl);
+\draw[arrow] (rm) -- (rl);
+\draw[arrow] (rl) -- (chat);
+
+\node[align=left, text width=10.3cm] at (0,-2.35) {
+  RLHF 把训练流水线从单一 next-token 预训练扩展为多模型、多阶段系统。
+  它对数据平台、训练调度、在线生成、评测和安全审核都提出更高要求。
+};
+```
+
+\end{tikzpicture}
+\caption{预训练、监督指令微调与 RLHF 的典型流程}
+\label{fig:pretrain-sft-rlhf-pipeline}
+\end{figure}
+
+简化的偏好模型训练伪代码如下：
+
+\begin{lstlisting}[language=Python,caption={Reward Model 偏好训练的简化伪代码},label={lst:reward-model-training}]
+import torch
+import torch.nn.functional as F
+
+def reward_model_loss(reward_model, batch):
+"""
+batch contains:
+prompt_ids
+chosen_response_ids
+rejected_response_ids
+"""
+chosen_input = concat_prompt_response(
+batch["prompt_ids"],
+batch["chosen_response_ids"],
+)
+rejected_input = concat_prompt_response(
+batch["prompt_ids"],
+batch["rejected_response_ids"],
+)
+
+```
+r_chosen = reward_model(chosen_input)      # [batch]
+r_rejected = reward_model(rejected_input)  # [batch]
+
+# Bradley-Terry style pairwise preference loss:
+# maximize log sigmoid(r_chosen - r_rejected)
+loss = -F.logsigmoid(r_chosen - r_rejected).mean()
+return loss
+```
+
+\end{lstlisting}
+
+RLHF 的 Infra 难点包括：
+
+\begin{itemize}
+\item 同时维护 policy model、reference model、reward model、value model；
+\item 生成阶段与训练阶段交替，GPU 利用率不如纯预训练稳定；
+\item PPO batch 中样本长度差异大，padding 和 KV Cache 管理复杂；
+\item reward hacking、KL 爆炸和训练不稳定需要实时监控；
+\item 人类偏好数据采集、审核、版本管理和质量控制成为数据平台问题。
+\end{itemize}
+
+近年来，DPO 等直接偏好优化方法试图简化 RLHF 流程，避免显式训练和在线使用 reward model 或 PPO。无论采用哪种方法，对齐训练都说明了一个事实：LLM 的训练已经不再是单一 loss 的最优化，而是数据、偏好、安全、系统吞吐和评测闭环的综合工程。
+
+\section{开源 LLM 生态}
+\label{sec:open-source-llm-ecosystem}
+
+开源模型生态极大改变了 AI Infra 的实践方式。过去，只有少数组织能够训练和部署大模型；随着 LLaMA、Mistral、Mixtral、Qwen、DeepSeek 等模型族出现，越来越多团队可以在本地或私有云中进行推理部署、领域微调、量化压缩和服务优化。
+
+这里的“开源”需要谨慎理解。有些模型开放权重但不开放训练数据；有些允许商业使用但有附加限制；有些开放代码和权重但不满足传统开源定义。对 AI Infra 工程师而言，核心影响在于：\textbf{模型权重可获得后，训练与推理系统的优化空间被显著打开。}
+
+\subsection{LLaMA 系列}
+\label{subsec:llama-family}
+
+LLaMA 系列推动了开源 LLM 生态的快速发展。它采用现代 Decoder-only Transformer 设计，并在后续版本中逐渐形成如下常见特征：
+
+\begin{itemize}
+\item Pre-Norm 结构；
+\item RMSNorm；
+\item RoPE；
+\item SwiGLU；
+\item GQA 或改进的 attention 变体；
+\item 面向 base model 与 chat model 的不同训练阶段。
+\end{itemize}
+
+LLaMA 对 Infra 的意义非常大。模型权重可下载后，工程团队可以真正进行端到端实验：
+
+\begin{itemize}
+\item 使用 vLLM、TensorRT-LLM、TGI、SGLang 等 serving 框架部署；
+\item 使用 LoRA、QLoRA、FSDP、DeepSpeed 进行微调；
+\item 使用 GPTQ、AWQ、SmoothQuant、FP8/INT8/INT4 等量化方法降低成本；
+\item 在私有数据上构建企业级 RAG、Agent、代码助手和领域模型；
+\item 通过 profiler 分析真实 kernel、KV Cache、batching 和通信瓶颈。
+\end{itemize}
+
+换句话说，LLaMA 系列让大模型从“只能调用 API 的黑盒”变成“可以被系统工程师拆解、优化和部署的基础设施组件”。
+
+\subsection{Mistral / Mixtral}
+\label{subsec:mistral-mixtral}
+
+Mistral 7B 的重要特点之一，是在相对较小参数规模下追求高效率。它采用 GQA 以提升推理效率，并使用滑动窗口注意力来降低长序列成本。滑动窗口注意力的基本思想是：每个 token 不必关注所有历史 token，而只关注最近窗口内的 token。
+
+若窗口大小为 $W$，标准 attention 对每个位置关注 $S$ 个历史位置，复杂度约为：
+[
+O(S^2).
+]
+滑动窗口 attention 则约为：
+[
+O(SW),
+]
+当 $W\ll S$ 时显著降低成本。
+
+Mixtral 则代表了 Sparse Mixture-of-Experts，简称 MoE 的方向。它不是让每个 token 经过同一个 FFN，而是设置多个 expert，并由 router 为每个 token 选择少数 expert。若每层有 $E$ 个 expert，每个 token 选择 top-$k$ 个 expert，则每个 token 的激活参数只是全部 expert 的一小部分。
+
+MoE 的直觉是：
+[
+\text{总参数量大}
+\quad
+\text{但每 token 计算量相对小}.
+]
+这使模型可以拥有更高容量，同时控制单 token FLOPs。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+token/.style={draw, rounded corners=2pt, minimum width=0.8cm, minimum height=0.48cm, align=center, fill=blue!6},
+router/.style={draw, rounded corners=3pt, minimum width=1.7cm, minimum height=0.7cm, align=center, fill=orange!14},
+expert/.style={draw, rounded corners=3pt, minimum width=1.35cm, minimum height=0.65cm, align=center, fill=green!10},
+arrow/.style={-{Latex[length=2.2mm]}, thick},
+faint/.style={-{Latex[length=2.0mm]}, thick, gray!45}
+]
+
+```
+\node[font=\bfseries] at (0,3.0) {MoE：Router 为每个 token 选择少数 Expert};
+
+\foreach \i/\x in {1/-4.8,2/-3.8,3/-2.8,4/-1.8} {
+  \node[token] (t\i) at (\x,1.3) {$t_\i$};
+}
+
+\node[router] (router) at (-3.3,0.1) {Router\\Top-$k$};
+
+\foreach \i in {1,...,4} {
+  \draw[arrow] (t\i) -- (router);
+}
+
+\foreach \i/\x in {1/0.3,2/1.7,3/3.1,4/4.5} {
+  \node[expert] (e\i) at (\x,0.85) {Expert \i};
+}
+
+\draw[arrow] (router) -- (e1);
+\draw[arrow] (router) -- (e3);
+\draw[faint] (router) -- (e2);
+\draw[faint] (router) -- (e4);
+
+\node[expert, fill=purple!10, minimum width=1.8cm] (combine) at (2.4,-0.75) {Combine};
+\draw[arrow] (e1) -- (combine);
+\draw[arrow] (e3) -- (combine);
+
+\node[align=left, text width=10.3cm] at (0,-2.2) {
+  MoE 提高模型容量，但引入路由、负载均衡和 all-to-all 通信。
+  对训练集群而言，MoE 不只是模型结构变化，更是通信模式和调度问题。
+};
+```
+
+\end{tikzpicture}
+\caption{Mixture-of-Experts 中的 Router 与 Expert 分发}
+\label{fig:moe-router-experts}
+\end{figure}
+
+MoE 对 AI Infra 的挑战包括：
+
+\begin{itemize}
+\item token 在不同 expert 之间动态分发，导致负载不均；
+\item expert parallel 通常需要 all-to-all 通信；
+\item 每个 expert 的 batch 形状动态变化，不利于稳定 GEMM；
+\item 推理时需要优化路由、缓存和专家并行部署；
+\item 多机训练中，网络拓扑对 MoE 性能影响非常大。
+\end{itemize}
+
+\subsection{Qwen、DeepSeek 等模型族}
+\label{subsec:qwen-deepseek-and-others}
+
+Qwen、DeepSeek 等模型族进一步推动了开源 LLM 在多语言、代码、数学、推理、长上下文和 MoE 方向的发展。不同模型族的公开重点不同：有的强调通用能力，有的强调代码，有的强调数学推理，有的强调训练效率，有的强调长上下文或开源部署生态。
+
+对 Infra 工程师而言，模型族差异需要转化为系统决策：
+
+\begin{itemize}
+\item 模型是 dense 还是 MoE；
+\item 使用 MHA、GQA 还是 MLA 等 attention 变体；
+\item 上下文长度是多少；
+\item tokenizer 词表大小和特殊 token 规则是什么；
+\item 是否支持 FP8、INT8、INT4 量化；
+\item 是否有官方推理框架或推荐部署参数；
+\item license 是否允许目标业务使用。
+\end{itemize}
+
+同样是“70B 模型”，不同架构的部署成本可能完全不同。GQA 会影响 KV Cache；MoE 会影响专家并行；长上下文会影响 prefill 和 cache；大词表会影响 logits 和 cross entropy；多模态输入会引入视觉 encoder、投影层和不同的 batch 组织方式。
+
+\subsection{开源模型对 AI Infra 的推动}
+\label{subsec:open-models-push-ai-infra}
+
+开源模型生态使 AI Infra 从少数大厂内部能力，变成广泛工程实践。它推动了以下方向：
+
+\begin{itemize}
+\item \textbf{推理框架竞争}：vLLM、TensorRT-LLM、TGI、llama.cpp、SGLang 等不断优化吞吐与延迟；
+\item \textbf{量化方法普及}：INT8、INT4、AWQ、GPTQ、GGUF 等让普通 GPU 甚至 CPU 也能运行模型；
+\item \textbf{微调工具成熟}：LoRA、QLoRA、PEFT、Axolotl、LLaMA-Factory 等降低领域适配门槛；
+\item \textbf{评测体系扩展}：从通用 benchmark 扩展到业务场景、对齐、安全、幻觉和成本评估；
+\item \textbf{私有化部署需求增长}：企业希望在自己的数据和合规环境中运行模型；
+\item \textbf{硬件适配多样化}：NVIDIA GPU、AMD GPU、国产加速卡、Apple Silicon、CPU 后端都有部署需求。
+\end{itemize}
+
+这意味着 AI Infra 工程师需要具备跨层能力：读懂模型结构，理解 kernel 和显存，掌握服务调度，能做量化和并行配置，还要能处理数据、评测和安全上线。
+
+\section{模型规模定律}
+\label{sec:scaling-laws}
+
+大语言模型的发展并不是随机堆参数。过去几年，一个核心经验逐渐清晰：模型能力与参数量、数据量和计算量之间存在可预测的 scaling 关系。Scaling Law 并不保证每一次扩展都成功，但它为训练规划提供了重要指导。
+
+\subsection{参数量、数据量与计算量}
+\label{subsec:params-data-compute}
+
+预训练一个自回归 Transformer 的主要资源可以概括为三要素：
+
+\begin{itemize}
+\item \textbf{参数量 $N$}：模型容量；
+\item \textbf{训练 token 数 $D$}：数据规模；
+\item \textbf{训练计算量 $C$}：通常与 $N$ 和 $D$ 的乘积相关。
+\end{itemize}
+
+粗略地，dense Transformer 的训练 FLOPs 可估为：
+[
+C\approx 6ND.
+]
+这里的常数 $6$ 来自 forward、backward 和梯度计算的近似开销，具体值会随架构、激活重计算、并行策略和实现细节变化。
+
+在给定计算预算 $C$ 的条件下，训练更大模型意味着可训练 token 数减少；训练更多 token 意味着模型参数量可能需要变小。早期一些大模型更强调参数量扩展，而后来的 compute-optimal 思路强调：模型不能只大，还要用足够多的数据训练。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+vertex/.style={circle, draw, minimum size=1.05cm, align=center},
+arrow/.style={-{Latex[length=2.3mm]}, thick},
+label/.style={align=center, text width=3.1cm}
+]
+
+```
+\node[font=\bfseries] at (0,3.2) {大模型训练的三角关系：参数、数据与算力};
+
+\node[vertex, fill=blue!8] (params) at (-3.7,0.5) {$N$\\参数量};
+\node[vertex, fill=green!10] (data) at (3.7,0.5) {$D$\\数据量};
+\node[vertex, fill=orange!14] (compute) at (0,-2.2) {$C$\\计算量};
+
+\draw[arrow] (params) -- node[above] {容量与泛化} (data);
+\draw[arrow] (data) -- node[right] {训练 token} (compute);
+\draw[arrow] (compute) -- node[left] {GPU-days} (params);
+
+\node[label] at (-4.4,-1.45) {
+  模型太小：\\
+  容量不足
+};
+\node[label] at (4.4,-1.45) {
+  数据太少：\\
+  undertrained
+};
+\node[label] at (0,1.95) {
+  算力预算决定\\
+  可行组合
+};
+```
+
+\end{tikzpicture}
+\caption{参数量、数据量与计算量的三角权衡}
+\label{fig:params-data-compute-triangle}
+\end{figure}
+
+\subsection{Chinchilla Scaling Law}
+\label{subsec:chinchilla-scaling-law}
+
+Chinchilla Scaling Law 的核心启发是：在固定计算预算下，许多早期大模型参数很多但训练 token 相对不足。更 compute-optimal 的策略是同时增加模型大小和训练数据量。
+
+直观地说，若模型参数翻倍，训练 token 数也应该相应增加，而不是只让模型变大。否则模型可能没有被充分训练，推理成本却很高。
+
+可以把训练不足的模型理解为：
+[
+\text{参数容量很大}
+\quad
+\text{但数据没有充分填充这些容量}.
+]
+这种模型可能在训练曲线上还没有充分收敛，却已经因为参数大而带来高推理成本。
+
+对 AI Infra 来说，Chinchilla 风格的结论意味着：
+
+\begin{itemize}
+\item 训练计划不能只问“训练多大模型”，还要问“训练多少 token”；
+\item 数据管线、去重、质量过滤和混合比例与算力同等重要；
+\item compute-optimal 模型可能参数更小但训练更充分，推理成本更低；
+\item 训练集群规划要围绕 token budget、step time 和 MFU 计算；
+\item checkpoint、日志、恢复和评测要支持长时间大 token 训练。
+\end{itemize}
+
+\subsection{compute-optimal training}
+\label{subsec:compute-optimal-training}
+
+设训练计算预算为 $C$，参数量为 $N$，训练 token 数为 $D$。粗略有：
+[
+C\propto ND.
+]
+compute-optimal training 的目标是在给定 $C$ 下选择合适的 $N$ 和 $D$，使最终 loss 最低。
+
+如果 $N$ 太大、$D$ 太小，模型 undertrained；如果 $N$ 太小、$D$ 太大，模型容量不足。最优点在二者之间。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+axis/.style={-{Latex[length=2.3mm]}, thick},
+curve/.style={thick},
+point/.style={circle, fill=red!70, inner sep=2pt}
+]
+
+```
+\node[font=\bfseries] at (0,3.0) {Compute-Optimal Training 的直觉};
+
+\draw[axis] (-5.4,-1.2) -- (5.4,-1.2) node[right] {model size $N$};
+\draw[axis] (-5.4,-1.2) -- (-5.4,2.2) node[above] {final loss};
+
+\draw[curve, blue!75]
+  plot[smooth] coordinates {
+    (-5.0,1.7) (-4.0,1.05) (-3.0,0.45) (-2.0,0.05)
+    (-1.0,-0.15) (0.0,-0.25) (1.0,-0.18) (2.0,0.02)
+    (3.0,0.45) (4.0,1.05) (5.0,1.65)
+  };
+
+\node[point] at (0.0,-0.25) {};
+\node[align=center] at (0.0,-0.72) {compute-optimal\\region};
+
+\node[align=center] at (-3.7,1.75) {模型太小\\容量不足};
+\node[align=center] at (3.9,1.75) {模型太大\\数据不足};
+
+\node[align=left, text width=10.2cm] at (0,-2.35) {
+  在固定计算预算下，并不是参数越多越好。参数量、训练 token 数和数据质量需要共同规划。
+  这也是大模型训练从“堆规模”走向“系统化配比”的关键。
+};
+```
+
+\end{tikzpicture}
+\caption{给定计算预算下的 compute-optimal 训练直觉}
+\label{fig:compute-optimal-training}
+\end{figure}
+
+在真实项目中，compute-optimal 不只是公式问题，还要考虑：
+
+\begin{itemize}
+\item 数据是否足够高质量；
+\item 是否存在重复数据污染 benchmark；
+\item 训练集群是否能稳定运行足够长时间；
+\item 模型规模是否满足推理成本约束；
+\item 下游任务是否更需要知识、推理、代码、多语言或长上下文；
+\item 是否计划后续 SFT、RLHF、DPO 或领域继续预训练。
+\end{itemize}
+
+\subsection{为什么 Infra 决定模型边界}
+\label{subsec:why-infra-defines-model-boundary}
+
+模型能力看起来由算法和数据决定，但在大规模训练中，Infra 决定可行边界。一个团队能训练多大模型，取决于：
+
+\begin{itemize}
+\item 有多少 GPU；
+\item 单卡 HBM 容量和带宽；
+\item 节点内 NVLink/NVSwitch 拓扑；
+\item 节点间 RDMA 网络带宽与稳定性；
+\item 存储系统能否持续喂数据；
+\item 分布式训练框架是否能高效扩展；
+\item checkpoint 是否能在故障后恢复；
+\item 训练监控是否能及时发现 loss spike、NaN 和 straggler；
+\item 调度系统是否能提供长时间稳定资源。
+\end{itemize}
+
+同样的模型设计，在不同 Infra 上可能有完全不同结果。一个理论上可行的训练配置，如果网络通信无法支撑 tensor parallel，或者存储吞吐无法支撑数据加载，或者 checkpoint 写入拖慢训练，就无法成为稳定产品。
+
+\begin{table}[H]
+\centering
+\small
+\caption{模型规模扩展对 Infra 的压力}
+\label{tab:model-scaling-infra-pressure}
+\begin{tabular}{p{0.22\textwidth}p{0.34\textwidth}p{0.34\textwidth}}
+\toprule
+\textbf{扩展方向} & \textbf{直接收益} & \textbf{Infra 压力} \
+\midrule
+增大参数量
+& 提升模型容量和潜在能力
+& 显存、优化器状态、模型并行、checkpoint 体积增加。 \
+\midrule
+增加训练 token
+& 更充分训练，降低 undertraining
+& 数据管线、训练时长、稳定性、存储吞吐要求上升。 \
+\midrule
+增加上下文长度
+& 支持长文档、多轮对话和复杂任务
+& Attention 成本、KV Cache、激活显存和调度复杂度上升。 \
+\midrule
+使用 MoE
+& 增加总参数容量，控制 active FLOPs
+& Router、负载均衡、all-to-all 通信和 expert placement 更复杂。 \
+\midrule
+多模态扩展
+& 支持图像、音频、视频等输入
+& 数据处理、encoder 计算、跨模态对齐和 serving pipeline 更复杂。 \
+\bottomrule
+\end{tabular}
+\end{table}
+
+因此，本书后续几篇会围绕这些 Infra 边界展开：分布式训练解决大模型放不下和训不动的问题；推理架构解决高吞吐、低延迟、低成本服务的问题；硬件与网络章节解决多 GPU、多节点和集群调度的问题。
+
+\section{从模型范式到训练流水线}
+\label{sec:from-model-paradigm-to-training-pipeline}
+
+为了把本章内容落到工程上，我们可以把一个现代 Chat LLM 的构建过程抽象为如下流水线：
+
+\begin{enumerate}
+\item 数据收集与清洗；
+\item tokenizer 训练或选择；
+\item base model 预训练；
+\item 中间 checkpoint 评测；
+\item 指令微调 SFT；
+\item 偏好数据收集；
+\item reward model 或直接偏好优化；
+\item 安全对齐与红队测试；
+\item 量化、蒸馏或格式转换；
+\item serving 部署与在线监控。
+\end{enumerate}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+stage/.style={draw, rounded corners=3pt, minimum width=1.8cm, minimum height=0.68cm, align=center, fill=blue!6},
+sys/.style={draw, rounded corners=3pt, minimum width=1.8cm, minimum height=0.68cm, align=center, fill=orange!12},
+arrow/.style={-{Latex[length=2.1mm]}, thick}
+]
+
+```
+\node[font=\bfseries] at (0,3.1) {现代 Chat LLM 构建流水线};
+
+\node[sys] (data) at (-5.2,1.6) {Data\\Curation};
+\node[sys] (tok) at (-3.0,1.6) {Tokenizer};
+\node[stage] (pre) at (-0.8,1.6) {Pretrain};
+\node[sys] (eval1) at (1.4,1.6) {Eval\\Checkpoint};
+\node[stage] (sft) at (3.6,1.6) {SFT};
+
+\draw[arrow] (data) -- (tok);
+\draw[arrow] (tok) -- (pre);
+\draw[arrow] (pre) -- (eval1);
+\draw[arrow] (eval1) -- (sft);
+
+\node[sys] (pref) at (-5.2,0.0) {Preference\\Data};
+\node[stage] (align) at (-3.0,0.0) {RLHF / DPO};
+\node[sys] (safe) at (-0.8,0.0) {Safety\\Eval};
+\node[sys] (quant) at (1.4,0.0) {Quantize\\Convert};
+\node[stage] (serve) at (3.6,0.0) {Serving};
+
+\draw[arrow] (sft.south) .. controls (3.6,0.75) and (-3.0,0.75) .. (align.north);
+\draw[arrow] (pref) -- (align);
+\draw[arrow] (align) -- (safe);
+\draw[arrow] (safe) -- (quant);
+\draw[arrow] (quant) -- (serve);
+
+\node[align=left, text width=10.5cm] at (0,-1.6) {
+  每个阶段都有不同 Infra 需求：预训练重吞吐和稳定性，SFT 重数据质量，
+  RLHF/DPO 重多模型训练与偏好数据，Serving 重延迟、吞吐、KV Cache 和成本。
+};
+```
+
+\end{tikzpicture}
+\caption{现代 Chat LLM 的端到端构建流水线}
+\label{fig:modern-chat-llm-pipeline}
+\end{figure}
+
+下面给出一个极简训练阶段配置伪代码，用来说明不同阶段的资源和目标差异：
+
+\begin{lstlisting}[language=Python,caption={不同 LLM 训练阶段的配置抽象},label={lst:llm-training-stages-config}]
+training_plan = [
+{
+"stage": "pretraining",
+"objective": "next_token_prediction",
+"data": "large_scale_web_code_math_corpus",
+"parallelism": ["data_parallel", "tensor_parallel", "pipeline_parallel"],
+"optimizer": "AdamW",
+"main_bottleneck": ["GPU_flops", "activation_memory", "network_collectives"],
+},
+{
+"stage": "supervised_finetuning",
+"objective": "instruction_following",
+"data": "high_quality_prompt_response_pairs",
+"parallelism": ["data_parallel", "fsdp_or_zero"],
+"optimizer": "AdamW_or_LoRA_optimizer",
+"main_bottleneck": ["data_quality", "sequence_packing", "overfitting"],
+},
+{
+"stage": "preference_optimization",
+"objective": "align_with_human_preference",
+"data": "chosen_rejected_pairs",
+"parallelism": ["data_parallel", "model_sharding"],
+"optimizer": "PPO_DPO_or_related_method",
+"main_bottleneck": ["multi_model_memory", "generation_throughput", "stability"],
+},
+{
+"stage": "serving",
+"objective": "low_latency_high_throughput_generation",
+"data": "online_requests",
+"parallelism": ["tensor_parallel", "pipeline_parallel", "continuous_batching"],
+"optimizer": None,
+"main_bottleneck": ["KV_cache", "scheduler", "memory_bandwidth", "tail_latency"],
+},
+]
+\end{lstlisting}
+
+这段伪代码强调：模型生命周期中的不同阶段，对 Infra 的瓶颈完全不同。预训练关心 GPU 利用率和多节点通信；SFT 关心数据格式、loss mask 和样本质量；偏好优化关心多模型显存和生成吞吐；serving 则关心 KV Cache、batching、延迟和成本。
+
+\section{本章小结}
+\label{sec:chapter05-summary}
+
+本章从语言模型任务定义出发，梳理了大语言模型的主要发展脉络和训练范式。
+
+\begin{itemize}
+\item \textbf{N-gram 模型} 使用有限上下文和离散计数，简单但无法有效建模长距离依赖和语义泛化。
+\item \textbf{神经语言模型} 将 token 映射到连续向量空间，把语言建模转化为可由 GPU 加速的张量计算。
+\item \textbf{自回归语言建模} 通过 next-token prediction 学习序列概率，是 Decoder-only LLM 的核心任务。
+\item \textbf{MLM 与 Causal LM} 代表不同建模范式：前者适合理解，后者适合生成。
+\item \textbf{GPT 系列} 推动了预训练、规模扩展、in-context learning、instruction tuning 和 RLHF 等关键范式。
+\item \textbf{Instruction Tuning} 通过高质量指令数据改变模型输出分布，让基础模型更稳定地遵循用户意图。
+\item \textbf{RLHF 与偏好优化} 把训练扩展为多模型、多阶段系统，连接了人类偏好、奖励建模和策略优化。
+\item \textbf{开源模型生态} 让模型权重成为可部署、可微调、可量化、可优化的基础设施对象，推动了 serving、量化和微调工具链成熟。
+\item \textbf{Scaling Law} 告诉我们模型能力与参数量、数据量和计算量有关；compute-optimal training 要在给定算力下平衡模型规模与训练 token。
+\item \textbf{Infra 决定模型边界}：GPU、网络、存储、并行框架、checkpoint、调度和监控共同决定一个模型能否被训练和服务。
+\end{itemize}
+
+下一章将进入具体架构对比：GPT、LLaMA 与现代 Decoder-only 架构。我们会把本章的历史范式落到模型结构细节上，系统比较 token embedding、causal attention、RMSNorm、RoPE、SwiGLU、GQA、MoE 以及 lm head 等组件，并分析这些结构如何改变训练和推理基础设施。

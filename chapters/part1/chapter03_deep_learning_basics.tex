@@ -1,0 +1,1570 @@
+\chapter{深度学习基本原理}
+\label{chap:deep-learning-basics}
+
+\section{神经网络的基本结构}
+\label{sec:nn-basic-structure}
+
+前两章分别从数学与 CUDA 的角度铺垫了 AI Infrastructure 的底层基础。本章开始，我们回到深度学习模型本身。对于 AI Infra 工程师而言，理解神经网络并不是为了从零发明一个新模型，而是为了回答一系列工程问题：
+
+\begin{itemize}
+\item 一个模型的参数量从哪里来？
+\item 训练时显存为什么远大于模型权重本身？
+\item 为什么反向传播需要保存激活？
+\item 为什么优化器状态会占用巨大显存？
+\item 为什么大模型训练偏好 AdamW、warmup、cosine decay、LayerNorm、RMSNorm 和混合精度？
+\item 为什么同样的数学结构，在 GPU 上的实现方式会决定吞吐和稳定性？
+\end{itemize}
+
+本章的目标，是把神经网络的数学结构与工程系统中的真实成本联系起来。我们会从线性层、激活函数和 loss function 出发，推导反向传播，分析优化器，比较归一化方法，并解释混合精度训练为什么成为现代大模型训练的默认配置。
+
+\subsection{线性层}
+\label{subsec:linear-layer}
+
+线性层是神经网络最基本的构件。给定输入：
+[
+\mat{X}\in\mathbb{R}^{B\times d_{\mathrm{in}}},
+]
+权重：
+[
+\mat{W}\in\mathbb{R}^{d_{\mathrm{in}}\times d_{\mathrm{out}}},
+]
+偏置：
+[
+\vect{b}\in\mathbb{R}^{d_{\mathrm{out}}},
+]
+线性层输出为：
+[
+\mat{Y}=\mat{X}\mat{W}+\vect{b}.
+]
+
+其中 $B$ 是 batch size，$d_{\mathrm{in}}$ 是输入维度，$d_{\mathrm{out}}$ 是输出维度。偏置 $\vect{b}$ 会沿 batch 维广播：
+[
+Y_{i,j}=\sum_{k=1}^{d_{\mathrm{in}}}X_{i,k}W_{k,j}+b_j.
+]
+
+在 PyTorch 中，\texttt{nn.Linear(d_in, d_out)} 默认保存的权重 shape 通常是：
+[
+(d_{\mathrm{out}},d_{\mathrm{in}}),
+]
+而数学书写中我们常使用：
+[
+\mat{W}\in\mathbb{R}^{d_{\mathrm{in}}\times d_{\mathrm{out}}}.
+]
+这只是约定差异。底层 GEMM 会根据 transpose 参数、stride 和 layout 选择实际计算方式。
+
+从参数量角度看，线性层参数为：
+[
+d_{\mathrm{in}}d_{\mathrm{out}}+d_{\mathrm{out}}.
+]
+如果 $d_{\mathrm{in}}=d_{\mathrm{out}}=4096$，单个线性层权重参数量约为：
+[
+4096^2=16,777,216.
+]
+使用 BF16 或 FP16 保存，仅权重就需要约：
+[
+16,777,216\times 2\ \mathrm{bytes}\approx 32\ \mathrm{MB}.
+]
+在 Transformer 中，attention 的 QKV projection、output projection、FFN 的 up projection 和 down projection 都是线性层。因此，线性层不仅是数学基础，也是参数量、FLOPs 与显存占用的主要来源。
+
+\subsection{激活函数}
+\label{subsec:activation-functions}
+
+如果神经网络只由线性层组成，那么无论叠多少层，整体仍然是一个线性变换。设：
+[
+\mat{H}_1=\mat{X}\mat{W}_1,\quad
+\mat{Y}=\mat{H}_1\mat{W}_2,
+]
+则：
+[
+\mat{Y}=\mat{X}(\mat{W}_1\mat{W}_2).
+]
+这等价于一个更大的线性层。激活函数的作用，就是引入非线性，使神经网络能够拟合复杂函数。
+
+常见激活函数包括 ReLU、Sigmoid、Tanh、GELU 和 SiLU。它们的定义如下：
+
+[
+\operatorname{ReLU}(x)=\max(0,x),
+]
+[
+\sigma(x)=\frac{1}{1+\exp(-x)},
+]
+[
+\tanh(x)=\frac{\exp(x)-\exp(-x)}{\exp(x)+\exp(-x)}.
+]
+
+GELU 常用于 Transformer 早期架构，其定义可写为：
+[
+\operatorname{GELU}(x)=x\Phi(x),
+]
+其中 $\Phi(x)$ 是标准正态分布的累积分布函数。工程实现中常用近似：
+[
+\operatorname{GELU}(x)
+\approx
+\frac{1}{2}x
+\left(
+1+\tanh
+\left[
+\sqrt{\frac{2}{\pi}}
+\left(x+0.044715x^3\right)
+\right]
+\right).
+]
+
+现代 LLM 中，SwiGLU 这类门控激活非常常见。若输入经过两个线性投影：
+[
+\mat{U}=\mat{X}\mat{W}_u,\quad
+\mat{G}=\mat{X}\mat{W}_g,
+]
+则 SwiGLU 可写作：
+[
+\operatorname{SwiGLU}(\mat{X})
+==============================
+
+\operatorname{SiLU}(\mat{G})\odot \mat{U},
+]
+其中：
+[
+\operatorname{SiLU}(x)=x\sigma(x).
+]
+
+从工程上看，激活函数大多属于 elementwise 操作，单独执行时往往是 memory-bound。若一个激活函数只做少量计算，却需要从 HBM 读取输入、写回输出，那么它很可能不能充分利用 GPU 算力。因此，在高性能训练和推理系统中，激活函数常常与 bias add、dropout 或 GEMM epilogue 融合，减少中间张量写回。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+axis/.style={-{Latex[length=2.3mm]}, thick},
+curve/.style={thick},
+sample/.style={circle, inner sep=1.2pt, fill=black}
+]
+
+```
+\node[font=\bfseries] at (0,3.0) {常见激活函数的形状直觉};
+
+\draw[axis] (-5.0,0) -- (-1.1,0) node[right] {$x$};
+\draw[axis] (-3.05,-1.0) -- (-3.05,1.8) node[above] {$y$};
+\draw[curve, blue!70]
+  (-4.8,0) -- (-3.05,0) -- (-1.35,1.35);
+\node at (-3.05,-1.35) {ReLU};
+
+\draw[axis] (-0.8,0) -- (3.1,0) node[right] {$x$};
+\draw[axis] (1.15,-1.0) -- (1.15,1.8) node[above] {$y$};
+\draw[curve, green!60!black]
+  plot[smooth] coordinates {
+    (-0.55,0.03) (0.0,0.08) (0.55,0.22) (1.15,0.5)
+    (1.75,0.78) (2.3,0.92) (2.85,0.97)
+  };
+\node at (1.15,-1.35) {Sigmoid};
+
+\draw[axis] (3.4,0) -- (7.3,0) node[right] {$x$};
+\draw[axis] (5.35,-1.0) -- (5.35,1.8) node[above] {$y$};
+\draw[curve, orange!80!black]
+  plot[smooth] coordinates {
+    (3.65,-0.15) (4.1,-0.12) (4.55,-0.05) (5.0,0.0)
+    (5.35,0.0) (5.8,0.2) (6.25,0.62) (6.75,1.18) (7.05,1.55)
+  };
+\node at (5.35,-1.35) {GELU / SiLU};
+
+\node[align=left, text width=10.6cm] at (1.0,-2.25) {
+  激活函数提供非线性表达能力。Infra 视角下，它们通常是逐元素操作，单独执行时算术强度较低，因此常与其他 elementwise 操作或 GEMM epilogue 融合。
+};
+```
+
+\end{tikzpicture}
+\caption{ReLU、Sigmoid、GELU/SiLU 的函数形状直觉}
+\label{fig:activation-functions}
+\end{figure}
+
+\subsection{Loss Function}
+\label{subsec:loss-function}
+
+训练神经网络时，我们需要一个目标函数衡量模型输出与真实标签之间的差异。这个目标函数称为损失函数。优化器通过最小化 loss 来更新参数。
+
+对于分类任务，常用交叉熵损失。设模型输出 logits：
+[
+\vect{z}\in\mathbb{R}^{C},
+]
+经过 softmax 得到类别概率：
+[
+p_i=\frac{\exp(z_i)}{\sum_{j=1}^{C}\exp(z_j)}.
+]
+若真实类别为 $y$，则交叉熵损失为：
+[
+\mathcal{L}=-\log p_y.
+]
+展开可得：
+[
+\mathcal{L}
+===========
+
+-z_y+\log\sum_{j=1}^{C}\exp(z_j).
+]
+
+对于语言模型，类别数 $C$ 就是词表大小 $V$。每个位置都要预测下一个 token，因此 batch 中的 logits 常见 shape 为：
+[
+(B,S,V).
+]
+若 $B=8$、$S=2048$、$V=50000$，则 logits 元素个数为：
+[
+8\times 2048\times 50000=819,200,000.
+]
+使用 BF16 保存也需要超过 $1.6$ GB 显存。实际训练中，cross entropy 往往需要 fused kernel 或 vocabulary parallelism 来降低显存和通信压力。
+
+对于回归任务，常用均方误差：
+[
+\mathcal{L}_{\mathrm{MSE}}
+==========================
+
+\frac{1}{N}\sum_{i=1}^{N}(\hat{y}_i-y_i)^2.
+]
+大模型预训练主要使用 next-token cross entropy，但强化学习、奖励模型、偏好优化、多模态对齐等任务还会使用更多损失函数。作为 Infra 工程师，我们需要重点关注 loss 的两个方面：
+
+\begin{itemize}
+\item \textbf{数值稳定性}：是否容易出现 overflow、underflow、NaN 或 inf。
+\item \textbf{系统代价}：是否需要物化巨大中间张量，是否能被 fuse，是否会引入跨 GPU 通信。
+\end{itemize}
+
+\subsection{模型参数与中间激活}
+\label{subsec:parameters-and-activations}
+
+神经网络训练时，显存并不仅仅存储模型参数。考虑一个简单的 MLP：
+[
+\mat{H}_1=\phi(\mat{X}\mat{W}_1+\vect{b}_1),
+]
+[
+\mat{H}_2=\phi(\mat{H}_1\mat{W}_2+\vect{b}_2),
+]
+[
+\mat{Y}=\mat{H}_2\mat{W}_3+\vect{b}_3.
+]
+训练时除了参数 $\mat{W}_1,\mat{W}_2,\mat{W}_3$，还需要保存中间激活 $\mat{X},\mat{H}_1,\mat{H}_2$，以便反向传播计算梯度。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+layer/.style={draw, rounded corners=3pt, minimum width=1.55cm, minimum height=0.9cm, align=center, fill=blue!6},
+act/.style={draw, rounded corners=3pt, minimum width=1.4cm, minimum height=0.75cm, align=center, fill=green!8},
+param/.style={draw, rounded corners=2pt, fill=orange!12, align=center, minimum width=1.2cm, minimum height=0.5cm},
+arrow/.style={-{Latex[length=2.3mm]}, thick}
+]
+
+```
+\node[act] (x) at (-5.2,0) {$\mat{X}$};
+\node[layer] (l1) at (-3.6,0) {Linear\\$W_1,b_1$};
+\node[layer] (a1) at (-1.9,0) {Activation\\$\phi$};
+\node[act] (h1) at (-0.4,0) {$\mat{H}_1$};
+\node[layer] (l2) at (1.2,0) {Linear\\$W_2,b_2$};
+\node[layer] (a2) at (2.9,0) {Activation\\$\phi$};
+\node[act] (h2) at (4.4,0) {$\mat{H}_2$};
+\node[layer] (l3) at (6.0,0) {Linear\\$W_3,b_3$};
+\node[act] (y) at (7.45,0) {$\mat{Y}$};
+
+\draw[arrow] (x) -- (l1);
+\draw[arrow] (l1) -- (a1);
+\draw[arrow] (a1) -- (h1);
+\draw[arrow] (h1) -- (l2);
+\draw[arrow] (l2) -- (a2);
+\draw[arrow] (a2) -- (h2);
+\draw[arrow] (h2) -- (l3);
+\draw[arrow] (l3) -- (y);
+
+\node[param] at (-3.6,1.2) {参数};
+\node[param] at (1.2,1.2) {参数};
+\node[param] at (6.0,1.2) {参数};
+
+\draw[dashed, rounded corners=3pt, fill=yellow!8]
+  (-5.85,-1.0) rectangle (5.05,-0.45);
+\node at (-0.4,-0.72) {训练时需要保存的中间激活，用于 backward};
+
+\node[align=left, text width=10.8cm] at (1.0,-2.0) {
+  前向传播得到输出；反向传播需要用前向中的输入和中间结果计算梯度。
+  因此训练显存通常远高于仅加载模型权重所需的显存。
+};
+```
+
+\end{tikzpicture}
+\caption{多层感知机的前向传播与中间激活}
+\label{fig:mlp-forward-activations}
+\end{figure}
+
+参数是模型的长期状态；激活是一次 forward/backward 中的临时状态。对于推理，很多激活可以在层间流动后立即释放；对于训练，激活需要保留到对应 backward 使用完毕。这个差异是训练显存远高于推理显存的重要原因之一。
+
+\section{反向传播}
+\label{sec:backpropagation}
+
+\subsection{从链式法则到计算图}
+\label{subsec:chain-rule-to-computation-graph}
+
+反向传播是链式法则在计算图上的系统化应用。假设一个简单标量函数：
+[
+y=(xw+b)^2.
+]
+可以拆成：
+[
+u=xw,\quad
+v=u+b,\quad
+y=v^2.
+]
+根据链式法则：
+[
+\frac{\partial y}{\partial w}
+=============================
+
+\frac{\partial y}{\partial v}
+\frac{\partial v}{\partial u}
+\frac{\partial u}{\partial w}.
+]
+逐项计算：
+[
+\frac{\partial y}{\partial v}=2v,\quad
+\frac{\partial v}{\partial u}=1,\quad
+\frac{\partial u}{\partial w}=x.
+]
+因此：
+[
+\frac{\partial y}{\partial w}=2v x.
+]
+
+深度学习框架会把复杂模型拆成许多基本算子，每个算子记录自己的前向输入、输出和 backward 规则。反向传播从 loss 开始，按照计算图的反向拓扑顺序，把梯度传播回所有需要更新的参数。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+nodebox/.style={draw, rounded corners=2pt, minimum width=1.1cm, minimum height=0.65cm, align=center, fill=blue!6},
+op/.style={draw, circle, minimum size=0.72cm, fill=orange!12},
+fwd/.style={-{Latex[length=2.2mm]}, thick, blue!70},
+bwd/.style={-{Latex[length=2.2mm]}, thick, red!70}
+]
+
+```
+\node[nodebox] (x) at (-4.8,1.1) {$x$};
+\node[nodebox] (w) at (-4.8,-0.1) {$w$};
+\node[op] (mul) at (-3.0,0.5) {$\times$};
+\node[nodebox] (u) at (-1.7,0.5) {$u$};
+
+\node[nodebox] (b) at (-1.7,-0.9) {$b$};
+\node[op] (add) at (-0.2,0.0) {$+$};
+\node[nodebox] (v) at (1.1,0.0) {$v$};
+\node[op] (sq) at (2.5,0.0) {$^2$};
+\node[nodebox] (y) at (3.8,0.0) {$y$};
+
+\draw[fwd] (x) -- (mul);
+\draw[fwd] (w) -- (mul);
+\draw[fwd] (mul) -- (u);
+\draw[fwd] (u) -- (add);
+\draw[fwd] (b) -- (add);
+\draw[fwd] (add) -- (v);
+\draw[fwd] (v) -- (sq);
+\draw[fwd] (sq) -- (y);
+
+\draw[bwd] (y.south) .. controls (3.2,-1.4) and (2.5,-1.4) .. (sq.south);
+\draw[bwd] (sq.south) .. controls (2.1,-1.65) and (1.3,-1.65) .. (v.south);
+\draw[bwd] (v.south) .. controls (0.7,-1.75) and (-0.2,-1.75) .. (add.south);
+\draw[bwd] (add.south) .. controls (-0.8,-1.9) and (-1.5,-1.9) .. (u.south);
+\draw[bwd] (u.south) .. controls (-2.2,-1.8) and (-3.0,-1.4) .. (mul.south);
+\draw[bwd] (mul.south) .. controls (-3.6,-1.2) and (-4.4,-0.8) .. (w.south);
+
+\node[align=left, text width=10.5cm] at (-0.4,-3.0) {
+  蓝色路径是 forward，红色路径是 backward。每个局部算子只需要知道自己的局部导数，
+  整体梯度由链式法则沿图传播得到。
+};
+```
+
+\end{tikzpicture}
+\caption{从链式法则到计算图反向传播}
+\label{fig:chain-rule-computation-graph}
+\end{figure}
+
+\subsection{梯度在图中的流动}
+\label{subsec:gradient-flow-in-graph}
+
+考虑一个线性层：
+[
+\mat{Y}=\mat{X}\mat{W}+\vect{b}.
+]
+设上游梯度为：
+[
+\mat{G}_Y=\frac{\partial \mathcal{L}}{\partial \mat{Y}}.
+]
+则对应梯度为：
+[
+\frac{\partial \mathcal{L}}{\partial \mat{X}}
+=============================================
+
+\mat{G}_Y\mat{W}^{\mathsf{T}},
+]
+[
+\frac{\partial \mathcal{L}}{\partial \mat{W}}
+=============================================
+
+\mat{X}^{\mathsf{T}}\mat{G}_Y,
+]
+[
+\frac{\partial \mathcal{L}}{\partial \vect{b}}
+==============================================
+
+\sum_{i=1}^{B}\mat{G}_{Y,i,:}.
+]
+
+这三条公式非常重要，因为它们揭示了训练中 GEMM 的来源。一个线性层 forward 是 GEMM，backward 中对输入和权重的梯度计算也都是 GEMM。也就是说，训练一个线性层通常包含：
+
+\begin{itemize}
+\item forward GEMM：$\mat{X}\mat{W}$；
+\item backward data GEMM：$\mat{G}_Y\mat{W}^{\mathsf{T}}$；
+\item backward weight GEMM：$\mat{X}^{\mathsf{T}}\mat{G}_Y$。
+\end{itemize}
+
+因此，训练 FLOPs 通常显著高于单次推理 forward。粗略地说，一个线性层训练中的计算量可近似为 forward 的 $3$ 倍左右，还不包括优化器更新、归一化、激活函数和通信。
+
+下面给出一个手动推导线性层 backward 的 PyTorch 风格示例：
+
+\begin{lstlisting}[language=Python,caption={线性层 forward 与 backward 公式的张量实现},label={lst:linear-backward-manual}]
+import torch
+
+B, Din, Dout = 8, 1024, 4096
+
+X = torch.randn(B, Din, device="cuda", dtype=torch.float32)
+W = torch.randn(Din, Dout, device="cuda", dtype=torch.float32)
+b = torch.randn(Dout, device="cuda", dtype=torch.float32)
+
+# Forward
+
+Y = X @ W + b
+
+# Suppose this is the upstream gradient dL/dY.
+
+dY = torch.randn_like(Y)
+
+# Backward formulas
+
+dX = dY @ W.T          # dL/dX
+dW = X.T @ dY          # dL/dW
+db = dY.sum(dim=0)     # dL/db
+
+print(dX.shape, dW.shape, db.shape)
+\end{lstlisting}
+
+在真实训练框架中，这些梯度计算由 autograd 自动生成或调用高性能 backend 实现。AI Infra 工程师需要知道的是：\textbf{反向传播不是抽象魔法，而是一组具体的张量算子、GEMM、reduction、elementwise kernel 与通信操作。}
+
+\subsection{激活保存与显存占用}
+\label{subsec:activation-memory-consumption}
+
+反向传播需要前向中间结果。以线性层为例，计算：
+[
+\frac{\partial \mathcal{L}}{\partial \mat{W}}
+=============================================
+
+\mat{X}^{\mathsf{T}}\mat{G}_Y
+]
+需要保存输入 $\mat{X}$；计算某些激活函数的 backward 也需要保存前向输出或 mask。例如 ReLU backward 需要知道前向时哪些位置大于零：
+[
+\frac{\partial \operatorname{ReLU}(x)}{\partial x}
+==================================================
+
+\begin{cases}
+1, & x>0,\
+0, & x\le 0.
+\end{cases}
+]
+
+对于一个 $L$ 层网络，若每层保存激活：
+[
+\tensor{A}*{\ell}\in\mathbb{R}^{B\times S\times H},
+]
+则仅隐藏状态激活显存粗略为：
+[
+M*{\mathrm{hidden}}
+\approx
+LBSH\cdot s,
+]
+其中 $s$ 是每个元素的字节数。实际显存会更高，因为 attention、MLP、dropout、norm 和 residual 都可能保存额外中间结果。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+layer/.style={draw, rounded corners=2pt, minimum width=1.05cm, minimum height=0.65cm, align=center, fill=blue!6},
+act/.style={draw, rounded corners=2pt, minimum width=0.95cm, minimum height=0.5cm, align=center, fill=yellow!16},
+arrow/.style={-{Latex[length=2.1mm]}, thick},
+bwd/.style={-{Latex[length=2.1mm]}, thick, red!70}
+]
+
+```
+\node[font=\bfseries] at (0,2.8) {前向保存激活，反向逐层消费};
+
+\foreach \i/\x in {1/-4.8,2/-3.2,3/-1.6,4/0.0,5/1.6,6/3.2,7/4.8} {
+  \node[layer] (l\i) at (\x,0.8) {Layer \i};
+  \node[act] (a\i) at (\x,-0.15) {$A_\i$};
+  \draw[dashed] (l\i) -- (a\i);
+}
+
+\foreach \i/\j in {1/2,2/3,3/4,4/5,5/6,6/7} {
+  \draw[arrow] (l\i.east) -- (l\j.west);
+}
+
+\draw[bwd] (4.8,-0.85) -- (3.2,-0.85);
+\draw[bwd] (3.2,-0.85) -- (1.6,-0.85);
+\draw[bwd] (1.6,-0.85) -- (0.0,-0.85);
+\draw[bwd] (0.0,-0.85) -- (-1.6,-0.85);
+\draw[bwd] (-1.6,-0.85) -- (-3.2,-0.85);
+\draw[bwd] (-3.2,-0.85) -- (-4.8,-0.85);
+
+\node[align=center] at (0,-1.35) {Backward 从最后一层开始，逐层读取对应 forward 激活并释放};
+
+\node[draw, rounded corners=3pt, fill=green!8, align=left, text width=10.4cm] at (0,-2.55) {
+  \textbf{显存痛点：} 层数越深、batch 越大、序列越长、hidden size 越大，激活显存越高。
+  在大模型训练中，激活显存常常与参数、梯度、优化器状态一起成为限制 batch size 和 sequence length 的关键因素。
+};
+```
+
+\end{tikzpicture}
+\caption{前向激活保存与反向传播中的激活消费}
+\label{fig:activation-save-backward-consume}
+\end{figure}
+
+激活显存的峰值通常发生在 forward 结束、backward 开始之前。此时大部分层的激活都还没有被释放。之后 backward 从后向前执行，每处理完一层，该层对应的激活就可以释放。这个生命周期是设计 activation checkpointing、pipeline parallelism 和 ZeRO activation partitioning 的基础。
+
+\subsection{Gradient Checkpointing 的动机}
+\label{subsec:gradient-checkpointing}
+
+Gradient Checkpointing，也常称为 activation checkpointing，其核心思想是：
+[
+\text{少存激活，多做重计算。}
+]
+在 forward 阶段，不保存所有中间激活，只保存少数 checkpoint。到了 backward 阶段，如果需要某段中间激活，就从最近的 checkpoint 重新执行一段 forward 来恢复。
+
+假设一个网络有 $L$ 层。普通训练保存每层激活，显存约为：
+[
+O(L).
+]
+采用 checkpointing 后，可以把激活显存降到更低，例如在某些理想策略下接近：
+[
+O(\sqrt{L}),
+]
+代价是额外 forward recomputation，计算量上升。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+layer/.style={draw, rounded corners=2pt, minimum width=0.85cm, minimum height=0.55cm, align=center, fill=blue!6},
+ckpt/.style={draw, rounded corners=2pt, minimum width=0.85cm, minimum height=0.55cm, align=center, fill=orange!20},
+arrow/.style={-{Latex[length=2.1mm]}, thick}
+]
+
+```
+\node[font=\bfseries] at (0,2.8) {Gradient Checkpointing：保存少数节点，反向时重计算};
+
+\foreach \i/\x in {1/-5.4,2/-4.2,3/-3.0,4/-1.8,5/-0.6,6/0.6,7/1.8,8/3.0,9/4.2,10/5.4} {
+  \node[layer] (l\i) at (\x,1.0) {$L_\i$};
+}
+\foreach \i/\j in {1/2,2/3,3/4,4/5,5/6,6/7,7/8,8/9,9/10} {
+  \draw[arrow] (l\i.east) -- (l\j.west);
+}
+
+\node[ckpt] (c1) at (-5.4,-0.2) {$C_1$};
+\node[ckpt] (c5) at (-0.6,-0.2) {$C_5$};
+\node[ckpt] (c10) at (5.4,-0.2) {$C_{10}$};
+
+\draw[dashed] (l1) -- (c1);
+\draw[dashed] (l5) -- (c5);
+\draw[dashed] (l10) -- (c10);
+
+\draw[decorate,decoration={brace,amplitude=5pt},thick]
+  (-5.85,-0.75) -- (-0.15,-0.75)
+  node[midway,below=7pt] {反向时从 $C_1$ 重算 $L_2$ 到 $L_5$};
+
+\draw[decorate,decoration={brace,amplitude=5pt},thick]
+  (-0.15,-1.35) -- (5.85,-1.35)
+  node[midway,below=7pt] {反向时从 $C_5$ 重算 $L_6$ 到 $L_{10}$};
+
+\node[align=left, text width=10.4cm] at (0,-2.65) {
+  Checkpointing 降低激活显存峰值，但增加计算量。它尤其适合显存受限但计算资源相对充足的场景，例如长上下文训练或大 batch 训练。
+};
+```
+
+\end{tikzpicture}
+\caption{Gradient Checkpointing 的保存与重计算机制}
+\label{fig:gradient-checkpointing}
+\end{figure}
+
+PyTorch 中可以使用 \texttt{torch.utils.checkpoint} 实现 checkpointing：
+
+\begin{lstlisting}[language=Python,caption={PyTorch 中使用 activation checkpointing},label={lst:pytorch-gradient-checkpointing}]
+import torch
+import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
+
+class Block(nn.Module):
+def **init**(self, hidden):
+super().**init**()
+self.net = nn.Sequential(
+nn.Linear(hidden, 4 * hidden),
+nn.GELU(),
+nn.Linear(4 * hidden, hidden),
+)
+
+```
+def forward(self, x):
+    return x + self.net(x)
+```
+
+class Model(nn.Module):
+def **init**(self, hidden, num_layers):
+super().**init**()
+self.layers = nn.ModuleList([Block(hidden) for _ in range(num_layers)])
+
+```
+def forward(self, x):
+    for layer in self.layers:
+        # Checkpoint this layer.
+        # During backward, PyTorch will recompute layer(x).
+        x = checkpoint(layer, x, use_reentrant=False)
+    return x
+```
+
+\end{lstlisting}
+
+在工程实践中，checkpointing 的收益取决于模型结构和硬件瓶颈。如果训练已经是 compute-bound，额外重计算会明显降低吞吐；如果训练受显存限制无法提高 batch size 或 sequence length，checkpointing 可能带来整体收益。成熟训练系统通常会把 checkpointing 与 ZeRO、tensor parallel、pipeline parallel、sequence parallel 等策略组合使用。
+
+\section{优化器}
+\label{sec:optimizers}
+
+优化器负责根据梯度更新模型参数。对于 AI Infra 工程师，优化器不仅是数学算法，也是一组额外显存状态和 kernel。Adam 这类优化器会为每个参数保存额外状态，因此在大模型训练中，优化器状态往往比参数本身更占显存。
+
+\subsection{SGD}
+\label{subsec:sgd}
+
+最基本的优化器是随机梯度下降。设参数为 $\vect{\theta}$，loss 为 $\mathcal{L}$，学习率为 $\eta$，则更新为：
+[
+\vect{\theta}_{t+1}
+===================
+
+## \vect{\theta}_{t}
+
+\eta
+\nabla_{\vect{\theta}}\mathcal{L}(\vect{\theta}_{t}).
+]
+
+SGD 的优点是简单、状态少。每个参数只需要保存自身和梯度，不需要额外的一阶矩、二阶矩。其缺点是对学习率敏感，在不同曲率方向上收敛速度差异很大。
+
+可以从几何上理解。若 loss landscape 在某个方向很陡，在另一个方向很平，SGD 会在陡峭方向来回震荡，同时在平坦方向缓慢前进。Momentum 和 Adam 都可以看作对这一问题的改进。
+
+\begin{lstlisting}[language=Python,caption={SGD 参数更新的最小实现},label={lst:sgd-minimal}]
+import torch
+
+@torch.no_grad()
+def sgd_step(params, lr):
+for p in params:
+if p.grad is None:
+continue
+p -= lr * p.grad
+p.grad = None
+\end{lstlisting}
+
+在真实训练中，SGD 仍然常用于某些视觉模型或小规模任务，但大语言模型预训练通常更偏好 AdamW，因为它对不同参数尺度和稀疏梯度更稳健。
+
+\subsection{Momentum}
+\label{subsec:momentum}
+
+Momentum 为梯度引入速度项。更新公式为：
+[
+\vect{v}_{t+1}
+==============
+
+\mu\vect{v}*t+
+\nabla*{\vect{\theta}}\mathcal{L}(\vect{\theta}*t),
+]
+[
+\vect{\theta}*{t+1}
+===================
+
+\vect{\theta}*t-\eta\vect{v}*{t+1}.
+]
+其中 $\mu$ 是动量系数，通常取 $0.9$ 左右。
+
+Momentum 的直觉是：如果多个 step 的梯度方向大体一致，就加速前进；如果梯度方向来回震荡，就相互抵消。它像物理系统中的惯性，让优化轨迹更平滑。
+
+从系统角度看，Momentum 为每个参数引入一个额外状态 $\vect{v}$。如果参数量为 $N$，并以 FP32 保存 momentum，则额外显存为：
+[
+4N\ \mathrm{bytes}.
+]
+当 $N$ 达到数十亿甚至数百亿时，这项显存非常可观。
+
+\subsection{Adam 与 AdamW}
+\label{subsec:adam-adamw}
+
+Adam 是大模型训练中最常见的优化器之一。它同时维护梯度的一阶矩和二阶矩估计：
+[
+\vect{m}*t=\beta_1\vect{m}*{t-1}+(1-\beta_1)\vect{g}_t,
+]
+[
+\vect{v}*t=\beta_2\vect{v}*{t-1}+(1-\beta_2)\vect{g}_t^2,
+]
+其中：
+[
+\vect{g}*t=\nabla*{\vect{\theta}}\mathcal{L}(\vect{\theta}_t).
+]
+为了修正初始时刻的偏差，Adam 使用 bias correction：
+[
+\hat{\vect{m}}_t=\frac{\vect{m}_t}{1-\beta_1^t},
+]
+[
+\hat{\vect{v}}_t=\frac{\vect{v}*t}{1-\beta_2^t}.
+]
+参数更新为：
+[
+\vect{\theta}*{t+1}
+===================
+
+## \vect{\theta}_t
+
+\eta
+\frac{\hat{\vect{m}}_t}{\sqrt{\hat{\vect{v}}_t}+\epsilon}.
+]
+
+AdamW 与 Adam 的关键差异在于 weight decay 的处理。传统 Adam 中，L2 正则项会混入梯度；AdamW 使用 decoupled weight decay：
+[
+\vect{\theta}_{t+1}
+===================
+
+## \vect{\theta}_t
+
+\eta
+\frac{\hat{\vect{m}}_t}{\sqrt{\hat{\vect{v}}_t}+\epsilon}
+---------------------------------------------------------
+
+\eta\lambda\vect{\theta}_t.
+]
+这种形式通常更适合 Transformer 和 LLM 训练。
+
+\begin{lstlisting}[language=Python,caption={AdamW 更新逻辑的简化实现},label={lst:adamw-simplified}]
+import math
+import torch
+
+@torch.no_grad()
+def adamw_step(params, state, lr, beta1=0.9, beta2=0.95, eps=1e-8, weight_decay=0.1):
+for p in params:
+if p.grad is None:
+continue
+
+```
+    g = p.grad
+
+    if p not in state:
+        state[p] = {
+            "step": 0,
+            "m": torch.zeros_like(p, dtype=torch.float32),
+            "v": torch.zeros_like(p, dtype=torch.float32),
+        }
+
+    s = state[p]
+    s["step"] += 1
+    t = s["step"]
+
+    m = s["m"]
+    v = s["v"]
+
+    # First and second moment estimates.
+    m.mul_(beta1).add_(g, alpha=1.0 - beta1)
+    v.mul_(beta2).addcmul_(g, g, value=1.0 - beta2)
+
+    # Bias correction.
+    m_hat = m / (1.0 - beta1 ** t)
+    v_hat = v / (1.0 - beta2 ** t)
+
+    # Decoupled weight decay.
+    p.mul_(1.0 - lr * weight_decay)
+
+    # Adam update.
+    p.addcdiv_(m_hat, torch.sqrt(v_hat).add_(eps), value=-lr)
+
+    p.grad = None
+```
+
+\end{lstlisting}
+
+AdamW 的显存代价非常高。若模型参数量为 $N$，使用 BF16 参数和梯度，同时保存 FP32 master weight、FP32 一阶矩和 FP32 二阶矩，则粗略显存为：
+
+[
+M
+\approx
+2N
++
+2N
++
+4N
++
+4N
++
+4N
+==
+
+16N\ \mathrm{bytes}.
+]
+
+这与第 1 章的估算一致。对于 $70$B 参数模型，优化器相关状态是 ZeRO、FSDP 和分片 checkpoint 必须存在的重要原因。
+
+\begin{table}[H]
+\centering
+\small
+\caption{常见优化器的状态与工程代价}
+\label{tab:optimizer-state-cost}
+\begin{tabular}{p{0.18\textwidth}p{0.25\textwidth}p{0.24\textwidth}p{0.24\textwidth}}
+\toprule
+\textbf{优化器} & \textbf{核心状态} & \textbf{优点} & \textbf{工程代价} \
+\midrule
+SGD
+& 无额外状态或很少状态
+& 简单，显存低
+& 对学习率敏感，收敛可能慢。 \
+\midrule
+Momentum
+& 一阶速度 $\vect{v}$
+& 缓解震荡，加速一致方向
+& 每个参数多一个状态张量。 \
+\midrule
+Adam
+& 一阶矩 $\vect{m}$，二阶矩 $\vect{v}$
+& 自适应学习率，训练稳定
+& 优化器状态显存大。 \
+\midrule
+AdamW
+& 一阶矩、二阶矩、解耦 weight decay
+& Transformer/LLM 常用
+& 大模型训练中必须配合状态分片。 \
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Learning Rate Schedule}
+\label{subsec:learning-rate-schedule}
+
+学习率不是一个固定超参数，而是训练过程中的时间函数。记第 $t$ 步学习率为 $\eta_t$，则优化器更新依赖：
+[
+\vect{\theta}_{t+1}
+===================
+
+## \vect{\theta}_{t}
+
+\eta_t
+\cdot
+\operatorname{UpdateDirection}_t.
+]
+
+常见学习率调度包括：
+
+\begin{itemize}
+\item \textbf{constant}：保持固定学习率；
+\item \textbf{step decay}：每隔一定步数衰减；
+\item \textbf{linear decay}：线性下降；
+\item \textbf{cosine decay}：按余弦曲线平滑下降；
+\item \textbf{warmup + decay}：先从小学习率升高，再逐步下降。
+\end{itemize}
+
+大模型训练通常使用 warmup。原因是训练初期参数尚未稳定，梯度统计也不稳定，如果一开始使用过大学习率，容易产生 loss spike 或直接发散。warmup 让优化器先以较小步长探索，随后进入主训练阶段。
+
+\subsection{Warmup、Cosine Decay 与大模型训练稳定性}
+\label{subsec:warmup-cosine-stability}
+
+一种常见 schedule 是 linear warmup + cosine decay。设 warmup 步数为 $T_w$，总训练步数为 $T$，峰值学习率为 $\eta_{\max}$，最小学习率为 $\eta_{\min}$。当 $t<T_w$：
+[
+\eta_t=\eta_{\max}\frac{t}{T_w}.
+]
+当 $t\ge T_w$：
+[
+\eta_t
+======
+
+\eta_{\min}
++
+\frac{1}{2}(\eta_{\max}-\eta_{\min})
+\left[
+1+
+\cos
+\left(
+\pi
+\frac{t-T_w}{T-T_w}
+\right)
+\right].
+]
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+axis/.style={-{Latex[length=2.4mm]}, thick},
+curve/.style={thick},
+labelnode/.style={align=center}
+]
+
+```
+\node[font=\bfseries] at (0,3.0) {常见 Learning Rate Schedule};
+
+\draw[axis] (-5.8,-1.2) -- (5.8,-1.2) node[right] {step};
+\draw[axis] (-5.8,-1.2) -- (-5.8,2.2) node[above] {lr};
+
+% Constant
+\draw[curve, blue!70] (-5.3,1.55) -- (5.3,1.55);
+\node[blue!70] at (4.2,1.82) {constant};
+
+% Linear decay
+\draw[curve, green!60!black] (-5.3,1.8) -- (5.3,-0.55);
+\node[green!60!black] at (3.8,-0.2) {linear decay};
+
+% Warmup + cosine hand drawn
+\draw[curve, orange!90!black]
+  (-5.3,-0.85) -- (-3.6,1.75)
+  .. controls (-2.4,1.65) and (-1.2,1.35) .. (0.0,0.85)
+  .. controls (1.5,0.25) and (3.4,-0.35) .. (5.3,-0.7);
+\node[orange!90!black] at (-1.0,1.85) {warmup + cosine};
+
+\draw[dashed] (-3.6,-1.2) -- (-3.6,1.75);
+\node[align=center] at (-3.6,-1.6) {warmup\\end};
+
+\node[align=left, text width=10.6cm] at (0,-2.55) {
+  大模型训练中，warmup 有助于避免初期不稳定；cosine decay 让后期学习率平滑降低，
+  常用于提升收敛稳定性和最终 loss。
+};
+```
+
+\end{tikzpicture}
+\caption{Constant、Linear Decay 与 Warmup+Cosine Decay 学习率曲线}
+\label{fig:learning-rate-schedules}
+\end{figure}
+
+学习率 schedule 不只是算法问题，也是系统问题。大规模训练通常运行数天到数周，如果因为学习率设置不当在中后期发散，损失的不只是实验时间，还有大量 GPU 成本。因此成熟训练平台会记录并监控：
+
+\begin{itemize}
+\item 当前 step 与 token 数；
+\item 当前学习率；
+\item loss 曲线；
+\item gradient norm；
+\item optimizer state 是否出现 NaN；
+\item loss scaler 是否频繁回退；
+\item checkpoint 恢复后 schedule 是否正确延续。
+\end{itemize}
+
+\section{正则化与归一化}
+\label{sec:regularization-normalization}
+
+\subsection{Dropout}
+\label{subsec:dropout}
+
+Dropout 是一种正则化方法。训练时，它以概率 $p$ 将某些激活置零：
+[
+\tilde{h}_i=
+\begin{cases}
+0, & \text{with probability }p,\
+\frac{h_i}{1-p}, & \text{with probability }1-p.
+\end{cases}
+]
+其中 $\frac{1}{1-p}$ 是为了保持期望不变：
+[
+\mathbb{E}[\tilde{h}_i]=h_i.
+]
+
+Dropout 的直觉是防止模型过度依赖某些特定神经元，从而提升泛化能力。它在传统神经网络和早期 Transformer 中很常见。但在大规模语言模型预训练中，dropout 的使用会更加谨慎，原因包括：
+
+\begin{itemize}
+\item 大规模数据本身具有正则化效果；
+\item dropout 会引入随机性，影响训练吞吐和确定性复现；
+\item dropout mask 需要额外保存或重建，影响 backward；
+\item 某些大模型训练 recipe 会减少甚至移除 dropout。
+\end{itemize}
+
+从 kernel 角度看，dropout 需要随机数生成、mask 应用和缩放，通常属于 memory-bound elementwise 操作。高性能实现会把 dropout 与 bias、activation、residual 等操作融合。
+
+\subsection{BatchNorm}
+\label{subsec:batchnorm}
+
+BatchNorm 对 batch 维统计均值和方差。对于某个 channel，给定 mini-batch 中的值：
+[
+x_1,x_2,\ldots,x_m,
+]
+均值和方差为：
+[
+\mu_B=\frac{1}{m}\sum_{i=1}^{m}x_i,
+]
+[
+\sigma_B^2=\frac{1}{m}\sum_{i=1}^{m}(x_i-\mu_B)^2.
+]
+归一化输出为：
+[
+\hat{x}_i=\frac{x_i-\mu_B}{\sqrt{\sigma_B^2+\epsilon}},
+]
+再经过可学习仿射变换：
+[
+y_i=\gamma\hat{x}_i+\beta.
+]
+
+BatchNorm 在 CNN 中非常成功，但在 LLM 中不常用。主要原因是语言模型训练中的 batch、sequence 和并行切分更复杂，跨 batch 统计会引入同步和不稳定性。尤其在分布式训练中，如果 BatchNorm 需要跨设备统计均值方差，就会引入额外通信。
+
+\subsection{LayerNorm}
+\label{subsec:layernorm}
+
+LayerNorm 不依赖 batch 维统计，而是对每个样本内部的 hidden 维归一化。给定：
+[
+\vect{x}\in\mathbb{R}^{H},
+]
+均值为：
+[
+\mu=\frac{1}{H}\sum_{i=1}^{H}x_i,
+]
+方差为：
+[
+\sigma^2=\frac{1}{H}\sum_{i=1}^{H}(x_i-\mu)^2.
+]
+输出为：
+[
+y_i=\gamma_i\frac{x_i-\mu}{\sqrt{\sigma^2+\epsilon}}+\beta_i.
+]
+
+对于张量：
+[
+\tensor{X}\in\mathbb{R}^{B\times S\times H},
+]
+LayerNorm 通常对最后一维 $H$ 做归一化，即每个 $(b,s)$ 位置独立计算均值和方差。这非常适合 Transformer，因为它不依赖 batch size，也不需要跨样本同步统计。
+
+\subsection{RMSNorm}
+\label{subsec:rmsnorm}
+
+RMSNorm 是 LayerNorm 的变体。它不减均值，只使用均方根进行归一化：
+[
+\operatorname{RMS}(\vect{x})
+============================
+
+\sqrt{
+\frac{1}{H}\sum_{i=1}^{H}x_i^2+\epsilon
+}.
+]
+输出为：
+[
+y_i=\gamma_i\frac{x_i}{\operatorname{RMS}(\vect{x})}.
+]
+
+与 LayerNorm 相比，RMSNorm 少计算均值和减均值操作，形式更简单。许多现代 Decoder-only LLM 使用 RMSNorm，因为它在训练稳定性和计算效率之间取得了良好平衡。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+cell/.style={draw, minimum width=0.42cm, minimum height=0.38cm},
+box/.style={draw, rounded corners=2pt, fill=blue!4},
+bn/.style={draw, rounded corners=2pt, fill=orange!12},
+ln/.style={draw, rounded corners=2pt, fill=green!10},
+rms/.style={draw, rounded corners=2pt, fill=purple!10}
+]
+
+```
+\node[font=\bfseries] at (0,3.0) {BatchNorm、LayerNorm 与 RMSNorm 的统计维度};
+
+\node at (-4.3,2.2) {$\tensor{X}\in\mathbb{R}^{B\times S\times H}$};
+
+\foreach \r in {0,...,3} {
+  \foreach \c in {0,...,7} {
+    \node[cell, fill=blue!5] at ({-5.8+0.42*\c},{1.55-0.38*\r}) {};
+  }
+}
+\node at (-6.35,0.95) {$B/S$};
+\node at (-4.25,-0.25) {$H$};
+
+\node[bn, minimum width=3.3cm, minimum height=0.6cm, align=center] at (0.2,1.65)
+  {BatchNorm：跨 batch 统计};
+\draw[decorate,decoration={brace,amplitude=4pt},thick]
+  (-1.6,1.25) -- (-1.6,0.25)
+  node[midway,left=6pt,font=\scriptsize] {batch};
+
+\node[ln, minimum width=3.3cm, minimum height=0.6cm, align=center] at (0.2,0.55)
+  {LayerNorm：对 hidden 维统计 $\mu,\sigma^2$};
+\draw[decorate,decoration={brace,amplitude=4pt},thick]
+  (-1.35,0.15) -- (1.75,0.15)
+  node[midway,below=6pt,font=\scriptsize] {hidden};
+
+\node[rms, minimum width=3.8cm, minimum height=0.6cm, align=center] at (0.2,-0.65)
+  {RMSNorm：对 hidden 维统计 RMS，不减均值};
+
+\node[align=left, text width=5.0cm] at (4.0,0.55) {
+  LLM 中更常用 LayerNorm/RMSNorm，\\
+  因为它们不依赖 batch 统计，\\
+  更适合变长序列、分布式训练和小 micro-batch。
+};
+```
+
+\end{tikzpicture}
+\caption{BatchNorm、LayerNorm 与 RMSNorm 的统计维度差异}
+\label{fig:normalization-axes}
+\end{figure}
+
+\subsection{为什么 LLM 更偏好 LayerNorm / RMSNorm}
+\label{subsec:why-llm-prefers-layernorm-rmsnorm}
+
+LLM 更偏好 LayerNorm 或 RMSNorm，主要有以下原因：
+
+\begin{itemize}
+\item \textbf{不依赖 batch size}：大模型训练常因显存限制使用很小的 micro-batch，BatchNorm 的统计会不稳定。
+\item \textbf{不需要跨设备同步统计}：在数据并行、张量并行和流水线并行中，跨设备 BatchNorm 会增加通信复杂度。
+\item \textbf{适合序列建模}：每个 token 的 hidden state 可以独立归一化，不依赖其他样本。
+\item \textbf{实现简单且易融合}：LayerNorm/RMSNorm 常与 residual add、dropout 等操作融合。
+\item \textbf{训练稳定性好}：Pre-Norm Transformer 中，归一化放在 attention 和 FFN 之前，有助于深层网络训练。
+\end{itemize}
+
+LayerNorm 和 RMSNorm 的 kernel 通常包括 reduction 和 elementwise 操作。对于每个 token 的 hidden 向量，需要计算均值、方差或 RMS，再进行归一化和缩放。它们通常比 GEMM 更 memory-bound，因此 fused norm kernel 和高效 reduction 对大模型训练吞吐非常重要。
+
+\begin{lstlisting}[language=Python,caption={RMSNorm 的 PyTorch 实现},label={lst:rmsnorm-pytorch}]
+import torch
+import torch.nn as nn
+
+class RMSNorm(nn.Module):
+def **init**(self, hidden_size, eps=1e-6):
+super().**init**()
+self.weight = nn.Parameter(torch.ones(hidden_size))
+self.eps = eps
+
+```
+def forward(self, x):
+    # x: [batch, seq, hidden]
+    # Compute RMS along the hidden dimension.
+    variance = x.pow(2).mean(dim=-1, keepdim=True)
+    x_norm = x * torch.rsqrt(variance + self.eps)
+    return self.weight * x_norm
+```
+
+\end{lstlisting}
+
+这段代码表达清晰，但在大模型生产训练中，通常会使用 fused RMSNorm kernel。原因是 \texttt{pow}、\texttt{mean}、\texttt{rsqrt}、乘法等如果分别对应多个 kernel，会产生多次 HBM 读写。融合后可以在一个 kernel 中完成 reduction 和归一化，减少显存带宽压力。
+
+\section{混合精度训练}
+\label{sec:mixed-precision-training}
+
+\subsection{FP32、FP16、BF16、FP8}
+\label{subsec:fp32-fp16-bf16-fp8}
+
+深度学习训练最早大量使用 FP32。FP32 精度高、动态范围较大，但显存和带宽开销也大。为了提升训练吞吐并降低显存占用，现代 GPU 训练广泛使用低精度格式。
+
+常见格式包括：
+
+\begin{itemize}
+\item \textbf{FP32}：传统单精度浮点，稳定但成本高。
+\item \textbf{FP16}：半精度浮点，显存减半，Tensor Core 支持好，但指数位少，容易 overflow/underflow。
+\item \textbf{BF16}：Brain Floating Point，指数位与 FP32 相同，动态范围大，尾数位较少，训练稳定性通常优于 FP16。
+\item \textbf{TF32}：NVIDIA Tensor Core 上用于加速 FP32 GEMM 的格式，对用户通常表现为 FP32 输入、低精度乘法、高精度累加。
+\item \textbf{FP8}：更低精度格式，用于进一步提升吞吐和降低显存，但需要更复杂的 scaling 和稳定性控制。
+\end{itemize}
+
+浮点数通常可抽象为：
+[
+(-1)^{s}\times 2^{e-bias}\times (1.f),
+]
+其中 $s$ 是符号位，$e$ 是指数，$f$ 是尾数。指数位决定动态范围，尾数位决定有效精度。FP16 的指数位较少，所以训练中更容易出现数值下溢；BF16 保留与 FP32 相同数量级的指数范围，因此更适合大模型训练。
+
+\begin{table}[H]
+\centering
+\small
+\caption{常见数值格式的直观对比}
+\label{tab:numeric-format-comparison}
+\begin{tabular}{p{0.16\textwidth}p{0.18\textwidth}p{0.22\textwidth}p{0.32\textwidth}}
+\toprule
+\textbf{格式} & \textbf{位宽} & \textbf{特点} & \textbf{大模型训练中的意义} \
+\midrule
+FP32
+& 32 bit
+& 精度高、范围大
+& 稳定但显存和带宽成本高，常用于 master weight 或累加。 \
+\midrule
+FP16
+& 16 bit
+& 尾数较多，指数较少
+& Tensor Core 高效，但需要 loss scaling 防止梯度下溢。 \
+\midrule
+BF16
+& 16 bit
+& 指数范围接近 FP32
+& 大模型训练常用，稳定性通常优于 FP16。 \
+\midrule
+FP8
+& 8 bit
+& 显存和带宽更低
+& 需要 scaling recipe，适合特定硬件和成熟训练栈。 \
+\bottomrule
+\end{tabular}
+\end{table}
+
+下面预留一张位布局图片。实际排版时可以放入更精确的 FP32、FP16、BF16、FP8 bit layout 对比图。
+
+\begin{figure}[H]
+\centering
+\IfFileExists{figures/part1/numeric_formats_bit_layout.png}{
+\includegraphics[width=0.88\textwidth]{part1/numeric_formats_bit_layout.png}
+}{
+\fbox{
+\parbox{0.84\textwidth}{
+\centering
+\vspace{1.1cm}
+\textbf{预留图片位：FP32、FP16、BF16、FP8 数值格式位布局}[2mm]
+此处建议放入一张横向对比图，展示 sign、exponent、mantissa 在不同浮点格式中的位数分布。
+重点突出 BF16 与 FP32 拥有相近指数范围，而 FP16 指数位更少。[2mm]
+\textbf{图片生成 Prompt 建议：}\
+``Clean educational diagram comparing floating point bit layouts for FP32, FP16, BF16 and FP8, showing sign bit, exponent bits and mantissa bits as colored blocks, technical textbook style, high readability, white background.''
+\vspace{1.1cm}
+}
+}
+}
+\caption{不同浮点格式 bit layout 对比图预留位}
+\label{fig:numeric-format-bit-layout-placeholder}
+\end{figure}
+
+\subsection{Loss Scaling}
+\label{subsec:loss-scaling}
+
+FP16 的一个主要问题是梯度下溢。训练中很多梯度值非常小，如果直接用 FP16 表示，可能被舍入为 $0$。Loss scaling 的思想是：在 backward 前把 loss 放大一个系数 $S$：
+[
+\tilde{\mathcal{L}}=S\mathcal{L}.
+]
+于是梯度也被放大：
+[
+\nabla_{\theta}\tilde{\mathcal{L}}
+==================================
+
+S\nabla_{\theta}\mathcal{L}.
+]
+在 optimizer step 前，再把梯度除以 $S$：
+[
+\nabla_{\theta}\mathcal{L}
+==========================
+
+\frac{1}{S}
+\nabla_{\theta}\tilde{\mathcal{L}}.
+]
+
+这样做不会改变数学上的更新方向，却可以让小梯度落入 FP16 可表示范围。若放大系数过大，可能导致 overflow。因此混合精度训练通常使用 dynamic loss scaling：如果发现 inf 或 NaN，就降低 scale；如果一段时间内稳定，就尝试提高 scale。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+step/.style={draw, rounded corners=3pt, minimum width=2.1cm, minimum height=0.8cm, align=center, fill=blue!6},
+check/.style={draw, diamond, aspect=2.2, align=center, fill=orange!12},
+arrow/.style={-{Latex[length=2.3mm]}, thick}
+]
+
+```
+\node[step] (loss) at (-5.2,0) {Compute\\loss};
+\node[step] (scale) at (-2.7,0) {Scale loss\\$\tilde{L}=S L$};
+\node[step] (backward) at (-0.2,0) {Backward\\scaled grad};
+\node[step] (unscale) at (2.3,0) {Unscale\\grad / $S$};
+\node[check] (check) at (4.9,0) {inf/NaN?};
+
+\draw[arrow] (loss) -- (scale);
+\draw[arrow] (scale) -- (backward);
+\draw[arrow] (backward) -- (unscale);
+\draw[arrow] (unscale) -- (check);
+
+\node[step, fill=green!8] (stepok) at (4.9,-1.65) {Optimizer\\step};
+\node[step, fill=red!8] (skip) at (4.9,1.65) {Skip step\\reduce $S$};
+
+\draw[arrow] (check) -- node[right] {no} (stepok);
+\draw[arrow] (check) -- node[right] {yes} (skip);
+
+\node[align=left, text width=10.5cm] at (-0.1,-2.85) {
+  Loss scaling 常用于 FP16 训练。BF16 因指数范围更大，通常不需要像 FP16 那样依赖 loss scaling，
+  但仍然需要监控 NaN、inf 和梯度范数。
+};
+```
+
+\end{tikzpicture}
+\caption{混合精度训练中的 Dynamic Loss Scaling 流程}
+\label{fig:dynamic-loss-scaling}
+\end{figure}
+
+PyTorch AMP 中，loss scaling 通常通过 \texttt{GradScaler} 完成：
+
+\begin{lstlisting}[language=Python,caption={PyTorch AMP 与 GradScaler 训练循环},label={lst:pytorch-amp-gradscaler}]
+import torch
+import torch.nn as nn
+
+model = nn.Linear(4096, 4096).cuda()
+optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+
+scaler = torch.cuda.amp.GradScaler()
+
+for x, target in dataloader:
+x = x.cuda()
+target = target.cuda()
+
+```
+optimizer.zero_grad(set_to_none=True)
+
+# autocast chooses lower precision kernels when safe.
+with torch.cuda.amp.autocast(dtype=torch.float16):
+    logits = model(x)
+    loss = nn.functional.cross_entropy(logits, target)
+
+# Scale loss before backward.
+scaler.scale(loss).backward()
+
+# Unscale gradients, check inf/NaN, and step if safe.
+scaler.step(optimizer)
+
+# Update scale factor dynamically.
+scaler.update()
+```
+
+\end{lstlisting}
+
+对于 BF16 训练，很多系统会使用 \texttt{autocast(dtype=torch.bfloat16)}，并不使用 \texttt{GradScaler}。不过具体策略仍取决于硬件、框架版本、模型结构和训练 recipe。
+
+\subsection{Tensor Core 与矩阵乘法吞吐}
+\label{subsec:tensor-core-matmul-throughput}
+
+Tensor Core 是现代 NVIDIA GPU 上专门加速矩阵乘法累加的硬件单元。它可以高效执行小矩阵 tile 的乘加，例如：
+[
+\mat{D}=\mat{A}\mat{B}+\mat{C}.
+]
+深度学习中的 Linear、Attention projection、FFN、卷积等大量操作都可以映射到 Tensor Core。
+
+从编程层面看，用户可能只是写：
+[
+\mat{Y}=\mat{X}\mat{W}.
+]
+但底层库会把大矩阵切分成许多 tile，每个 tile 通过 Tensor Core 执行 MMA 操作，再写回输出矩阵。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+tile/.style={draw, rounded corners=2pt, minimum width=1.25cm, minimum height=1.0cm, align=center},
+arrow/.style={-{Latex[length=2.3mm]}, thick}
+]
+
+```
+\node[font=\bfseries] at (0,3.0) {Tensor Core 中的 Tile-based Matrix Multiply-Accumulate};
+
+\node[tile, fill=orange!15] (a) at (-3.6,1.1) {$A_{tile}$\\FP16/BF16};
+\node[tile, fill=green!15] (b) at (-1.5,1.1) {$B_{tile}$\\FP16/BF16};
+\node[tile, fill=blue!10] (c) at (0.6,1.1) {$C_{tile}$\\FP32 acc};
+
+\node[draw, rounded corners=3pt, fill=red!10, minimum width=2.7cm, minimum height=1.05cm, align=center] (tc) at (2.9,1.1)
+  {Tensor Core\\MMA};
+
+\node[tile, fill=purple!10] (d) at (5.4,1.1) {$D_{tile}$\\output};
+
+\draw[arrow] (a) -- (tc);
+\draw[arrow] (b) -- (tc);
+\draw[arrow] (c) -- (tc);
+\draw[arrow] (tc) -- (d);
+
+\node[align=center] at (2.9,0.1) {$D=A\times B+C$};
+
+\node[align=left, text width=10.2cm] at (1.0,-1.35) {
+  混合精度矩阵乘通常使用低精度输入、高精度累加。
+  要真正利用 Tensor Core，shape、dtype、layout 和对齐都需要满足底层库或 kernel 的要求。
+};
+```
+
+\end{tikzpicture}
+\caption{Tensor Core 的 tile-based MMA 计算直觉}
+\label{fig:tensor-core-mma}
+\end{figure}
+
+Tensor Core 的存在解释了为什么混合精度训练不只是节省显存，也能显著提升计算吞吐。但实际能否获得加速，还取决于：
+
+\begin{itemize}
+\item GEMM 尺寸是否足够大；
+\item $M,N,K$ 是否满足硬件友好的对齐；
+\item 输入是否 contiguous 或满足高效 stride；
+\item 是否使用支持 Tensor Core 的 dtype；
+\item cuBLAS/cuBLASLt 是否选中了合适算法；
+\item 是否有过多小 kernel 打断时间线。
+\end{itemize}
+
+\subsection{精度、速度与稳定性的取舍}
+\label{subsec:precision-speed-stability-tradeoff}
+
+混合精度训练的核心不是简单地把所有张量从 FP32 改成 FP16 或 BF16，而是在不同位置选择合适精度。常见策略包括：
+
+\begin{itemize}
+\item 参数 forward/backward 使用 BF16 或 FP16；
+\item 梯度通信使用 BF16 或 FP16；
+\item 优化器状态使用 FP32；
+\item 某些 reduction 或 norm 使用 FP32 累加；
+\item loss、softmax、logsumexp 等敏感操作使用更稳定实现；
+\item FP8 训练中为不同张量维护 scale。
+\end{itemize}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+box/.style={draw, rounded corners=3pt, minimum width=2.15cm, minimum height=0.8cm, align=center},
+arrow/.style={-{Latex[length=2.3mm]}, thick}
+]
+
+```
+\node[box, fill=blue!8] (param) at (-5.0,0.8) {BF16/FP16\\Parameters};
+\node[box, fill=green!8] (fwd) at (-2.4,0.8) {Forward\\Tensor Core};
+\node[box, fill=green!8] (bwd) at (0.2,0.8) {Backward\\Tensor Core};
+\node[box, fill=orange!12] (grad) at (2.8,0.8) {Gradients\\BF16/FP16};
+\node[box, fill=red!10] (optim) at (5.4,0.8) {Optimizer\\FP32 states};
+
+\draw[arrow] (param) -- (fwd);
+\draw[arrow] (fwd) -- (bwd);
+\draw[arrow] (bwd) -- (grad);
+\draw[arrow] (grad) -- (optim);
+\draw[arrow] (optim.south) .. controls (2.0,-1.2) and (-2.8,-1.2) .. (param.south);
+
+\node[box, fill=yellow!16, minimum width=3.0cm] at (-2.4,-0.55) {Sensitive ops\\FP32 accumulation};
+\node[box, fill=purple!10, minimum width=3.1cm] at (2.8,-0.55) {Communication\\compressed dtype};
+
+\node[align=left, text width=10.7cm] at (0,-2.0) {
+  混合精度是一套系统策略：哪些张量低精度保存，哪些运算高精度累加，
+  哪些通信可以压缩，哪些统计必须保持稳定，都需要根据模型和硬件共同决定。
+};
+```
+
+\end{tikzpicture}
+\caption{混合精度训练中的精度分配策略}
+\label{fig:mixed-precision-strategy}
+\end{figure}
+
+混合精度训练中的常见故障包括：
+
+\begin{itemize}
+\item loss 突然变成 NaN；
+\item gradient norm 爆炸；
+\item FP16 loss scaler 频繁下降；
+\item 某些 rank 出现 inf 后通过 all-reduce 扩散；
+\item checkpoint 恢复后 optimizer state dtype 不匹配；
+\item 自定义 CUDA kernel 未正确处理 BF16/FP16 累加精度。
+\end{itemize}
+
+因此，训练系统需要在日志和监控中暴露足够信息。仅仅看到 loss 变坏是不够的，还需要知道当前 dtype、loss scale、梯度范数、参数范数、是否发生 overflow、哪个 rank 先出问题、最近一次 checkpoint 是否可恢复。
+
+\section{端到端训练循环：从公式到工程}
+\label{sec:end-to-end-training-loop}
+
+为了把本章概念串起来，我们写出一个最小化训练循环。它包含 forward、loss、backward、optimizer step、zero grad 和混合精度上下文。
+
+\begin{lstlisting}[language=Python,caption={现代 PyTorch 训练循环骨架},label={lst:modern-pytorch-training-loop}]
+import torch
+import torch.nn as nn
+
+model = MyModel().cuda()
+optimizer = torch.optim.AdamW(
+model.parameters(),
+lr=3e-4,
+betas=(0.9, 0.95),
+weight_decay=0.1,
+)
+
+use_bf16 = True
+
+for step, batch in enumerate(train_loader):
+input_ids = batch["input_ids"].cuda(non_blocking=True)
+labels = batch["labels"].cuda(non_blocking=True)
+
+```
+optimizer.zero_grad(set_to_none=True)
+
+# Mixed precision forward.
+amp_dtype = torch.bfloat16 if use_bf16 else torch.float16
+with torch.cuda.amp.autocast(dtype=amp_dtype):
+    logits = model(input_ids)
+    loss = nn.functional.cross_entropy(
+        logits.view(-1, logits.size(-1)),
+        labels.view(-1),
+    )
+
+# Backward builds gradients for all parameters.
+loss.backward()
+
+# Optional: gradient clipping for stability.
+torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+# AdamW updates parameters and optimizer states.
+optimizer.step()
+
+if step % 100 == 0:
+    print(f"step={step}, loss={loss.item():.4f}")
+```
+
+\end{lstlisting}
+
+这段代码在 Python 层看起来很短，但从系统角度展开，会出现大量操作：
+
+\begin{itemize}
+\item data loader 将数据从存储读入 CPU 内存；
+\item token 或 batch 被拷贝到 GPU；
+\item forward 触发 embedding、GEMM、attention、norm、MLP 等 kernel；
+\item loss 触发 cross entropy kernel；
+\item backward 触发反向 GEMM、reduction、activation backward、norm backward；
+\item DDP 或其他并行策略触发通信；
+\item optimizer step 更新参数、梯度和状态；
+\item 日志、checkpoint、监控系统记录训练状态。
+\end{itemize}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+step/.style={draw, rounded corners=3pt, minimum width=1.8cm, minimum height=0.72cm, align=center, fill=blue!6},
+sys/.style={draw, rounded corners=3pt, minimum width=1.8cm, minimum height=0.72cm, align=center, fill=orange!12},
+arrow/.style={-{Latex[length=2.3mm]}, thick}
+]
+
+```
+\node[font=\bfseries] at (0,3.0) {一次训练 step 的系统展开};
+
+\node[sys] (data) at (-5.4,1.4) {Data\\Load};
+\node[step] (fwd) at (-3.2,1.4) {Forward};
+\node[step] (loss) at (-1.0,1.4) {Loss};
+\node[step] (bwd) at (1.2,1.4) {Backward};
+\node[sys] (comm) at (3.4,1.4) {Gradient\\Comm};
+\node[step] (opt) at (5.6,1.4) {Optimizer\\Step};
+
+\draw[arrow] (data) -- (fwd);
+\draw[arrow] (fwd) -- (loss);
+\draw[arrow] (loss) -- (bwd);
+\draw[arrow] (bwd) -- (comm);
+\draw[arrow] (comm) -- (opt);
+
+\node[sys, fill=green!8] (ckpt) at (-2.2,0.0) {Checkpoint};
+\node[sys, fill=green!8] (log) at (0.0,0.0) {Logging};
+\node[sys, fill=green!8] (monitor) at (2.2,0.0) {Monitoring};
+
+\draw[dashed, -{Latex[length=2.1mm]}] (opt.south) .. controls (3.0,0.1) .. (monitor.east);
+\draw[dashed, -{Latex[length=2.1mm]}] (loss.south) -- (log.north);
+\draw[dashed, -{Latex[length=2.1mm]}] (opt.south) .. controls (0.5,-0.4) .. (ckpt.east);
+
+\node[align=left, text width=10.4cm] at (0,-1.65) {
+  一个训练 step 不只是 forward/backward。数据、通信、优化器、checkpoint 和监控共同决定端到端吞吐与可靠性。
+};
+```
+
+\end{tikzpicture}
+\caption{训练 step 的端到端系统视角}
+\label{fig:training-step-system-view}
+\end{figure}
+
+从这里开始，我们已经具备理解后续章节的基本语言：Transformer block 是由这些基础组件堆叠而成；分布式训练是把这些参数、梯度、激活和优化器状态切分到多个 GPU；推理优化则是在不做 backward 的条件下，最大化 forward 和 decode 的效率。
+
+\section{本章小结}
+\label{sec:chapter03-summary}
+
+本章系统回顾了深度学习基本原理，并始终从 AI Infrastructure 的视角解释其工程代价。
+
+\begin{itemize}
+\item \textbf{线性层} 是神经网络和 Transformer 的主要参数与计算来源。Forward 和 backward 都会触发 GEMM。
+\item \textbf{激活函数} 引入非线性，但常属于 memory-bound elementwise 操作，生产系统中常与其他操作融合。
+\item \textbf{Loss function} 不仅定义训练目标，也可能形成显存和带宽瓶颈，尤其是大词表语言模型中的 cross entropy。
+\item \textbf{反向传播} 是链式法则在计算图上的应用，需要保存前向激活，因此训练显存远大于推理。
+\item \textbf{Gradient Checkpointing} 通过重计算减少激活显存，是长上下文和大模型训练中的关键技术。
+\item \textbf{SGD、Momentum、AdamW} 体现了不同优化思想，同时也带来不同优化器状态显存成本。
+\item \textbf{Learning Rate Schedule} 对大模型训练稳定性至关重要，warmup 和 cosine decay 是常见组合。
+\item \textbf{LayerNorm 与 RMSNorm} 更适合 LLM，因为它们不依赖 batch 统计，避免跨设备同步，并适配变长序列。
+\item \textbf{混合精度训练} 通过低精度计算和高精度累加平衡速度、显存与稳定性，是现代 GPU 训练的默认路径。
+\end{itemize}
+
+到此，第一篇的基础部分已经完成：第 1 章建立数学对象和显存计算意识，第 2 章解释 CUDA 和 GPU 执行模型，第 3 章把神经网络训练过程拆解为参数、激活、梯度、优化器状态和数值精度。下一章将进入 Transformer 架构深度剖析，我们会把这些基础组件组合成现代大语言模型最核心的计算结构。

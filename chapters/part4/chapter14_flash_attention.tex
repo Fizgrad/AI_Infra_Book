@@ -1,0 +1,1782 @@
+\chapter{FlashAttention 算法}
+\label{chap:flash-attention}
+
+\section{标准 Attention 的 IO 瓶颈}
+\label{sec:standard-attention-io-bottleneck}
+
+上一章讨论了 PagedAttention。PagedAttention 解决的是在线 serving 中 KV Cache 的\textbf{内存管理问题}：请求长度不一、动态加入退出、KV Cache 增长和释放，都会造成碎片与 over-reservation。PagedAttention 通过 block table 让逻辑连续的 KV Cache 可以物理离散存储。
+
+本章讨论另一个方向：\textbf{Attention 计算本身的 IO 瓶颈}。这就是 FlashAttention 要解决的问题。
+
+标准 Attention 的数学公式非常简单：
+
+[
+\operatorname{Attention}(\mat{Q},\mat{K},\mat{V})
+=================================================
+
+\softmax
+\left(
+\frac{\mat{Q}\mat{K}^{\mathsf{T}}}{\sqrt{d_h}}
+\right)
+\mat{V}.
+]
+
+如果只从数学上看，计算过程似乎只是三步：
+
+[
+\mat{S}=\frac{\mat{Q}\mat{K}^{\mathsf{T}}}{\sqrt{d_h}},
+]
+[
+\mat{P}=\softmax(\mat{S}),
+]
+[
+\mat{O}=\mat{P}\mat{V}.
+]
+
+但在 GPU 上，性能不只取决于 FLOPs，还取决于数据如何在 HBM、L2、shared memory、register 之间移动。标准 Attention 最大的问题，是它通常会显式物化巨大的中间矩阵：
+
+[
+\mat{S}\in\mathbb{R}^{S\times S},
+\quad
+\mat{P}\in\mathbb{R}^{S\times S}.
+]
+
+其中 $S$ 是序列长度。随着上下文长度增长，$S^2$ 级别的中间矩阵会带来巨大的 HBM 读写压力。FlashAttention 的核心不是改变 Attention 的数学结果，而是改变计算路径：\textbf{不把完整 attention matrix 写入 HBM，而是在片上 SRAM/register 中分块完成 softmax 和 weighted sum}。
+
+\subsection{$QK^{\mathsf{T}}$ 的中间矩阵}
+\label{subsec:qk-intermediate-matrix}
+
+考虑单个 batch、单个 attention head。设：
+
+[
+\mat{Q},\mat{K},\mat{V}\in\mathbb{R}^{S\times d_h}.
+]
+
+标准 Attention 第一步计算 score matrix：
+
+[
+\mat{S}=\mat{Q}\mat{K}^{\mathsf{T}},
+]
+
+其中：
+
+[
+\mat{S}\in\mathbb{R}^{S\times S}.
+]
+
+第 $i$ 行第 $j$ 列为：
+
+[
+S_{ij}
+======
+
+\langle \vect{q}_i,\vect{k}_j\rangle.
+]
+
+对于 causal attention，还需要 mask：
+
+[
+S_{ij}=-\infty,\quad j>i.
+]
+
+然后对每一行做 softmax：
+
+[
+P_{ij}
+======
+
+\frac{\exp(S_{ij}-m_i)}
+{\sum_{j'}\exp(S_{ij'}-m_i)},
+]
+其中 $m_i=\max_j S_{ij}$ 用于数值稳定。
+
+最后输出：
+
+[
+\vect{o}_i
+==========
+
+\sum_j P_{ij}\vect{v}_j.
+]
+
+问题出现在 $\mat{S}$ 和 $\mat{P}$。如果 $S=4096$，则单 head 的 attention matrix 元素个数为：
+
+[
+4096^2=16{,}777{,}216.
+]
+
+若使用 FP16/BF16，每个元素 2 bytes，则一个矩阵约为：
+
+[
+32\ \mathrm{MB}.
+]
+
+如果同时保存 score、softmax probability、dropout mask 或 backward 所需中间结果，显存和 HBM traffic 会更高。对于多 head、多 batch、多层，这个开销会迅速放大。
+
+[
+M_{\mathrm{attn\ matrix}}
+=========================
+
+B\cdot n_h\cdot S^2\cdot s_{\mathrm{dtype}}.
+]
+
+例如：
+
+[
+B=8,\quad n_h=32,\quad S=4096,\quad s_{\mathrm{dtype}}=2.
+]
+
+则仅一个 $B\times n_h\times S\times S$ 矩阵就需要：
+
+[
+8\times 32\times 4096^2\times 2
+\approx
+8.59\ \mathrm{GB}.
+]
+
+这只是单层 attention 的一个中间矩阵。训练时还要考虑 backward 保存和重读，开销更加不可接受。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+tensor/.style={draw, rounded corners=3pt, minimum width=1.55cm, minimum height=0.75cm, align=center},
+big/.style={draw, rounded corners=3pt, minimum width=2.0cm, minimum height=1.15cm, align=center},
+arrow/.style={-{Latex[length=2.2mm]}, thick}
+]
+
+```
+\node[font=\bfseries] at (0,3.35) {标准 Attention 显式物化 $S\times S$ 中间矩阵};
+
+\node[tensor, fill=blue!8] (q) at (-5.2,1.4) {$Q$\\$S,d_h$};
+\node[tensor, fill=blue!8] (k) at (-5.2,0.35) {$K$\\$S,d_h$};
+\node[big, fill=orange!14] (score) at (-2.6,0.85) {$S=QK^T$\\$S,S$};
+\node[big, fill=green!12] (prob) at (0.25,0.85) {$P=\softmax(S)$\\$S,S$};
+\node[tensor, fill=blue!8] (v) at (2.65,0.2) {$V$\\$S,d_h$};
+\node[tensor, fill=purple!10] (o) at (5.0,0.85) {$O=PV$\\$S,d_h$};
+
+\draw[arrow] (q) -- (score);
+\draw[arrow] (k) -- (score);
+\draw[arrow] (score) -- node[above] {write/read HBM} (prob);
+\draw[arrow] (prob) -- (o);
+\draw[arrow] (v) -- (o);
+
+\node[draw, rounded corners=3pt, fill=red!8, minimum width=2.6cm, minimum height=0.55cm, align=center] at (-1.2,-0.95)
+  {large $S\times S$ traffic};
+
+\node[align=left, text width=10.5cm] at (0,-2.05) {
+  标准实现往往把 score matrix 和 softmax matrix 写入 HBM，再从 HBM 读回。
+  当序列长度变大时，中间矩阵读写成为主要瓶颈。
+};
+```
+
+\end{tikzpicture}
+\caption{标准 Attention 的中间矩阵物化流程}
+\label{fig:standard-attention-materialization}
+\end{figure}
+
+\subsection{HBM 与 SRAM 的带宽差异}
+\label{subsec:hbm-vs-sram-bandwidth}
+
+现代 GPU 有多级存储层次。对深度学习 kernel 来说，最重要的几层是：
+
+\begin{itemize}
+\item \textbf{HBM}：容量大，带宽高，但相比片上存储仍然慢；
+\item \textbf{L2 Cache}：片上共享缓存，容量比 HBM 小得多；
+\item \textbf{Shared Memory / SRAM}：每个 SM 内部可编程片上存储，延迟低、带宽高、容量有限；
+\item \textbf{Registers}：线程私有，最快但数量有限。
+\end{itemize}
+
+标准 Attention 的问题是，它在 HBM 中读写了太多中间结果。即使 GPU 的 Tensor Core 对矩阵乘法很快，如果数据需要反复从 HBM 搬进搬出，整体性能仍会被内存带宽限制。
+
+可以把一个 GPU kernel 的执行理解为：
+
+[
+\text{HBM}
+\rightarrow
+\text{SRAM/register}
+\rightarrow
+\text{compute}
+\rightarrow
+\text{HBM}.
+]
+
+如果中间矩阵 $\mat{S}$ 和 $\mat{P}$ 都写回 HBM，再读回继续计算，则数据路径变成：
+
+[
+Q,K,V
+\rightarrow
+\mat{S}\ \text{write HBM}
+\rightarrow
+\mat{S}\ \text{read HBM}
+\rightarrow
+\mat{P}\ \text{write HBM}
+\rightarrow
+\mat{P}\ \text{read HBM}
+\rightarrow
+O.
+]
+
+FlashAttention 的目标是减少这类 HBM 往返。它将 Q、K、V 按块搬入 SRAM/register，在片上计算 score、softmax 和局部输出累积，中间 attention matrix 不落地到 HBM。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+mem/.style={draw, rounded corners=4pt, minimum width=3.0cm, minimum height=0.75cm, align=center},
+arrow/.style={-{Latex[length=2.2mm]}, thick}
+]
+
+```
+\node[font=\bfseries] at (0,3.25) {GPU 存储层次与 Attention IO};
+
+\node[mem, fill=orange!14] (hbm) at (0,2.0) {HBM\\large capacity, high latency};
+\node[mem, fill=green!12] (l2) at (0,0.95) {L2 Cache};
+\node[mem, fill=blue!8] (smem) at (0,-0.1) {Shared Memory / SRAM\\small capacity, high bandwidth};
+\node[mem, fill=purple!10] (reg) at (0,-1.15) {Registers\\fastest, tiny};
+
+\draw[arrow] (hbm) -- (l2);
+\draw[arrow] (l2) -- (smem);
+\draw[arrow] (smem) -- (reg);
+
+\node[align=left, text width=10.5cm] at (0,-2.35) {
+  FlashAttention 的关键是把尽可能多的中间计算留在 SRAM/register 中完成，
+  避免把 $S\times S$ attention matrix 写入 HBM。
+};
+```
+
+\end{tikzpicture}
+\caption{HBM 与片上 SRAM/register 的存储层次}
+\label{fig:hbm-sram-memory-hierarchy}
+\end{figure}
+
+\subsection{计算复杂度与 IO 复杂度}
+\label{subsec:compute-complexity-and-io-complexity}
+
+标准 Attention 和 FlashAttention 在数学上都计算精确 Attention。它们的 FLOPs 复杂度同阶：
+
+[
+O(S^2d_h).
+]
+
+这意味着 FlashAttention 并不是通过把 attention 变成稀疏或近似来减少数学计算。它的收益来自 IO 复杂度下降。
+
+为了理解这一点，需要区分：
+
+\begin{itemize}
+\item \textbf{计算复杂度}：执行多少乘加、指数、除法等运算；
+\item \textbf{IO 复杂度}：数据在 HBM 与片上存储之间搬运多少次。
+\end{itemize}
+
+在 GPU 上，如果 kernel 是 compute-bound，优化 FLOPs 更重要；如果 kernel 是 memory-bound，减少 HBM 读写更重要。标准 Attention 中，$S\times S$ 中间矩阵导致 HBM traffic 很高，尤其在长序列下，IO 成本可能主导运行时间。
+
+粗略看，标准 Attention 至少涉及：
+
+[
+\text{read }Q,K,V,
+]
+[
+\text{write }S,
+]
+[
+\text{read }S,
+]
+[
+\text{write }P,
+]
+[
+\text{read }P,V,
+]
+[
+\text{write }O.
+]
+
+其中 $S$ 和 $P$ 都是 $S\times S$ 大矩阵。FlashAttention 则尽量只读 Q/K/V，写 O，并保存少量 softmax 统计量，例如每行最大值和归一化分母：
+
+[
+m_i,\quad l_i.
+]
+
+因此，它把 attention 的显存复杂度从需要保存 $O(S^2)$ 中间矩阵，降低到只需要 $O(S)$ 级别的辅助统计量和 $O(Sd_h)$ 的输出。
+
+\begin{table}[H]
+\centering
+\small
+\caption{标准 Attention 与 FlashAttention 的关键区别}
+\label{tab:standard-vs-flash-attention}
+\begin{tabular}{p{0.24\textwidth}p{0.32\textwidth}p{0.34\textwidth}}
+\toprule
+\textbf{维度} & \textbf{标准 Attention} & \textbf{FlashAttention} \
+\midrule
+数学结果
+& 精确 Attention
+& 精确 Attention \
+\midrule
+FLOPs 复杂度
+& $O(S^2d_h)$
+& $O(S^2d_h)$，可能有少量重计算 \
+\midrule
+中间矩阵
+& 常物化 $S\times S$ score/probability
+& 不物化完整 attention matrix \
+\midrule
+主要优化目标
+& 简单分步执行
+& 减少 HBM 读写，提升 IO efficiency \
+\midrule
+显存占用
+& 需要保存较大中间矩阵
+& 只保存输出和少量 softmax 统计量 \
+\midrule
+适用价值
+& 短序列或简单实现
+& 长序列、高 batch、训练和 prefill 场景 \
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{为什么不是 FLOPs 越少越快}
+\label{subsec:why-fewer-flops-not-always-faster}
+
+很多性能优化初学者会自然地认为：算法 FLOPs 越少，速度越快。但在 GPU 上，这并不总成立。一个 kernel 的速度常常受以下因素共同决定：
+
+\begin{itemize}
+\item HBM 读写量；
+\item L2 cache 命中；
+\item shared memory 使用；
+\item register pressure；
+\item Tensor Core 利用率；
+\item warp occupancy；
+\item memory coalescing；
+\item kernel launch 和同步；
+\item 数据 layout；
+\item 是否有中间 tensor 落地。
+\end{itemize}
+
+FlashAttention 的一个重要启发是：\textbf{宁可做一些额外计算，也要避免昂贵的 HBM 读写}。尤其在 backward 中，FlashAttention 可以选择不保存完整 attention probability，而是在 backward 时重新计算需要的 score 和 softmax 块。这增加了 FLOPs，但减少了巨大的中间矩阵存储和读取。
+
+这与 gradient checkpointing 的思想类似：用重计算换显存和 IO。区别在于 FlashAttention 的重计算发生在更细粒度的 attention kernel 内部，并且与 tiling 和 online softmax 结合。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+axis/.style={-{Latex[length=2.2mm]}, thick},
+point/.style={circle, draw, fill=blue!10, minimum size=0.18cm},
+line/.style={thick}
+]
+
+```
+\node[font=\bfseries] at (0,3.0) {Roofline 视角：Attention 可能受 IO 而非 FLOPs 限制};
+
+\draw[axis] (-5.0,-1.2) -- (5.1,-1.2) node[right] {arithmetic intensity};
+\draw[axis] (-5.0,-1.2) -- (-5.0,2.2) node[above] {performance};
+
+\draw[line, orange!80!black] (-4.7,-1.0) -- (-1.5,1.5);
+\draw[line, orange!80!black] (-1.5,1.5) -- (4.7,1.5);
+
+\node[point, fill=red!18] (std) at (-3.2,0.15) {};
+\node[anchor=west] at (-3.0,0.15) {standard attention};
+
+\node[point, fill=green!18] (flash) at (0.1,1.2) {};
+\node[anchor=west] at (0.3,1.2) {FlashAttention};
+
+\node[align=center, font=\scriptsize] at (-3.2,-0.45) {memory-bound};
+\node[align=center, font=\scriptsize] at (2.2,1.85) {compute-bound ceiling};
+
+\node[align=left, text width=10.5cm] at (0,-2.35) {
+  减少 HBM traffic 可以提高 arithmetic intensity，使 kernel 从 memory-bound 区域向更高性能区域移动。
+  因此即使 FLOPs 没有减少，甚至略有增加，wall-clock 时间仍可能下降。
+};
+```
+
+\end{tikzpicture}
+\caption{从 roofline 模型理解 FlashAttention 的 IO-aware 思路}
+\label{fig:attention-roofline-intuition}
+\end{figure}
+
+\section{Online Softmax}
+\label{sec:online-softmax}
+
+FlashAttention 的数学核心之一是 online softmax。Attention 的困难在于 softmax 的分母依赖整行所有元素：
+
+[
+\softmax(x_i)
+=============
+
+\frac{e^{x_i}}
+{\sum_j e^{x_j}}.
+]
+
+如果把 score matrix 按列分块计算，那么在只看到一个块时，并不知道整行的全局最大值和全局分母。Online softmax 解决了这个问题：它允许我们一块一块处理 score，同时维护每一行的最大值和指数和，最终得到与一次性 softmax 完全一致的结果。
+
+\subsection{softmax 的数值稳定性}
+\label{subsec:softmax-numerical-stability}
+
+直接计算：
+
+[
+\frac{e^{x_i}}{\sum_j e^{x_j}}
+]
+
+容易溢出。数值稳定做法是减去最大值：
+
+[
+m=\max_j x_j.
+]
+
+然后：
+
+[
+\softmax(x_i)
+=============
+
+\frac{e^{x_i-m}}
+{\sum_j e^{x_j-m}}.
+]
+
+因为：
+
+[
+\frac{e^{x_i-m}}{\sum_j e^{x_j-m}}
+==================================
+
+# \frac{e^{x_i}e^{-m}}{\sum_j e^{x_j}e^{-m}}
+
+\frac{e^{x_i}}{\sum_j e^{x_j}}.
+]
+
+减去 $m$ 不改变 softmax 结果，但能防止指数溢出。
+
+标准 softmax 通常分两步：
+
+[
+m=\max_j x_j,
+]
+[
+l=\sum_j e^{x_j-m}.
+]
+
+然后输出：
+
+[
+y_i=\frac{e^{x_i-m}}{l}.
+]
+
+如果 $x$ 是 attention score 的一行，那么 $j$ 遍历所有 key positions。FlashAttention 分块处理时，需要在多个 blocks 之间维护同样的 $m$ 和 $l$。
+
+\subsection{分块计算中的 max 与 sum 更新}
+\label{subsec:blockwise-max-sum-update}
+
+假设一行 score 被分成多个 blocks。当前已经处理过若干 blocks，维护：
+
+[
+m_{\mathrm{old}}
+================
+
+\max_{\text{old blocks}} x_j,
+]
+[
+l_{\mathrm{old}}
+================
+
+\sum_{\text{old blocks}} e^{x_j-m_{\mathrm{old}}}.
+]
+
+现在处理新 block，计算该 block 的局部最大值：
+
+[
+m_{\mathrm{blk}}
+================
+
+\max_{\text{new block}} x_j,
+]
+
+和局部指数和：
+
+[
+l_{\mathrm{blk}}
+================
+
+\sum_{\text{new block}} e^{x_j-m_{\mathrm{blk}}}.
+]
+
+合并 old blocks 与 new block 的全局最大值为：
+
+[
+m_{\mathrm{new}}
+================
+
+\max(m_{\mathrm{old}},m_{\mathrm{blk}}).
+]
+
+旧的指数和 $l_{\mathrm{old}}$ 是以 $m_{\mathrm{old}}$ 为基准的。要改成以 $m_{\mathrm{new}}$ 为基准，需要乘缩放因子：
+
+[
+e^{m_{\mathrm{old}}-m_{\mathrm{new}}}.
+]
+
+新 block 的指数和也要改成以 $m_{\mathrm{new}}$ 为基准：
+
+[
+e^{m_{\mathrm{blk}}-m_{\mathrm{new}}}.
+]
+
+因此：
+
+[
+l_{\mathrm{new}}
+================
+
+e^{m_{\mathrm{old}}-m_{\mathrm{new}}}l_{\mathrm{old}}
++
+e^{m_{\mathrm{blk}}-m_{\mathrm{new}}}l_{\mathrm{blk}}.
+]
+
+这就是 online softmax 的核心更新公式。
+
+\subsection{避免完整 attention matrix}
+\label{subsec:avoid-full-attention-matrix}
+
+Attention 输出不是 softmax 本身，而是：
+
+[
+\vect{o}
+========
+
+\sum_j
+\frac{e^{x_j-m}}{l}
+\vect{v}_j.
+]
+
+分块时，不仅要维护 $m$ 和 $l$，还要维护未归一化的输出累积。设旧输出累积为：
+
+[
+\vect{o}_{\mathrm{old}}
+=======================
+
+\sum_{\text{old blocks}}
+\frac{e^{x_j-m_{\mathrm{old}}}}
+{l_{\mathrm{old}}}
+\vect{v}_j.
+]
+
+更方便的做法是维护带分母的累积量：
+
+[
+\vect{a}_{\mathrm{old}}
+=======================
+
+# l_{\mathrm{old}}\vect{o}_{\mathrm{old}}
+
+\sum_{\text{old blocks}}
+e^{x_j-m_{\mathrm{old}}}\vect{v}_j.
+]
+
+新 block 的累积量为：
+
+[
+\vect{a}_{\mathrm{blk}}
+=======================
+
+\sum_{\text{new block}}
+e^{x_j-m_{\mathrm{blk}}}\vect{v}_j.
+]
+
+合并到新基准 $m_{\mathrm{new}}$ 后：
+
+[
+\vect{a}_{\mathrm{new}}
+=======================
+
+e^{m_{\mathrm{old}}-m_{\mathrm{new}}}\vect{a}*{\mathrm{old}}
++
+e^{m*{\mathrm{blk}}-m_{\mathrm{new}}}\vect{a}_{\mathrm{blk}}.
+]
+
+最终输出：
+
+[
+\vect{o}_{\mathrm{new}}
+=======================
+
+\frac{\vect{a}*{\mathrm{new}}}{l*{\mathrm{new}}}.
+]
+
+这意味着我们可以一块一块处理 score 和 V，持续更新：
+
+[
+m_i,\quad l_i,\quad \vect{a}_i,
+]
+
+而不需要保存整行 $S$ 个 softmax probability，更不需要保存完整 $S\times S$ attention matrix。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+block/.style={draw, rounded corners=3pt, minimum width=1.45cm, minimum height=0.65cm, align=center},
+state/.style={draw, rounded corners=3pt, minimum width=1.4cm, minimum height=0.55cm, align=center, fill=green!10},
+arrow/.style={-{Latex[length=2.1mm]}, thick}
+]
+
+```
+\node[font=\bfseries] at (0,3.2) {Online Softmax 分块更新};
+
+\node[block, fill=blue!8] (b0) at (-5.1,1.3) {score\\block 0};
+\node[state] (s0) at (-3.3,1.3) {$m,l,a$};
+
+\node[block, fill=blue!8] (b1) at (-1.7,1.3) {score\\block 1};
+\node[state] (s1) at (0.1,1.3) {$m,l,a$};
+
+\node[block, fill=blue!8] (b2) at (1.7,1.3) {score\\block 2};
+\node[state] (s2) at (3.5,1.3) {$m,l,a$};
+
+\node[block, fill=purple!10] (out) at (5.2,1.3) {$O=a/l$};
+
+\draw[arrow] (b0) -- (s0);
+\draw[arrow] (s0) -- (b1);
+\draw[arrow] (b1) -- (s1);
+\draw[arrow] (s1) -- (b2);
+\draw[arrow] (b2) -- (s2);
+\draw[arrow] (s2) -- (out);
+
+\node[align=left, text width=10.5cm] at (0,-0.65) {
+  每处理一个 score block，就更新该行的最大值 $m$、指数和 $l$ 与输出累积 $a$。
+  最终结果与一次性 softmax 完全一致，但不需要物化完整 attention row。
+};
+```
+
+\end{tikzpicture}
+\caption{Online softmax 的分块归约流程}
+\label{fig:online-softmax-blockwise}
+\end{figure}
+
+\subsection{online softmax 推导}
+\label{subsec:online-softmax-derivation}
+
+下面把推导整理成更系统的形式。对某一行 attention score，分块处理。第 $r$ 个 block 的元素集合为 $\mathcal{B}_r$。
+
+局部最大值：
+
+[
+m_r=\max_{j\in\mathcal{B}_r} x_j.
+]
+
+局部指数和：
+
+[
+l_r=\sum_{j\in\mathcal{B}_r}e^{x_j-m_r}.
+]
+
+局部 value 累积：
+
+[
+\vect{a}_r
+==========
+
+\sum_{j\in\mathcal{B}_r}
+e^{x_j-m_r}\vect{v}_j.
+]
+
+若当前已经合并到第 $r-1$ 个 block，状态为：
+
+[
+m^{(r-1)},\quad l^{(r-1)},\quad \vect{a}^{(r-1)}.
+]
+
+合并第 $r$ 个 block：
+
+[
+m^{(r)}
+=======
+
+\max(m^{(r-1)},m_r).
+]
+
+[
+l^{(r)}
+=======
+
+e^{m^{(r-1)}-m^{(r)}}l^{(r-1)}
++
+e^{m_r-m^{(r)}}l_r.
+]
+
+[
+\vect{a}^{(r)}
+==============
+
+e^{m^{(r-1)}-m^{(r)}}\vect{a}^{(r-1)}
++
+e^{m_r-m^{(r)}}\vect{a}_r.
+]
+
+处理完所有 blocks 后：
+
+[
+\vect{o}
+========
+
+\frac{\vect{a}^{(R)}}{l^{(R)}}.
+]
+
+这个公式的关键在于缩放因子。每当全局最大值变大，旧累积量必须被重新缩放，否则 softmax 分母不一致。FlashAttention 的 kernel 就是把这种数学更新嵌入到 tiled attention 计算中。
+
+下面给出一个教学版 online softmax attention 的 Python 伪代码。它强调数学流程，不代表高性能实现。
+
+\begin{lstlisting}[language=Python,caption={教学版 Online Softmax Attention 伪代码},label={lst:online-softmax-attention-pseudocode}]
+import math
+import torch
+
+def online_attention_one_row(q, k, v, block_size):
+"""
+q: [d]
+k: [seq_len, d]
+v: [seq_len, d]
+return: [d]
+"""
+seq_len = k.shape[0]
+scale = 1.0 / math.sqrt(q.shape[0])
+
+```
+m = torch.tensor(-float("inf"), device=q.device)
+l = torch.tensor(0.0, device=q.device)
+acc = torch.zeros_like(q)
+
+for start in range(0, seq_len, block_size):
+    end = min(start + block_size, seq_len)
+
+    k_blk = k[start:end]  # [B_blk, d]
+    v_blk = v[start:end]  # [B_blk, d]
+
+    scores = (k_blk @ q) * scale  # [B_blk]
+    m_blk = torch.max(scores)
+    p_blk = torch.exp(scores - m_blk)
+    l_blk = torch.sum(p_blk)
+    acc_blk = p_blk @ v_blk
+
+    m_new = torch.maximum(m, m_blk)
+
+    old_scale = torch.exp(m - m_new)
+    blk_scale = torch.exp(m_blk - m_new)
+
+    acc = old_scale * acc + blk_scale * acc_blk
+    l = old_scale * l + blk_scale * l_blk
+    m = m_new
+
+return acc / l
+```
+
+\end{lstlisting}
+
+实际 FlashAttention 会同时处理一个 $Q$ block 的多行，而不是一行；会在 shared memory/register 中计算 block GEMM；会进行向量化、warp-level reduction 和 Tensor Core MMA。上面代码只是展示 online softmax 的数学骨架。
+
+\section{FlashAttention 核心算法}
+\label{sec:flashattention-core-algorithm}
+
+FlashAttention 的核心可以概括为四句话：
+
+\begin{enumerate}
+\item 将 $Q,K,V$ 沿序列维分块；
+\item 将 $K,V$ blocks 搬入 SRAM；
+\item 对 $Q$ blocks 计算局部 attention，并用 online softmax 更新输出；
+\item 不把完整 $S\times S$ attention matrix 写入 HBM。
+\end{enumerate}
+
+它的设计目标不是减少 Attention 的数学复杂度，而是最小化 HBM 与片上存储之间的 IO。
+
+\subsection{tiling}
+\label{subsec:flashattention-tiling}
+
+设序列长度为 $S$。将 Q 按行切成 blocks：
+
+[
+\mat{Q}_1,\mat{Q}*2,\ldots,\mat{Q}*{T_Q},
+]
+
+每个 Q block 大小约为：
+
+[
+B_Q\times d_h.
+]
+
+将 K/V 也按序列维切成 blocks：
+
+[
+(\mat{K}_1,\mat{V}_1),
+(\mat{K}*2,\mat{V}*2),
+\ldots,
+(\mat{K}*{T_K},\mat{V}*{T_K}),
+]
+
+每个 K/V block 大小约为：
+
+[
+B_K\times d_h.
+]
+
+对于一个 Q block 和一个 K block，局部 score 为：
+
+[
+\mat{S}_{ij}
+============
+
+\mat{Q}_i\mat{K}_j^{\mathsf{T}}.
+]
+
+它的 shape 为：
+
+[
+B_Q\times B_K.
+]
+
+这个局部矩阵可以放在 SRAM/register 中处理，而不需要写入 HBM。对所有 K/V blocks 迭代，使用 online softmax 更新 Q block 对应的输出。
+
+[
+\mat{O}_i
+=========
+
+\operatorname{Attention}(\mat{Q}_i,\mat{K},\mat{V}).
+]
+
+最终只将 $\mat{O}_i$ 写回 HBM。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+tile/.style={draw, rounded corners=2pt, minimum width=0.9cm, minimum height=0.55cm, align=center},
+mat/.style={draw, rounded corners=3pt, minimum width=1.5cm, minimum height=1.0cm, align=center},
+arrow/.style={-{Latex[length=2.1mm]}, thick}
+]
+
+```
+\node[font=\bfseries] at (0,3.35) {FlashAttention Tiling 数据流};
+
+\node[mat, fill=blue!8] (q) at (-5.2,1.25) {$Q$};
+\foreach \i/\y in {0/1.75,1/1.25,2/0.75} {
+  \node[tile, fill=blue!12] at (-5.2,\y) {$Q_{\i}$};
+}
+
+\node[mat, fill=green!10] (kv) at (-2.8,1.25) {$K,V$};
+\foreach \i/\y in {0/1.75,1/1.25,2/0.75} {
+  \node[tile, fill=green!14] at (-2.8,\y) {$K_{\i},V_{\i}$};
+}
+
+\node[mat, fill=orange!14, minimum width=2.2cm] (sram) at (0.0,1.25) {SRAM/register\\block compute};
+
+\node[mat, fill=purple!10] (online) at (2.9,1.25) {online\\softmax update};
+
+\node[mat, fill=red!8] (out) at (5.2,1.25) {$O$\\write once};
+
+\draw[arrow] (q) -- (sram);
+\draw[arrow] (kv) -- (sram);
+\draw[arrow] (sram) -- (online);
+\draw[arrow] (online) -- (out);
+
+\node[align=left, text width=10.5cm] at (0,-0.85) {
+  $Q,K,V$ 按块搬入片上存储。局部 score、mask、softmax 和 $PV$ 累积都在片上完成。
+  完整 $S\times S$ attention matrix 不写入 HBM。
+};
+```
+
+\end{tikzpicture}
+\caption{FlashAttention 的 tiling 数据流}
+\label{fig:flashattention-tiling-dataflow}
+\end{figure}
+
+\subsection{SRAM 中计算 block}
+\label{subsec:compute-block-in-sram}
+
+FlashAttention 的一个典型循环结构可以抽象为：
+
+\begin{enumerate}
+\item 外层遍历 K/V blocks；
+\item 内层遍历 Q blocks；
+\item 将当前 K/V block 加载到 SRAM；
+\item 将当前 Q block 加载到 SRAM/register；
+\item 计算局部 score；
+\item 应用 causal mask 或 attention mask；
+\item 计算局部 softmax 统计；
+\item 更新输出累积；
+\item 最后写回 O。
+\end{enumerate}
+
+不同实现可能选择不同循环顺序。关键原则是：让 K/V block 被加载后尽可能复用，减少 HBM 访问；让局部 score matrix 只在片上存在。
+
+对一个 Q block，维护每一行的：
+
+[
+m_i,\quad l_i,\quad \vect{a}_i.
+]
+
+每处理一个 K/V block，更新这些状态。最后输出：
+
+[
+\vect{o}_i=\frac{\vect{a}_i}{l_i}.
+]
+
+如果是 causal attention，当 K block 的位置超过 Q block 当前行允许关注的位置，需要 mask 掉未来位置：
+
+[
+S_{ij}=-\infty,\quad j>i.
+]
+
+在 block 级别，causal mask 可能出现三种情况：
+
+\begin{itemize}
+\item 当前 K block 完全在 Q block 之前：无需 mask；
+\item 当前 K block 完全在 Q block 之后：整块跳过；
+\item 当前 K block 与 Q block 对角线相交：需要块内 mask。
+\end{itemize}
+
+这种 block-level 判断可以避免不必要计算。
+
+\subsection{fused kernel}
+\label{subsec:flashattention-fused-kernel}
+
+标准实现可能将 Attention 拆成多个 kernel：
+
+[
+QK^{\mathsf{T}}\ \text{kernel},
+]
+[
+mask/scale\ \text{kernel},
+]
+[
+softmax\ \text{kernel},
+]
+[
+dropout\ \text{kernel},
+]
+[
+PV\ \text{kernel}.
+]
+
+每个 kernel 都可能把中间结果写回 HBM，再被下一个 kernel 读入。FlashAttention 则将这些操作融合到一个或少数几个 kernel 中：
+
+[
+QK^{\mathsf{T}}
++
+mask
++
+softmax
++
+dropout
++
+PV
+\rightarrow
+\text{fused attention kernel}.
+]
+
+Kernel fusion 的收益包括：
+
+\begin{itemize}
+\item 减少 kernel launch overhead；
+\item 减少 HBM 中间读写；
+\item 中间值停留在 register/shared memory；
+\item 更容易做跨操作优化；
+\item 更低显存峰值。
+\end{itemize}
+
+但 fused kernel 也更复杂。它需要同时管理矩阵乘法、softmax、mask、dropout、数值稳定、寄存器压力、shared memory、warp 分工和边界条件。FlashAttention 的难点正是把这些操作合并后仍然保持高性能。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+box/.style={draw, rounded corners=3pt, minimum width=1.45cm, minimum height=0.58cm, align=center},
+arrow/.style={-{Latex[length=2.1mm]}, thick}
+]
+
+```
+\node[font=\bfseries] at (0,3.1) {Kernel Fusion：从多次 HBM 往返到单个 fused kernel};
+
+% standard
+\node[font=\bfseries] at (-3.5,2.35) {Standard};
+\node[box, fill=blue!8] (a1) at (-5.5,1.45) {$QK^T$};
+\node[box, fill=orange!14] (a2) at (-3.8,1.45) {mask};
+\node[box, fill=green!10] (a3) at (-2.1,1.45) {softmax};
+\node[box, fill=purple!10] (a4) at (-0.4,1.45) {$PV$};
+\draw[arrow] (a1) -- node[above,font=\scriptsize] {HBM} (a2);
+\draw[arrow] (a2) -- node[above,font=\scriptsize] {HBM} (a3);
+\draw[arrow] (a3) -- node[above,font=\scriptsize] {HBM} (a4);
+
+% flash
+\node[font=\bfseries] at (2.5,2.35) {FlashAttention};
+\node[box, fill=red!8, minimum width=3.0cm, minimum height=0.85cm] (fused) at (3.2,1.45)
+  {$QK^T$ + mask + softmax + $PV$};
+\node[box, fill=yellow!16] (o) at (5.7,1.45) {$O$};
+\draw[arrow] (fused) -- node[above,font=\scriptsize] {write once} (o);
+
+\node[align=left, text width=10.5cm] at (0,-0.45) {
+  标准实现的多个 kernel 之间需要通过 HBM 传递中间矩阵。
+  FlashAttention 把这些步骤融合，让中间 attention block 不落地。
+};
+```
+
+\end{tikzpicture}
+\caption{FlashAttention 的 fused kernel 思路}
+\label{fig:flashattention-fused-kernel}
+\end{figure}
+
+\subsection{forward pass}
+\label{subsec:flashattention-forward-pass}
+
+FlashAttention forward 的核心状态包括：
+
+[
+\mat{O}\in\mathbb{R}^{S\times d_h},
+]
+[
+\vect{m}\in\mathbb{R}^{S},
+]
+[
+\vect{l}\in\mathbb{R}^{S}.
+]
+
+其中 $\vect{m}$ 保存每一行的运行最大值，$\vect{l}$ 保存每一行的运行 softmax 分母。输出 $\mat{O}$ 在分块过程中逐步更新。
+
+抽象伪代码如下：
+
+\begin{lstlisting}[language=Python,caption={FlashAttention forward 的简化伪代码},label={lst:flashattention-forward-pseudocode}]
+def flash_attention_forward(Q, K, V, block_q, block_k):
+"""
+Q, K, V: [seq_len, head_dim]
+This is a mathematical sketch, not an efficient implementation.
+"""
+S, D = Q.shape
+
+```
+O = zeros([S, D])
+m = full([S], -inf)
+l = zeros([S])
+
+for q_start in range(0, S, block_q):
+    q_end = min(q_start + block_q, S)
+    Q_blk = Q[q_start:q_end]
+
+    O_blk = zeros([q_end - q_start, D])
+    m_blk_running = full([q_end - q_start], -inf)
+    l_blk_running = zeros([q_end - q_start])
+
+    for k_start in range(0, S, block_k):
+        k_end = min(k_start + block_k, S)
+        K_blk = K[k_start:k_end]
+        V_blk = V[k_start:k_end]
+
+        scores = Q_blk @ K_blk.T / sqrt(D)
+
+        # Apply causal mask if needed.
+        scores = apply_causal_mask(
+            scores,
+            q_start=q_start,
+            k_start=k_start,
+        )
+
+        m_local = row_max(scores)
+        p = exp(scores - m_local[:, None])
+        l_local = row_sum(p)
+        acc_local = p @ V_blk
+
+        m_new = maximum(m_blk_running, m_local)
+        old_scale = exp(m_blk_running - m_new)
+        new_scale = exp(m_local - m_new)
+
+        O_blk = (
+            old_scale[:, None] * O_blk
+            + new_scale[:, None] * acc_local
+        )
+        l_blk_running = (
+            old_scale * l_blk_running
+            + new_scale * l_local
+        )
+        m_blk_running = m_new
+
+    O_blk = O_blk / l_blk_running[:, None]
+
+    O[q_start:q_end] = O_blk
+    m[q_start:q_end] = m_blk_running
+    l[q_start:q_end] = l_blk_running
+
+return O, m, l
+```
+
+\end{lstlisting}
+
+实际 kernel 不会像 Python 这样分配中间张量。它会把 block 内矩阵乘法映射到 GPU thread block、warp 和 Tensor Core MMA 上，尽量保持 Q/K/V block 的加载、计算和累积在片上完成。
+
+\subsection{backward pass}
+\label{subsec:flashattention-backward-pass}
+
+训练时还需要 backward。标准 Attention backward 如果保存了 $\mat{P}$，可以直接使用它计算梯度。但 $\mat{P}$ 是 $S\times S$ 大矩阵，保存它会带来高显存和 IO。
+
+FlashAttention 的 backward 通常不保存完整 $\mat{P}$，而是保存 forward 中每行的 softmax 统计量：
+
+[
+m_i,\quad l_i.
+]
+
+在 backward 中，对每个 block 重新计算：
+
+[
+\mat{S}_{ij}=\mat{Q}_i\mat{K}*j^{\mathsf{T}},
+]
+[
+\mat{P}*{ij}
+============
+
+\frac{\exp(\mat{S}_{ij}-m_i)}{l_i}.
+]
+
+然后使用重算得到的 $\mat{P}_{ij}$ 计算：
+
+[
+d\mat{V},
+\quad
+d\mat{Q},
+\quad
+d\mat{K}.
+]
+
+这体现了重计算换 IO 的思想。Backward 的 FLOPs 增加了一些，但避免读取和保存巨大的 attention probability matrix。
+
+Softmax backward 的核心公式为：
+
+[
+dS_i
+====
+
+P_i
+\odot
+\left(
+dP_i
+-
+\sum_j dP_{ij}P_{ij}
+\right).
+]
+
+在 Attention 中：
+
+[
+O=PV.
+]
+
+因此：
+
+[
+dP=dO V^{\mathsf{T}},
+]
+[
+dV=P^{\mathsf{T}}dO.
+]
+
+再由：
+
+[
+S=QK^{\mathsf{T}},
+]
+
+得到：
+
+[
+dQ=dS K,
+]
+[
+dK=dS^{\mathsf{T}}Q.
+]
+
+FlashAttention backward 通过分块重算 $P$，在片上完成这些局部梯度计算，并将 $dQ,dK,dV$ 写回或累积。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+box/.style={draw, rounded corners=3pt, minimum width=1.9cm, minimum height=0.7cm, align=center},
+arrow/.style={-{Latex[length=2.1mm]}, thick}
+]
+
+```
+\node[font=\bfseries] at (0,3.25) {FlashAttention Backward：重算 Attention Block 而非保存完整 $P$};
+
+\node[box, fill=blue!8] (saved) at (-5.0,1.4) {saved\\$m,l$};
+\node[box, fill=green!10] (qkv) at (-5.0,0.35) {$Q,K,V$\\blocks};
+\node[box, fill=orange!14] (recompute) at (-2.3,0.9) {recompute\\$S,P$ block};
+\node[box, fill=purple!10] (grad) at (0.5,0.9) {local gradient\\$dQ,dK,dV$};
+\node[box, fill=red!8] (acc) at (3.3,0.9) {accumulate\\write grads};
+
+\draw[arrow] (saved) -- (recompute);
+\draw[arrow] (qkv) -- (recompute);
+\draw[arrow] (recompute) -- (grad);
+\draw[arrow] (grad) -- (acc);
+
+\node[align=left, text width=10.5cm] at (0,-1.2) {
+  Forward 只保存每行 softmax 统计量 $m,l$。Backward 中分块重算 $S$ 和 $P$，
+  用额外计算换取更低显存与更少 HBM 读取。
+};
+```
+
+\end{tikzpicture}
+\caption{FlashAttention backward 的重计算思想}
+\label{fig:flashattention-backward-recompute}
+\end{figure}
+
+\subsection{FlashAttention-2 / FlashAttention-3 的优化方向}
+\label{subsec:flashattention2-flashattention3}
+
+FlashAttention 的第一版解决了 IO-aware exact attention 的核心问题，但仍然距离高度优化的 GEMM 有差距。后续版本主要围绕 GPU 并行度、work partitioning、硬件特性和低精度展开。
+
+\textbf{FlashAttention-2} 的核心方向包括：
+
+\begin{itemize}
+\item 减少非矩阵乘法 FLOPs；
+\item 改进 thread block 和 warp 之间的工作划分；
+\item 对单个 head 的 attention 进行更好的并行切分；
+\item 降低 shared memory 读写和跨 warp 通信；
+\item 提高 occupancy 和 Tensor Core 利用率。
+\end{itemize}
+
+从系统角度看，FlashAttention-2 的启发是：减少 IO 只是第一步。一个 kernel 想接近 GEMM 性能，还必须让 GPU 有足够并行度，避免某些 warp 空闲，避免 shared memory 成为内部瓶颈。
+
+\textbf{FlashAttention-3} 则进一步面向新硬件特性，尤其是 Hopper 架构中的异步数据搬运、Tensor Memory Accelerator、warp specialization 和 FP8 支持。其思想可以概括为：
+
+\begin{itemize}
+\item 让数据搬运和计算重叠；
+\item 让不同 warp 承担不同角色，例如 producer/consumer；
+\item 更细粒度地交错矩阵乘法和 softmax；
+\item 利用 FP8 等低精度能力提升吞吐；
+\item 在低精度下控制数值误差。
+\end{itemize}
+
+对 AI Infra 工程师来说，理解这些方向比记住某个版本的具体实现更重要。FlashAttention 的演进说明，高性能 attention kernel 不是单一算法公式，而是算法、数值稳定、GPU 存储层次、线程组织、低精度和硬件特性的共同设计。
+
+\begin{table}[H]
+\centering
+\small
+\caption{FlashAttention 系列的优化演进}
+\label{tab:flashattention-evolution}
+\begin{tabular}{p{0.22\textwidth}p{0.34\textwidth}p{0.34\textwidth}}
+\toprule
+\textbf{版本} & \textbf{核心问题} & \textbf{主要优化方向} \
+\midrule
+FlashAttention
+& 标准 Attention 物化 $S\times S$ 中间矩阵，HBM IO 过高
+& IO-aware tiling、online softmax、不落地 attention matrix。 \
+\midrule
+FlashAttention-2
+& 第一版仍未充分接近 GEMM 效率
+& 更好的 work partitioning、更高 occupancy、减少非 matmul FLOPs。 \
+\midrule
+FlashAttention-3
+& 新硬件特性未充分利用
+& Hopper 异步、warp specialization、TMA、FP8 与低精度数值控制。 \
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{工程实现视角}
+\label{sec:flashattention-engineering-view}
+
+FlashAttention 的论文公式展示了算法思想，但工程实现还要处理大量底层细节。一个高性能 attention kernel 需要同时满足：
+
+\begin{itemize}
+\item 数据从 HBM 读取次数少；
+\item shared memory 容量足够；
+\item register pressure 不过高；
+\item Tensor Core 利用率高；
+\item warp 分工合理；
+\item occupancy 足够；
+\item 支持 causal mask、padding mask、dropout；
+\item 支持不同 head dimension；
+\item 支持 MHA/MQA/GQA；
+\item 支持 variable sequence length；
+\item 支持训练 backward 和推理 decode/prefill；
+\item 与 PyTorch、Triton、CUDA graph、serving engine 集成。
+\end{itemize}
+
+本节从几个工程维度展开。
+
+\subsection{block size 选择}
+\label{subsec:flashattention-block-size-choice}
+
+FlashAttention 的 block size 决定每次搬入 SRAM 的 Q/K/V tile 大小。设 Q block 大小为 $B_Q$，K/V block 大小为 $B_K$。局部 score block 为：
+
+[
+B_Q\times B_K.
+]
+
+Block size 受以下约束：
+
+\begin{itemize}
+\item shared memory 容量；
+\item register 数量；
+\item head dimension $d_h$；
+\item Tensor Core tile 形状；
+\item warp 数量；
+\item occupancy；
+\item causal mask 边界；
+\item sequence length；
+\item dtype。
+\end{itemize}
+
+如果 block 太大：
+
+\begin{itemize}
+\item shared memory 不够；
+\item register pressure 高；
+\item occupancy 下降；
+\item block 内同步和 reduction 变重。
+\end{itemize}
+
+如果 block 太小：
+
+\begin{itemize}
+\item 数据复用不足；
+\item kernel launch 和 block 调度开销相对变高；
+\item Tensor Core 利用率可能下降；
+\item online softmax 更新次数增加。
+\end{itemize}
+
+因此 block size 不是越大越好，也不是越小越好。高性能库通常会根据 head dimension、dtype、GPU 架构和是否 causal 选择不同 kernel specialization。
+
+\subsection{warp-level parallelism}
+\label{subsec:warp-level-parallelism}
+
+在 GPU 中，warp 是调度基本单位。FlashAttention kernel 需要将一个 attention tile 的工作分配给多个 warps。例如：
+
+\begin{itemize}
+\item 一些 warps 负责加载 Q/K/V；
+\item 一些 warps 负责 MMA；
+\item 一些 warps 负责 softmax reduction；
+\item 一些 warps 负责输出累积和写回。
+\end{itemize}
+
+如果 warp 分工不好，会出现：
+
+\begin{itemize}
+\item 某些 warp 等待其他 warp；
+\item shared memory 读写冲突；
+\item reduction 开销过大；
+\item occupancy 低；
+\item Tensor Core pipeline 填不满。
+\end{itemize}
+
+FlashAttention-2 的一个重要方向就是更好的 work partitioning。特别是在序列长度较短、batch/head 数不足或单 head 工作量较大时，需要在一个 head 内部进一步并行，否则 GPU 可能吃不满。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+warp/.style={draw, rounded corners=3pt, minimum width=1.4cm, minimum height=0.55cm, align=center},
+smem/.style={draw, rounded corners=4pt, minimum width=4.2cm, minimum height=0.75cm, align=center, fill=orange!14},
+arrow/.style={-{Latex[length=2.0mm]}, thick}
+]
+
+```
+\node[font=\bfseries] at (0,3.15) {FlashAttention kernel 中的 warp-level 分工示意};
+
+\foreach \i/\x/\task/\col in {
+  0/-4.5/load Q/blue!8,
+  1/-2.6/load KV/green!10,
+  2/-0.7/MMA/purple!10,
+  3/1.2/softmax/yellow!16,
+  4/3.1/accumulate/red!8
+} {
+  \node[warp, fill=\col] (w\i) at (\x,1.55) {Warp \i\\\task};
+}
+
+\node[smem] (smem) at (-0.7,0.25) {Shared Memory / Registers};
+
+\foreach \i in {0,1,2,3,4} {
+  \draw[arrow] (w\i) -- (smem);
+}
+
+\node[align=left, text width=10.5cm] at (0,-1.25) {
+  实际实现中 warp 分工会更加复杂。核心目标是让数据搬运、矩阵乘法、
+  softmax reduction 和输出累积尽量流水化，减少等待和片上通信。
+};
+```
+
+\end{tikzpicture}
+\caption{FlashAttention 中 warp-level parallelism 的工程直觉}
+\label{fig:flashattention-warp-level-parallelism}
+\end{figure}
+
+\subsection{shared memory 使用}
+\label{subsec:flashattention-shared-memory-usage}
+
+Shared memory 是 FlashAttention 的关键资源。它用于缓存 K/V blocks、部分 Q blocks、中间 score 或 softmax 相关数据。使用 shared memory 的目标是减少 HBM 访问，但 shared memory 容量有限，且会影响 occupancy。
+
+需要关注：
+
+\begin{itemize}
+\item 每个 thread block 使用多少 shared memory；
+\item 是否导致每个 SM 可驻留 block 数下降；
+\item shared memory bank conflict；
+\item 数据 layout 是否利于 vectorized load；
+\item Q/K/V tile 是否复用充分；
+\item 是否需要 double buffering。
+\end{itemize}
+
+Double buffering 是常见优化：当当前 tile 正在计算时，异步加载下一个 tile。这样可以重叠数据搬运和计算。较新的 GPU 架构提供更强的异步拷贝能力，使这类优化更重要。
+
+\subsection{与 Triton kernel 的关系}
+\label{subsec:flashattention-and-triton}
+
+Triton 是一种用于编写高性能 GPU kernel 的语言和编译器，常用于实现矩阵乘法、softmax、attention 等算子。FlashAttention 可以用 CUDA C++ 实现，也可以用 Triton 实现。Triton 的优势是：
+
+\begin{itemize}
+\item Python 风格开发体验；
+\item 更容易写出 tile-based kernel；
+\item 自动处理部分底层细节；
+\item 与 PyTorch 集成方便；
+\item 适合快速迭代和定制 kernel。
+\end{itemize}
+
+但极致性能实现仍可能需要 CUDA C++、CUTLASS、内联 PTX 或硬件特定优化。尤其当需要利用最新架构的异步拷贝、TMA、warp specialization、FP8 Tensor Core 等特性时，底层实现复杂度会增加。
+
+对工程团队而言，选择 Triton 还是 CUDA C++ 取决于：
+
+\begin{itemize}
+\item 性能目标；
+\item 开发速度；
+\item 目标 GPU 架构；
+\item 需要支持的 dtype 和 head dimension；
+\item 是否需要快速适配模型变体；
+\item 团队对底层 CUDA 的掌握程度。
+\end{itemize}
+
+下面给出一个简化的 Triton 风格伪代码，用于展示 tiled attention kernel 的形状。它不是可直接运行的完整实现。
+
+\begin{lstlisting}[language=Python,caption={Triton 风格 FlashAttention kernel 的结构示意},label={lst:triton-flashattention-sketch}]
+
+# This is a structural sketch, not runnable Triton code.
+
+@triton_jit
+def flash_attention_kernel(Q, K, V, O, LSE, stride_info, BLOCK_M, BLOCK_N):
+# Program id selects a Q block and a head.
+q_block_id = program_id(0)
+head_id = program_id(1)
+
+```
+# Load Q tile.
+q = load_q_tile(Q, q_block_id, head_id, BLOCK_M)
+
+# Initialize online softmax states.
+m = full([BLOCK_M], -inf)
+l = zeros([BLOCK_M])
+acc = zeros([BLOCK_M, HEAD_DIM])
+
+# Loop over K/V blocks.
+for kv_block_id in range(0, num_kv_blocks):
+    k = load_k_tile(K, kv_block_id, head_id, BLOCK_N)
+    v = load_v_tile(V, kv_block_id, head_id, BLOCK_N)
+
+    scores = dot(q, transpose(k)) * scale
+    scores = apply_mask_if_needed(scores, q_block_id, kv_block_id)
+
+    m_new = maximum(m, max(scores, axis=1))
+    p = exp(scores - m_new[:, None])
+
+    alpha = exp(m - m_new)
+    acc = acc * alpha[:, None] + dot(p, v)
+    l = l * alpha + sum(p, axis=1)
+    m = m_new
+
+# Normalize and write output.
+acc = acc / l[:, None]
+store_o_tile(O, q_block_id, head_id, acc)
+
+# Save log-sum-exp or m/l for backward if training.
+store_lse(LSE, q_block_id, head_id, m + log(l))
+```
+
+\end{lstlisting}
+
+这个伪代码保留了 FlashAttention 的核心结构：tile、循环、online softmax、累积输出、不保存 $S\times S$ 矩阵。
+
+\section{FlashAttention 与推理系统}
+\label{sec:flashattention-and-serving-systems}
+
+FlashAttention 最初常被训练和长序列 attention 场景关注，但它同样影响推理系统。推理中有 prefill 和 decode 两种阶段，它们对 attention kernel 的需求不同。
+
+\subsection{Prefill 中的 FlashAttention}
+\label{subsec:flashattention-in-prefill}
+
+Prefill 阶段一次处理 prompt 的全部 token。对于长 prompt，attention 仍然是 $S\times S$ 结构，因此 FlashAttention 非常有价值。它可以：
+
+\begin{itemize}
+\item 降低 prefill 显存峰值；
+\item 减少 attention 中间矩阵 HBM 读写；
+\item 提升长 prompt 的 TTFT；
+\item 支持更长上下文；
+\item 与 causal mask 结合。
+\end{itemize}
+
+在 serving 中，TTFT 通常由排队时间和 prefill 时间共同决定。长 prompt 请求尤其依赖高效 prefill attention。FlashAttention 可以显著降低 prefill kernel 的 IO 开销，但它不能消除 $O(S^2)$ 的数学计算，因此超长 prompt 仍然昂贵。对于超长上下文，还需要 chunked prefill、prefix cache、sparse attention 或 context parallel 等技术配合。
+
+\subsection{Decode 中的 FlashAttention}
+\label{subsec:flashattention-in-decode}
+
+Decode 阶段每个请求通常只处理一个新 token。此时 Q 的 sequence length 为 $1$，K/V length 为历史上下文长度 $S$。Attention 形状是：
+
+[
+Q: 1\times d_h,
+\quad
+K,V: S\times d_h.
+]
+
+这与 prefill 中的 $S\times S$ attention 不同。Decode attention 不会物化完整 $S\times S$ matrix，因为只有一行 score：
+
+[
+1\times S.
+]
+
+因此 decode 的瓶颈更多是 KV Cache 读取和 batch 组织，而不是 $S^2$ 中间矩阵物化。FlashAttention 的 online softmax 和 fused kernel 思想仍然有帮助，但 decode kernel 通常需要针对 single-query 或 small-query 情况专门优化。
+
+对于 batch decode，多个请求可以组成：
+
+[
+B_{\mathrm{decode}}\times 1
+]
+
+的 query batch，每个请求上下文长度不同。若配合 PagedAttention，K/V 还可能是分页存储。此时 attention kernel 需要同时处理：
+
+\begin{itemize}
+\item variable context length；
+\item paged KV block table；
+\item GQA/MQA；
+\item small Q length；
+\item memory-bound KV reads；
+\item sampling 后的 dynamic scheduling。
+\end{itemize}
+
+因此，serving 系统中常常同时需要 FlashAttention 风格的 prefill kernel 和 PagedAttention 风格的 decode kernel。二者解决的问题不同：
+
+\begin{itemize}
+\item FlashAttention：减少 attention 计算中的 HBM IO；
+\item PagedAttention：管理动态 KV Cache 并支持 continuous batching。
+\end{itemize}
+
+\begin{table}[H]
+\centering
+\small
+\caption{Prefill 与 Decode 对 Attention Kernel 的不同要求}
+\label{tab:prefill-decode-attention-kernel}
+\begin{tabular}{p{0.2\textwidth}p{0.34\textwidth}p{0.34\textwidth}}
+\toprule
+\textbf{维度} & \textbf{Prefill} & \textbf{Decode} \
+\midrule
+Q 长度
+& prompt 长度 $S$
+& 通常为 1 \
+\midrule
+K/V 长度
+& prompt 长度 $S$
+& 历史上下文长度 $S_{\mathrm{cache}}$ \
+\midrule
+主要问题
+& $S\times S$ attention IO 和计算
+& KV Cache 读取、动态 batch、memory-bound \
+\midrule
+FlashAttention 价值
+& 非常高，避免物化 attention matrix
+& 思想有用，但通常需要 decode-specialized kernel \
+\midrule
+PagedAttention 价值
+& 管理写入和长 prompt blocks
+& 非常高，支持动态 KV 读取与 continuous batching \
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{与 PagedAttention 的互补关系}
+\label{subsec:flashattention-pagedattention-complementary}
+
+PagedAttention 和 FlashAttention 很容易被混淆，因为它们都与 Attention 和显存有关。但二者关注点不同。
+
+[
+\text{FlashAttention}
+\Rightarrow
+\text{How to compute attention with less HBM IO?}
+]
+
+[
+\text{PagedAttention}
+\Rightarrow
+\text{How to store and manage KV Cache for dynamic requests?}
+]
+
+在一个现代 LLM serving engine 中，它们可能同时存在：
+
+\begin{itemize}
+\item prefill 使用 FlashAttention 或其变体；
+\item decode 使用 PagedAttention kernel 读取分页 KV Cache；
+\item 长 prompt chunked prefill 中也可能结合 paged KV 写入；
+\item prefix cache 使用 block table 共享 KV；
+\item attention backend 根据阶段、shape、GPU 架构选择不同 kernel。
+\end{itemize}
+
+可以把关系理解为：
+
+[
+\text{FlashAttention 是计算优化，PagedAttention 是内存管理与调度优化。}
+]
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+box/.style={draw, rounded corners=4pt, minimum width=2.35cm, minimum height=0.8cm, align=center},
+arrow/.style={-{Latex[length=2.1mm]}, thick}
+]
+
+```
+\node[font=\bfseries] at (0,3.25) {FlashAttention 与 PagedAttention 在 Serving 中的互补};
+
+\node[box, fill=green!10] (prefill) at (-4.2,1.35) {Prefill\\long prompt};
+\node[box, fill=orange!14] (flash) at (-1.35,1.35) {FlashAttention\\IO-aware compute};
+\node[box, fill=blue!8] (kvwrite) at (1.45,1.35) {Write KV\\blocks};
+\node[box, fill=purple!10] (decode) at (4.2,1.35) {Decode\\token loop};
+
+\node[box, fill=yellow!16] (paged) at (1.45,0.0) {PagedAttention\\paged KV read};
+\node[box, fill=red!8] (sched) at (4.2,0.0) {Continuous\\batching};
+
+\draw[arrow] (prefill) -- (flash);
+\draw[arrow] (flash) -- (kvwrite);
+\draw[arrow] (kvwrite) -- (decode);
+\draw[arrow] (paged) -- (decode);
+\draw[arrow] (sched) -- (decode);
+\draw[arrow] (kvwrite) -- (paged);
+
+\node[align=left, text width=10.5cm] at (0,-1.55) {
+  Prefill 阶段常用 FlashAttention 减少 $S\times S$ attention 的 IO；
+  Decode 阶段常用 PagedAttention 管理和读取动态 KV Cache。
+};
+```
+
+\end{tikzpicture}
+\caption{FlashAttention 与 PagedAttention 在推理系统中的互补关系}
+\label{fig:flashattention-pagedattention-complementary}
+\end{figure}
+
+\section{常见误区与调试方法}
+\label{sec:flashattention-misconceptions-debugging}
+
+\subsection{误区一：FlashAttention 是近似 Attention}
+\label{subsec:misconception-flashattention-approximate}
+
+FlashAttention 不是近似 attention。它计算的是与标准 attention 数学上等价的精确结果，只是改变计算顺序和内存访问方式。由于浮点数加法和指数运算顺序变化，结果可能与标准实现存在极小数值差异，但这不是近似算法意义上的误差。
+
+这点很重要。FlashAttention 不像某些 sparse attention、linear attention 或 low-rank attention 那样改变模型的 attention pattern。它的目标是在不改变模型语义的前提下提高速度和降低显存。
+
+\subsection{误区二：FlashAttention 降低了 $O(S^2)$ 计算复杂度}
+\label{subsec:misconception-flashattention-compute-complexity}
+
+FlashAttention 不改变 dense attention 的 $O(S^2d_h)$ 计算复杂度。对于 full attention，所有 query-key 对仍然需要计算。它降低的是 HBM IO 和中间显存，不是数学计算阶数。
+
+因此，当序列极长时，FlashAttention 仍然要面对 $S^2$ 计算量。若需要从复杂度上降低长上下文成本，需要考虑 sparse attention、sliding window attention、state space model、linear attention、attention sink、KV compression 等其他方向。
+
+\subsection{误区三：所有场景都一定更快}
+\label{subsec:misconception-flashattention-always-faster}
+
+FlashAttention 在许多长序列和训练/prefill 场景中非常有效，但并不意味着所有 shape 都一定更快。影响因素包括：
+
+\begin{itemize}
+\item sequence length；
+\item head dimension；
+\item batch size；
+\item causal 或 non-causal；
+\item GPU 架构；
+\item dtype；
+\item dropout 是否开启；
+\item mask 类型；
+\item 是否 variable length；
+\item kernel 是否支持当前 shape；
+\item 是否 decode single-query。
+\end{itemize}
+
+对于很短序列，标准实现或其他 fused attention 可能已经足够快；对于某些特殊 mask 或 layout，FlashAttention kernel 可能无法直接使用；对于 decode 阶段，专门的 paged decode kernel 可能比通用 FlashAttention 更合适。
+
+\subsection{调试与验证}
+\label{subsec:flashattention-debug-validation}
+
+接入 FlashAttention 或替换 attention backend 时，需要验证：
+
+\begin{itemize}
+\item 输出数值与标准实现是否在 tolerance 内一致；
+\item backward 梯度是否正确；
+\item causal mask 是否正确；
+\item padding mask 或 variable length 是否正确；
+\item dropout 随机性是否符合训练要求；
+\item mixed precision 是否稳定；
+\item 长序列下是否 OOM；
+\item profiler 中 HBM traffic 是否下降；
+\item kernel 是否真正被调用，而不是 fallback；
+\item 不同 GPU 架构是否走了合适 kernel。
+\end{itemize}
+
+一个最小数值验证可以写成：
+
+\begin{lstlisting}[language=Python,caption={FlashAttention 与标准 Attention 的数值验证示意},label={lst:flashattention-correctness-check}]
+import torch
+import torch.nn.functional as F
+
+def standard_attention(q, k, v, causal=True):
+# q, k, v: [batch, heads, seq, dim]
+scale = q.shape[-1] ** -0.5
+scores = torch.matmul(q, k.transpose(-1, -2)) * scale
+
+```
+if causal:
+    seq = q.shape[-2]
+    mask = torch.triu(
+        torch.ones(seq, seq, device=q.device, dtype=torch.bool),
+        diagonal=1,
+    )
+    scores = scores.masked_fill(mask, float("-inf"))
+
+prob = torch.softmax(scores, dim=-1)
+return torch.matmul(prob, v)
+```
+
+def check_attention_impl(q, k, v, flash_attention_fn):
+ref = standard_attention(q, k, v, causal=True)
+out = flash_attention_fn(q, k, v, causal=True)
+
+```
+max_abs_err = (ref - out).abs().max().item()
+max_rel_err = ((ref - out).abs() / ref.abs().clamp_min(1e-6)).max().item()
+
+print("max abs err:", max_abs_err)
+print("max rel err:", max_rel_err)
+
+torch.testing.assert_close(out, ref, rtol=1e-2, atol=1e-2)
+```
+
+\end{lstlisting}
+
+在 BF16/FP16 下，不应要求逐 bit 一致。应使用合理的 absolute/relative tolerance，并分别验证不同 sequence length、head dimension、causal mask、batch size 和 dtype。
+
+\section{本章小结}
+\label{sec:chapter14-summary}
+
+本章系统介绍了 FlashAttention 的动机、online softmax 推导、核心算法、前反向计算和工程实现视角。
+
+\begin{itemize}
+\item \textbf{标准 Attention 的主要问题之一是 IO 瓶颈}：它常常显式物化 $S\times S$ score matrix 和 softmax probability matrix，导致大量 HBM 读写。
+\item \textbf{FlashAttention 不改变 Attention 数学结果}，而是通过 IO-aware tiling 和 kernel fusion 减少 HBM traffic。
+\item \textbf{FlashAttention 不降低 dense attention 的 FLOPs 阶数}，仍然是 $O(S^2d_h)$，但显著降低中间显存和 HBM 访问。
+\item \textbf{HBM 与片上 SRAM/register 的差异是理解 FlashAttention 的关键}：把中间 attention block 留在片上计算，通常比写入 HBM 再读回更快。
+\item \textbf{Online softmax 使分块 attention 成为可能}：通过维护每行的运行最大值 $m$、指数和 $l$ 和输出累积 $a$，可以分块得到与完整 softmax 等价的结果。
+\item \textbf{FlashAttention forward 按 Q/K/V blocks 计算}，局部 score、mask、softmax 和 $PV$ 累积都在 SRAM/register 中完成，最终只写回输出和少量统计量。
+\item \textbf{FlashAttention backward 使用重计算换 IO}：不保存完整 attention probability，而是保存 $m,l$，在 backward 中分块重算需要的 softmax block。
+\item \textbf{FlashAttention-2 进一步优化 work partitioning}，提升 occupancy，减少非矩阵乘法 FLOPs 和 shared memory 开销。
+\item \textbf{FlashAttention-3 面向新硬件特性}，利用异步数据搬运、warp specialization、TMA 和 FP8 等能力继续提升性能。
+\item \textbf{工程实现需要综合考虑 block size、shared memory、register pressure、warp 分工、Tensor Core 利用率和 mask 支持}。
+\item \textbf{在推理系统中，FlashAttention 与 PagedAttention 是互补的}：前者主要优化 attention 计算 IO，后者主要优化动态 KV Cache 管理和 continuous batching。
+\item \textbf{FlashAttention 不是所有 shape 都必然更快}。短序列、特殊 mask、single-query decode 或不支持的 layout 可能需要其他 attention backend。
+\end{itemize}
+
+下一章将进入量化技术。FlashAttention 通过减少 IO 提升 attention kernel 效率，而量化则从数据表示本身入手，降低模型权重、激活和 KV Cache 的字节数。我们会系统讨论 PTQ、QAT、GPTQ、AWQ、weight-only quantization、per-channel/per-group scale，以及量化对显存、带宽、吞吐和精度的影响。

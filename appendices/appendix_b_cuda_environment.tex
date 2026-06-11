@@ -1,0 +1,346 @@
+
+% appendices/appendix_b_cuda_environment.tex
+
+\chapter{CUDA 与分布式训练环境搭建}
+
+AI Infrastructure 工程的第一道门槛，通常不是模型结构，而是环境。一个看似简单的 \texttt{import torch}，背后涉及 NVIDIA Driver、CUDA Runtime、cuDNN、NCCL、PyTorch wheel、GPU 架构、容器运行时、网络驱动和权限配置。环境配置错误会导致大量隐蔽问题：训练一启动就崩溃、NCCL 卡死、GPU 不可见、性能只有预期的一半、不同节点行为不一致等。
+
+本附录给出一套面向单机多卡与多机训练的环境搭建和排查方法。它不是某个固定版本的安装手册，而是一套可迁移的检查框架。
+
+\section{CUDA Toolkit}
+
+\subsection{CUDA Toolkit 的角色}
+
+CUDA Toolkit 包含编译 CUDA 程序所需的编译器、头文件、库文件和工具链。常见组件包括：
+
+\begin{itemize}
+\item \texttt{nvcc}：CUDA C++ 编译器。
+\item CUDA Runtime：运行 CUDA 程序所需的运行时库。
+\item cuBLAS：GPU 上的 BLAS 矩阵运算库。
+\item cuFFT、cuRAND、cuSPARSE：常用数学库。
+\item Nsight Systems / Nsight Compute：性能分析工具。
+\end{itemize}
+
+对于只运行 PyTorch 的用户，很多预编译 wheel 已经内置了相应 CUDA Runtime，不一定需要系统安装完整 CUDA Toolkit。但如果要编译自定义 CUDA Extension、Triton kernel、DeepSpeed fused op 或 Megatron-LM 中的扩展模块，通常需要安装匹配的 Toolkit。
+
+\subsection{检查 CUDA Toolkit}
+
+可以使用以下命令检查 \texttt{nvcc}：
+
+\begin{lstlisting}[language=bash,caption={检查 CUDA Toolkit},label={lst:check-cuda-toolkit}]
+which nvcc
+nvcc --version
+\end{lstlisting}
+
+也可以检查 CUDA 安装目录：
+
+\begin{lstlisting}[language=bash,caption={检查 CUDA 安装目录},label={lst:check-cuda-path}]
+ls -l /usr/local/cuda
+ls -l /usr/local/cuda/bin
+ls -l /usr/local/cuda/lib64
+\end{lstlisting}
+
+常见环境变量如下：
+
+\begin{lstlisting}[language=bash,caption={CUDA 常见环境变量},label={lst:cuda-env-vars}]
+export CUDA_HOME=/usr/local/cuda
+export PATH=$CUDA_HOME/bin:$PATH
+export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
+\end{lstlisting}
+
+\section{NVIDIA Driver}
+
+\subsection{Driver 与 CUDA 的关系}
+
+NVIDIA Driver 负责让操作系统识别和管理 GPU。CUDA 应用最终需要通过 Driver 与 GPU 交互。需要特别注意：
+
+\begin{itemize}
+\item Driver 安装在宿主机层面。
+\item CUDA Toolkit 可以安装在宿主机，也可以随容器镜像提供。
+\item 容器中的 CUDA Runtime 必须与宿主机 Driver 兼容。
+\item 多节点训练时，不同节点的 Driver 版本最好保持一致。
+\end{itemize}
+
+在容器化环境中，一个常见误区是以为容器内安装了 CUDA 就可以直接使用 GPU。实际上，容器仍然依赖宿主机 Driver 以及 NVIDIA Container Toolkit 将 GPU 设备和驱动库挂载进容器。
+
+\subsection{检查 Driver 与 GPU 状态}
+
+最常用的检查命令是：
+
+\begin{lstlisting}[language=bash,caption={检查 NVIDIA Driver 与 GPU 状态},label={lst:nvidia-smi-basic}]
+nvidia-smi
+\end{lstlisting}
+
+重点观察以下信息：
+
+\begin{itemize}
+\item Driver Version：宿主机驱动版本。
+\item CUDA Version：Driver 支持的最高 CUDA 运行时版本。
+\item GPU Name：GPU 型号。
+\item Memory-Usage：显存占用。
+\item GPU-Util：GPU 利用率。
+\item Processes：当前占用 GPU 的进程。
+\end{itemize}
+
+检查 GPU 拓扑：
+
+\begin{lstlisting}[language=bash,caption={检查 GPU 拓扑},label={lst:nvidia-smi-topo}]
+nvidia-smi topo -m
+\end{lstlisting}
+
+该命令对单机多卡训练尤其重要。它可以帮助判断 GPU 之间通过 PCIe、NVLink 还是 NVSwitch 互联，也可以观察 GPU 与 NIC 的亲和关系。
+
+\section{PyTorch CUDA 环境}
+
+\subsection{检查 PyTorch 是否识别 CUDA}
+
+在 Python 中执行：
+
+\begin{lstlisting}[language=Python,caption={检查 PyTorch CUDA 可用性},label={lst:pytorch-cuda-check}]
+import torch
+
+print("torch version:", torch.**version**)
+print("cuda available:", torch.cuda.is_available())
+print("cuda version:", torch.version.cuda)
+print("device count:", torch.cuda.device_count())
+
+for i in range(torch.cuda.device_count()):
+print(i, torch.cuda.get_device_name(i))
+\end{lstlisting}
+
+若 \texttt{torch.cuda.is_available()} 返回 \texttt{False}，常见原因包括：
+
+\begin{itemize}
+\item 安装的是 CPU-only 版本 PyTorch。
+\item 宿主机 Driver 未正确安装。
+\item 容器未正确挂载 GPU。
+\item \texttt{CUDA_VISIBLE_DEVICES} 设置错误。
+\item Driver 与 CUDA Runtime 不兼容。
+\end{itemize}
+
+\subsection{简单矩阵乘法测试}
+
+安装完成后，不应只检查 CUDA 是否可用，还应做一次实际计算：
+
+\begin{lstlisting}[language=Python,caption={PyTorch GPU 矩阵乘法测试},label={lst:pytorch-matmul-test}]
+import torch
+import time
+
+device = "cuda"
+n = 8192
+
+a = torch.randn(n, n, device=device, dtype=torch.float16)
+b = torch.randn(n, n, device=device, dtype=torch.float16)
+
+torch.cuda.synchronize()
+start = time.time()
+
+c = a @ b
+
+torch.cuda.synchronize()
+end = time.time()
+
+print("elapsed:", end - start)
+print("result:", c[0, 0].item())
+\end{lstlisting}
+
+该测试不能替代专业 benchmark，但可以快速确认 GPU 计算链路是否基本正常。
+
+\section{NCCL 环境变量}
+
+\subsection{NCCL 的角色}
+
+NCCL 是 NVIDIA Collective Communications Library，负责多 GPU 和多节点之间的集合通信。DDP、Tensor Parallelism、Pipeline Parallelism、ZeRO 等训练策略都会依赖 NCCL 完成 AllReduce、AllGather、ReduceScatter、Broadcast 等通信操作。
+
+当分布式训练卡住时，问题经常不在模型，而在 NCCL 初始化、网络接口选择、拓扑发现或防火墙配置。
+
+\subsection{常用 NCCL 环境变量}
+
+\begin{longtable}{p{0.32\textwidth}p{0.58\textwidth}}
+\toprule
+环境变量 & 用途 \
+\midrule
+\texttt{NCCL_DEBUG} & 打印 NCCL 日志，常设为 \texttt{INFO}。 \
+\texttt{NCCL_DEBUG_SUBSYS} & 指定日志子系统，如 \texttt{INIT}、\texttt{COLL}、\texttt{NET}。 \
+\texttt{NCCL_SOCKET_IFNAME} & 指定用于通信的网卡接口。 \
+\texttt{NCCL_IB_HCA} & 指定 InfiniBand 或 RoCE HCA。 \
+\texttt{NCCL_IB_DISABLE} & 是否禁用 IB/RDMA。 \
+\texttt{NCCL_P2P_DISABLE} & 是否禁用 GPU P2P。 \
+\texttt{NCCL_SHM_DISABLE} & 是否禁用共享内存通信。 \
+\texttt{NCCL_NET_GDR_LEVEL} & 控制 GPUDirect RDMA 使用策略。 \
+\bottomrule
+\end{longtable}
+
+调试时可以先打开详细日志：
+
+\begin{lstlisting}[language=bash,caption={NCCL 调试日志},label={lst:nccl-debug-env}]
+export NCCL_DEBUG=INFO
+export NCCL_DEBUG_SUBSYS=INIT,NET,COLL
+\end{lstlisting}
+
+指定网络接口示例：
+
+\begin{lstlisting}[language=bash,caption={指定 NCCL 网络接口},label={lst:nccl-ifname}]
+export NCCL_SOCKET_IFNAME=eth0
+\end{lstlisting}
+
+实际生产环境中，接口名可能是 \texttt{bond0}、\texttt{ib0}、\texttt{ens5f0} 等，应根据机器网络配置确定。
+
+\subsection{NCCL Tests}
+
+建议在运行真实训练任务前，先使用 NCCL Tests 检查通信性能：
+
+\begin{lstlisting}[language=bash,caption={NCCL all_reduce 性能测试示例},label={lst:nccl-tests}]
+./build/all_reduce_perf -b 8 -e 1G -f 2 -g 8
+\end{lstlisting}
+
+多节点场景中，可以通过 \texttt{mpirun}、\texttt{torchrun} 或集群调度系统启动。重点观察：
+
+\begin{itemize}
+\item 通信是否能正常初始化。
+\item bus bandwidth 是否接近预期。
+\item 单机内与跨节点带宽是否存在异常差距。
+\item 是否出现 timeout、connection refused、unhandled system error 等错误。
+\end{itemize}
+
+\section{DeepSpeed / Megatron-LM 安装}
+
+\subsection{DeepSpeed 安装检查}
+
+DeepSpeed 常用于 ZeRO、offload、混合精度训练和大模型训练优化。安装后可执行：
+
+\begin{lstlisting}[language=bash,caption={DeepSpeed 环境检查},label={lst:deepspeed-env-report}]
+ds_report
+\end{lstlisting}
+
+该命令会显示当前环境中各类 fused op 是否可用。若某些 op 未编译成功，DeepSpeed 仍可能运行，但性能可能明显下降。
+
+常见问题包括：
+
+\begin{itemize}
+\item \texttt{CUDA_HOME} 未设置。
+\item \texttt{nvcc} 不存在。
+\item PyTorch CUDA 版本与系统 CUDA Toolkit 不匹配。
+\item 编译器版本过旧。
+\item 容器中缺少构建工具链。
+\end{itemize}
+
+\subsection{Megatron-LM 环境要点}
+
+Megatron-LM 通常依赖如下能力：
+
+\begin{itemize}
+\item 多进程分布式启动。
+\item NCCL 正常工作。
+\item 可选 fused kernels。
+\item 数据集预处理工具。
+\item 与 Tensor Parallelism / Pipeline Parallelism 匹配的 rank mapping。
+\end{itemize}
+
+启动前应确认：
+
+\begin{lstlisting}[language=bash,caption={分布式启动基础环境变量},label={lst:distributed-env-vars}]
+export MASTER_ADDR=127.0.0.1
+export MASTER_PORT=29500
+export WORLD_SIZE=8
+export RANK=0
+export LOCAL_RANK=0
+\end{lstlisting}
+
+在真实多节点任务中，这些变量通常由 \texttt{torchrun}、MPI、Slurm、Kubernetes Operator 或训练平台自动注入。
+
+\section{常见环境问题排查}
+
+\subsection{问题一：GPU 不可见}
+
+现象：
+
+\begin{itemize}
+\item \texttt{nvidia-smi} 看不到 GPU。
+\item \texttt{torch.cuda.is_available()} 返回 \texttt{False}。
+\item 容器内没有 \texttt{/dev/nvidia*} 设备。
+\end{itemize}
+
+排查路径：
+
+\begin{enumerate}
+\item 在宿主机执行 \texttt{nvidia-smi}。
+\item 检查 Driver 是否安装成功。
+\item 检查容器启动参数是否包含 GPU 访问权限。
+\item 检查 Kubernetes 中 NVIDIA Device Plugin 是否正常。
+\item 检查 \texttt{CUDA_VISIBLE_DEVICES} 是否被错误设置为空。
+\end{enumerate}
+
+\subsection{问题二：PyTorch CUDA 版本混乱}
+
+现象：
+
+\begin{itemize}
+\item 编译 extension 失败。
+\item 运行时报找不到 \texttt{libcudart}、\texttt{libcublas} 或 \texttt{libnccl}。
+\item 安装多个 CUDA 版本后行为不一致。
+\end{itemize}
+
+排查路径：
+
+\begin{lstlisting}[language=bash,caption={检查 CUDA 相关路径},label={lst:check-cuda-paths}]
+which python
+python -c "import torch; print(torch.**version**, torch.version.cuda)"
+which nvcc
+nvcc --version
+echo $CUDA_HOME
+echo $LD_LIBRARY_PATH
+\end{lstlisting}
+
+原则是：运行时、编译时、框架 wheel 与宿主机 Driver 之间要形成兼容组合。不要在同一环境中无意识混用多个 CUDA 路径。
+
+\subsection{问题三：NCCL 初始化卡住}
+
+现象：
+
+\begin{itemize}
+\item 训练日志停在 initializing process group。
+\item 只有部分 rank 打印日志。
+\item 多节点任务长时间无输出。
+\end{itemize}
+
+排查路径：
+
+\begin{enumerate}
+\item 确认所有节点能互相解析和访问 \texttt{MASTER_ADDR}。
+\item 确认 \texttt{MASTER_PORT} 未被防火墙或安全组阻断。
+\item 打开 \texttt{NCCL_DEBUG=INFO}。
+\item 指定正确的 \texttt{NCCL_SOCKET_IFNAME}。
+\item 使用 NCCL Tests 单独验证通信。
+\item 检查节点时间、DNS、容器网络和多网卡路由。
+\end{enumerate}
+
+\subsection{问题四：训练能跑但性能很差}
+
+可能原因包括：
+
+\begin{itemize}
+\item GPU 拓扑选择不合理，跨 NUMA 或跨 PCIe switch 通信。
+\item NCCL 没有使用 NVLink、NVSwitch 或 RDMA。
+\item DataLoader 成为瓶颈。
+\item 混合精度未启用 Tensor Core。
+\item batch size 太小，GPU 无法充分利用。
+\item kernel launch 太碎，缺少 fusion。
+\item 日志、checkpoint 或评测过于频繁。
+\end{itemize}
+
+建议先分别测量：
+
+\begin{itemize}
+\item 单卡模型吞吐。
+\item 单机多卡 NCCL 吞吐。
+\item 多节点 NCCL 吞吐。
+\item 数据读取吞吐。
+\item checkpoint 写入吞吐。
+\end{itemize}
+
+不要在没有 baseline 的情况下直接调大规模训练任务，否则很难判断瓶颈来自模型、通信、存储还是调度系统。
+
+\section{附录 B 小结}
+
+CUDA 与分布式训练环境搭建的核心不是背安装命令，而是理解依赖链路：Driver 负责 GPU 访问，CUDA Runtime 支撑程序运行，PyTorch 绑定具体 CUDA 能力，NCCL 负责通信，容器和调度系统负责把这些能力正确暴露给任务。遇到问题时，应按“硬件可见性、运行时兼容性、通信连通性、性能基准”四层逐步排查。

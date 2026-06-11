@@ -1,0 +1,1506 @@
+\chapter{KV Cache 机制}
+\label{chap:kv-cache}
+
+\section{自回归推理流程}
+\label{sec:autoregressive-inference-flow}
+
+前面几篇主要围绕训练展开：从 Transformer 结构到分布式训练，再到 3D 并行和 ZeRO。现在开始进入第四篇：\textbf{推理架构优化 Serving Infra}。训练系统关心的是如何在大量 GPU 上稳定、高吞吐地完成参数更新；推理系统关心的是如何在在线请求中以低延迟、低成本、高并发生成 token。
+
+大语言模型推理和普通深度学习推理有本质差异。一个图像分类模型通常一次 forward 得到一个分类结果；一个推荐模型通常一次 forward 得到候选排序；而自回归语言模型必须不断生成下一个 token，并把这个 token 追加到上下文，再生成下一个 token。也就是说，LLM 推理不是一次计算，而是一串强依赖的迭代过程：
+
+[
+x_{t+1}\sim p_{\theta}(x_{t+1}\mid x_{\le t}),
+]
+[
+x_{t+2}\sim p_{\theta}(x_{t+2}\mid x_{\le t+1}),
+]
+[
+\cdots
+]
+
+对于 Decoder-only LLM，每一步生成都依赖前面已经生成的全部 token。这个依赖使得推理阶段天然分成两个部分：
+
+\begin{itemize}
+\item \textbf{Prefill 阶段}：处理用户输入 prompt，计算 prompt 中所有 token 的 hidden states，并建立 KV Cache；
+\item \textbf{Decode 阶段}：每次只处理一个新 token，读取历史 KV Cache，生成下一个 token，并追加新的 K/V。
+\end{itemize}
+
+KV Cache 正是 LLM 推理性能优化的核心。没有 KV Cache，decode 每一步都要重复计算历史 token 的 Key 和 Value；有了 KV Cache，系统只需要为新 token 计算新的 K/V，同时复用历史 K/V。这个优化看似简单，却决定了 LLM serving 的显存结构、调度策略、batch 管理、长上下文能力和吞吐上限。
+
+\subsection{prefill 阶段}
+\label{subsec:prefill-stage}
+
+Prefill 阶段处理的是用户输入 prompt。假设 prompt token 序列为：
+
+[
+x_1,x_2,\ldots,x_S.
+]
+
+模型需要一次性计算这些 token 的 hidden states，并得到最后一个位置的 logits，用于采样第一个输出 token：
+
+[
+p(x_{S+1}\mid x_1,\ldots,x_S).
+]
+
+在 prefill 中，输入序列长度为 $S$，模型可以像训练 forward 一样并行处理整个 prompt。每一层 attention 需要计算：
+
+[
+\mat{Q}\in\mathbb{R}^{B\times n_q\times S\times d_h},
+]
+[
+\mat{K}\in\mathbb{R}^{B\times n_{kv}\times S\times d_h},
+]
+[
+\mat{V}\in\mathbb{R}^{B\times n_{kv}\times S\times d_h}.
+]
+
+对于标准 causal attention，prefill 阶段每个 token 只能关注它之前的位置，因此仍需要 causal mask。但与训练一样，所有位置可以在同一次 forward 中并行计算。Attention 的 score matrix 大小约为：
+
+[
+B\times n_q\times S\times S.
+]
+
+因此 prefill 的计算复杂度包含 $S^2$ 项。序列越长，prefill 越昂贵。尤其当 prompt 很长时，TTFT，即 time to first token，往往主要由 prefill 决定。
+
+Prefill 阶段完成后，系统会把每一层的 Key 和 Value 保存下来：
+
+[
+\mat{K}^{(\ell)}*{1:S},
+\quad
+\mat{V}^{(\ell)}*{1:S},
+\quad
+\ell=0,\ldots,L-1.
+]
+
+这些保存下来的张量就是 KV Cache。它们会在后续 decode 中被反复读取。
+
+从系统角度看，prefill 阶段具有以下特点：
+
+\begin{itemize}
+\item \textbf{输入长度可能很长}：prompt 可以是几百、几千甚至更多 token；
+\item \textbf{计算密度较高}：QKV projection、FFN 和 attention 都能形成较大 GEMM；
+\item \textbf{更接近训练 forward}：一次处理完整序列；
+\item \textbf{会建立 KV Cache}：为每层、每个请求保存历史 K/V；
+\item \textbf{决定首 token 延迟}：用户体感中的“模型多久开始回答”主要受 prefill 影响。
+\end{itemize}
+
+\subsection{decode 阶段}
+\label{subsec:decode-stage}
+
+Decode 阶段从模型生成第一个输出 token 后开始。假设已经有上下文：
+
+[
+x_1,x_2,\ldots,x_t.
+]
+
+下一步只需要处理最新 token $x_t$，生成：
+
+[
+x_{t+1}.
+]
+
+在第 $\ell$ 层，对最新 token 计算 query、key、value：
+
+[
+\vect{q}_t^{(\ell)},
+\quad
+\vect{k}_t^{(\ell)},
+\quad
+\vect{v}_t^{(\ell)}.
+]
+
+然后把新的 $\vect{k}_t,\vect{v}_t$ 追加到该层的 KV Cache 中：
+
+[
+\mat{K}_{cache}^{(\ell)}[t]
+===========================
+
+\vect{k}*t^{(\ell)},
+]
+[
+\mat{V}*{cache}^{(\ell)}[t]
+===========================
+
+\vect{v}_t^{(\ell)}.
+]
+
+Attention 输出为：
+
+[
+\vect{o}_t^{(\ell)}
+===================
+
+\softmax
+\left(
+\frac{
+\vect{q}*t^{(\ell)}
+\left(\mat{K}*{cache}^{(\ell)}[1:t]\right)^{\mathsf{T}}
+}
+{\sqrt{d_h}}
+\right)
+\mat{V}_{cache}^{(\ell)}[1:t].
+]
+
+这里非常关键：decode 每一步只为当前 token 计算 query，但需要读取历史所有 Key 和 Value。因此 decode 的每一步计算量随当前上下文长度 $t$ 线性增长，而不是像 prefill 那样一次计算 $S\times S$ 的矩阵。
+
+Decode 阶段的系统特征与 prefill 不同：
+
+\begin{itemize}
+\item \textbf{每步只处理一个新 token}；
+\item \textbf{强自回归依赖}：下一步必须等待当前 token 采样完成；
+\item \textbf{GEMM 尺寸小}：batch 内每个请求通常只增加一个 token；
+\item \textbf{频繁读取 KV Cache}：每一步、每一层都读取历史 K/V；
+\item \textbf{通常 memory-bound}：吞吐受 HBM 带宽和 cache layout 影响很大；
+\item \textbf{决定持续生成速度}：用户体感中的 tokens per second 主要受 decode 影响。
+\end{itemize}
+
+这也是 LLM serving 的难点：prefill 像一个大 batch forward，decode 像大量小步迭代；两者在算子形状、显存访问、调度目标上完全不同。
+
+\subsection{token-by-token generation}
+\label{subsec:token-by-token-generation}
+
+完整生成流程可以写成如下循环：
+
+[
+\text{prompt}
+\xrightarrow{\text{prefill}}
+\text{first logits}
+\xrightarrow{\text{sample}}
+x_{S+1}
+\xrightarrow{\text{decode}}
+x_{S+2}
+\xrightarrow{\text{decode}}
+\cdots
+]
+
+每次 decode 后，模型得到下一个 token 的 logits：
+
+[
+\vect{z}_t\in\mathbb{R}^{V},
+]
+其中 $V$ 是词表大小。随后经过采样策略得到 token：
+
+[
+x_{t+1}
+=======
+
+\operatorname{Sample}
+(
+\vect{z}_t;
+T,\ top\text{-}k,\ top\text{-}p,\ \ldots
+).
+]
+
+生成循环通常会在以下条件之一满足时结束：
+
+\begin{itemize}
+\item 生成了 EOS token；
+\item 命中 stop words 或 stop sequence；
+\item 达到最大生成长度；
+\item 请求被用户取消；
+\item server 触发超时或资源限制；
+\item 安全策略或工具调用逻辑中断生成。
+\end{itemize}
+
+下面给出一个极简自回归推理伪代码。它强调 prefill、decode 和 KV Cache 的关系，不代表高性能实现。
+
+\begin{lstlisting}[language=Python,caption={自回归推理中 prefill、decode 与 KV Cache 的极简伪代码},label={lst:autoregressive-generation-kv-cache}]
+def generate(model, input_ids, max_new_tokens, sampler):
+"""
+input_ids: [batch, prompt_len]
+"""
+# Prefill: process the whole prompt and build KV cache.
+logits, kv_cache = model.forward_prefill(input_ids)
+
+```
+next_token = sampler(logits[:, -1, :])
+output_tokens = [next_token]
+
+# Decode: one token per iteration.
+for _ in range(max_new_tokens - 1):
+    logits, kv_cache = model.forward_decode(
+        input_ids=next_token[:, None],
+        kv_cache=kv_cache,
+    )
+
+    next_token = sampler(logits[:, -1, :])
+    output_tokens.append(next_token)
+
+    if should_stop(next_token):
+        break
+
+return concat_tokens(output_tokens)
+```
+
+\end{lstlisting}
+
+真实 serving 系统会比这复杂得多。它需要把多个请求放到同一个 batch 中，支持请求动态加入和退出，管理不同长度的 KV Cache，处理 prefix cache、分页分配、并行采样、流式输出、超时、取消、优先级、SLA 和多 GPU 通信。
+
+\subsection{为什么推理不同于训练}
+\label{subsec:why-inference-differs-from-training}
+
+训练与推理都执行 Transformer forward，但系统形态差异很大。训练通常有固定 batch、固定 sequence length、完整 forward+backward、规则的张量形状和长时间稳定运行。推理则面向在线请求，输入长度和输出长度高度动态，且 decode 阶段存在严格 token 依赖。
+
+训练中，一次 step 可能处理：
+
+[
+B\times S
+]
+个 token，并对所有 token 计算 loss。推理 prefill 处理 prompt，而 decode 每步通常只处理每个请求的一个 token。
+
+训练主要瓶颈包括：
+
+\begin{itemize}
+\item 大 GEMM 计算吞吐；
+\item 激活显存；
+\item backward 与 optimizer；
+\item DP/TP/PP 通信；
+\item checkpoint 和数据加载。
+\end{itemize}
+
+推理主要瓶颈包括：
+
+\begin{itemize}
+\item KV Cache 显存；
+\item decode 阶段 HBM 带宽；
+\item 请求调度；
+\item batch 内长度不均；
+\item TTFT 与 TPOT；
+\item cache 碎片；
+\item 多租户和 SLA。
+\end{itemize}
+
+\begin{table}[H]
+\centering
+\small
+\caption{LLM 训练与推理的系统差异}
+\label{tab:training-vs-inference}
+\begin{tabular}{p{0.22\textwidth}p{0.34\textwidth}p{0.34\textwidth}}
+\toprule
+\textbf{维度} & \textbf{训练} & \textbf{推理} \
+\midrule
+输入形态
+& 大 batch、固定或近似固定序列长度
+& 请求长度动态，prompt 和 output 长度差异大 \
+\midrule
+计算流程
+& forward + backward + optimizer step
+& prefill + 多轮 decode \
+\midrule
+并行性
+& 一个 step 内大量 token 可并行
+& decode token-by-token，强依赖上一 token \
+\midrule
+主要显存
+& 参数、梯度、优化器状态、激活
+& 参数、KV Cache、临时 attention buffer \
+\midrule
+主要瓶颈
+& GEMM、激活、分布式通信
+& HBM 带宽、KV Cache 管理、调度 \
+\midrule
+关键指标
+& tokens/s、MFU、loss、收敛稳定性
+& TTFT、TPOT、吞吐、尾延迟、成本/token \
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+box/.style={draw, rounded corners=3pt, minimum width=1.8cm, minimum height=0.7cm, align=center},
+token/.style={draw, rounded corners=2pt, minimum width=0.55cm, minimum height=0.4cm, align=center},
+arrow/.style={-{Latex[length=2.2mm]}, thick}
+]
+
+```
+\node[font=\bfseries] at (0,3.4) {Prefill 与 Decode 阶段对比};
+
+% Prefill
+\node[font=\bfseries] at (-3.8,2.55) {Prefill};
+\foreach \i/\x in {1/-5.2,2/-4.55,3/-3.9,4/-3.25,5/-2.6} {
+  \node[token, fill=blue!10] (p\i) at (\x,1.8) {$x_{\i}$};
+}
+\node[box, fill=orange!14] (pf) at (-3.9,0.75) {Full prompt\\forward};
+\node[box, fill=green!10] (pkv) at (-3.9,-0.25) {Build KV Cache};
+\node[box, fill=purple!10] (plogit) at (-3.9,-1.25) {First logits};
+
+\foreach \i in {1,2,3,4,5} {
+  \draw[arrow] (p\i) -- (pf);
+}
+\draw[arrow] (pf) -- (pkv);
+\draw[arrow] (pkv) -- (plogit);
+
+% Decode
+\node[font=\bfseries] at (3.8,2.55) {Decode};
+\node[token, fill=blue!10] (dnew) at (2.25,1.8) {$x_t$};
+\node[box, fill=orange!14] (df) at (3.8,1.25) {One-token\\forward};
+\node[box, fill=green!10] (dkv) at (5.35,1.8) {Read old KV\\Append new KV};
+\node[box, fill=purple!10] (dlogit) at (3.8,0.25) {Next logits};
+\node[token, fill=yellow!18] (sample) at (3.8,-0.75) {$x_{t+1}$};
+\node[box, fill=red!8] (loop) at (3.8,-1.6) {repeat};
+
+\draw[arrow] (dnew) -- (df);
+\draw[arrow] (dkv) -- (df);
+\draw[arrow] (df) -- (dlogit);
+\draw[arrow] (dlogit) -- (sample);
+\draw[arrow] (sample) -- (loop);
+\draw[arrow] (loop.west) .. controls (1.7,-1.1) and (1.7,1.6) .. (dnew.west);
+
+\draw[dashed, thick] (0,-2.0) -- (0,2.8);
+
+\node[align=left, text width=10.6cm] at (0,-2.75) {
+  Prefill 一次处理完整 prompt，计算密度高；Decode 每次只处理一个新 token，
+  但每层都要读取不断增长的 KV Cache，因此更容易受显存带宽和 cache 管理影响。
+};
+```
+
+\end{tikzpicture}
+\caption{Prefill 与 Decode 阶段的计算流程对比}
+\label{fig:prefill-vs-decode}
+\end{figure}
+
+\section{KV Cache 的基本原理}
+\label{sec:kv-cache-basics}
+
+KV Cache 的核心问题是：为什么 Key 和 Value 可以缓存？为什么 Query 不缓存？缓存的 shape 是什么？显存如何估算？这些问题决定了后续所有推理优化。
+
+\subsection{Key / Value 为什么可以缓存}
+\label{subsec:why-cache-key-value}
+
+考虑 Decoder-only Transformer 的第 $\ell$ 层。对某个 token 的 hidden state $\vect{h}_i^{(\ell)}$，线性投影得到：
+
+[
+\vect{q}_i^{(\ell)}=\vect{h}_i^{(\ell)}\mat{W}_Q^{(\ell)},
+]
+[
+\vect{k}_i^{(\ell)}=\vect{h}_i^{(\ell)}\mat{W}_K^{(\ell)},
+]
+[
+\vect{v}_i^{(\ell)}=\vect{h}_i^{(\ell)}\mat{W}_V^{(\ell)}.
+]
+
+在自回归 decode 中，当已经生成了 token $x_1,\ldots,x_t$ 后，未来生成 $x_{t+1}$ 不会改变过去 token 的 hidden states。原因是 causal mask 保证过去位置不能看未来位置；模型参数在推理中也不更新。因此，对于历史位置 $i\le t$：
+
+[
+\vect{k}_i^{(\ell)},\quad
+\vect{v}_i^{(\ell)}
+]
+
+在后续 decode 步中保持不变。
+
+当生成第 $t+1$ 个 token 时，需要计算的是新 token 的 query：
+
+[
+\vect{q}_{t+1}^{(\ell)}.
+]
+
+它要和历史所有 key 做点积：
+
+[
+\vect{q}*{t+1}^{(\ell)}
+\left[
+\vect{k}*{1}^{(\ell)},
+\vect{k}*{2}^{(\ell)},
+\ldots,
+\vect{k}*{t+1}^{(\ell)}
+\right]^{\mathsf{T}}.
+]
+
+历史 key/value 不变，因此可以缓存。若不缓存，就必须在每个 decode step 重新对整个上下文做 forward，重复计算所有历史 token 的 K/V。这会把 decode 成本从每步近似 $O(t)$ 变成重复的 $O(t^2)$ 或更高，完全不可接受。
+
+为什么不缓存 Query？因为每一步只需要当前新 token 的 query。历史 token 的 query 不会再用于未来 token 的 attention。未来 token 关注历史 token 时，需要的是未来 token 的 query 与历史 token 的 key，而不是历史 token 的 query。因此 Query 没有长期缓存价值。
+
+可以总结为：
+
+[
+\text{Key: 历史 token 的可匹配地址，需要被未来 query 查询。}
+]
+[
+\text{Value: 历史 token 的内容，需要被未来 attention 加权汇聚。}
+]
+[
+\text{Query: 当前 token 的查询向量，只在当前步使用。}
+]
+
+\subsection{cache shape 推导}
+\label{subsec:kv-cache-shape-derivation}
+
+设模型有：
+
+\begin{itemize}
+\item 层数 $L$；
+\item batch size $B$；
+\item 当前最大上下文长度 $S$；
+\item query head 数 $n_q$；
+\item key/value head 数 $n_{kv}$；
+\item head dimension $d_h$；
+\item hidden size $H=n_qd_h$；
+\item 每个元素字节数 $s_{\mathrm{dtype}}$。
+\end{itemize}
+
+对于每一层，K Cache 的 shape 通常是：
+
+[
+\mat{K}*{cache}^{(\ell)}
+\in
+\mathbb{R}^{B\times n*{kv}\times S\times d_h}.
+]
+
+V Cache 同理：
+
+[
+\mat{V}*{cache}^{(\ell)}
+\in
+\mathbb{R}^{B\times n*{kv}\times S\times d_h}.
+]
+
+所有层合并后：
+
+[
+\mat{K}*{cache}
+\in
+\mathbb{R}^{L\times B\times n*{kv}\times S\times d_h},
+]
+[
+\mat{V}*{cache}
+\in
+\mathbb{R}^{L\times B\times n*{kv}\times S\times d_h}.
+]
+
+有些实现会使用不同 layout，例如：
+
+[
+[B,L,n_{kv},S,d_h],
+]
+[
+[L,B,S,n_{kv},d_h],
+]
+[
+[L,B,n_{kv},d_h,S].
+]
+
+layout 的选择会影响 attention kernel 的访存连续性、append 新 token 的写入效率、batch 内请求重排成本以及分页 KV Cache 的实现方式。
+
+一个简单连续 KV Cache layout 如下图所示。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+cell/.style={draw, minimum width=0.45cm, minimum height=0.38cm},
+label/.style={font=\scriptsize},
+box/.style={draw, rounded corners=3pt, minimum width=2.0cm, minimum height=0.65cm, align=center},
+arrow/.style={-{Latex[length=2.1mm]}, thick}
+]
+
+```
+\node[font=\bfseries] at (0,3.25) {KV Cache 张量布局示意};
+
+\node[box, fill=blue!6] (layer) at (-4.7,1.9) {Layer $\ell$};
+\node[box, fill=orange!12] (kv) at (-2.4,1.9) {K Cache / V Cache};
+\draw[arrow] (layer) -- (kv);
+
+\foreach \b/\y in {0/1.15,1/0.35,2/-0.45} {
+  \node[label] at (-5.1,\y) {batch \b};
+  \foreach \h/\xbase in {0/-3.95,1/-2.85,2/-1.75} {
+    \node[label] at (\xbase,1.65) {head \h};
+    \foreach \s in {0,...,4} {
+      \node[cell, fill=green!10] at ({\xbase+0.18*\s},{\y}) {};
+    }
+  }
+}
+
+\draw[decorate,decoration={brace,amplitude=5pt},thick]
+  (-4.05,-0.95) -- (-3.15,-0.95)
+  node[midway,below=6pt] {$S$ positions};
+
+\draw[decorate,decoration={brace,amplitude=5pt},thick]
+  (-4.3,1.35) -- (-1.25,1.35)
+  node[midway,above=6pt] {$n_{kv}$ heads};
+
+\node[box, fill=purple!10, minimum width=2.4cm] (shape) at (2.6,0.4)
+  {$[L,B,n_{kv},S,d_h]$};
+
+\draw[arrow] (-1.1,0.4) -- (shape);
+
+\node[align=left, text width=10.5cm] at (0,-2.05) {
+  KV Cache 需要为每一层保存 K 和 V。每个请求的 cache 会随着生成长度增长。
+  实际系统会根据 attention kernel 的访存模式选择具体内存 layout。
+};
+```
+
+\end{tikzpicture}
+\caption{KV Cache 的基本张量布局}
+\label{fig:kv-cache-tensor-layout}
+\end{figure}
+
+\subsection{batch、head、seq_len、head_dim}
+\label{subsec:batch-head-seqlen-headdim}
+
+KV Cache shape 中每个维度都有系统含义。
+
+\textbf{Batch 维 $B$} 对应同一时刻正在服务的请求数。与训练不同，推理中的 batch 是动态的。请求可能随时加入或退出，且每个请求的上下文长度不同。因此 KV Cache 的 batch 维并不总是一个固定矩形张量那样简单。传统实现可能为每个 batch slot 预留最大长度；更高效的实现会使用 block-based 或 paged allocation。
+
+\textbf{Head 维 $n_{kv}$} 对应 key/value heads 数量。对于 MHA：
+
+[
+n_{kv}=n_q.
+]
+
+对于 MQA：
+
+[
+n_{kv}=1.
+]
+
+对于 GQA：
+
+[
+1<n_{kv}<n_q.
+]
+
+KV Cache 显存与 $n_{kv}$ 成正比。因此 GQA/MQA 对推理显存和带宽非常重要。
+
+\textbf{Sequence 维 $S$} 对应每个请求已经缓存的 token 数。Prefill 后，$S$ 等于 prompt length；decode 每生成一个 token，$S$ 增加 1。对于多轮对话，请求的 KV Cache 可能不断增长，直到达到上下文窗口上限或触发截断、压缩、eviction。
+
+\textbf{Head dimension $d_h$} 是每个 attention head 的向量维度。通常：
+
+[
+H=n_qd_h.
+]
+
+KV Cache 显存与 $d_h$ 成正比。对固定 hidden size $H$，如果使用 GQA 减少 $n_{kv}$，KV Cache 可显著下降。
+
+\subsection{KV Cache 显存估算}
+\label{subsec:kv-cache-memory-estimation}
+
+KV Cache 显存是 serving capacity 的核心约束。对于一个 dense Decoder-only 模型，KV Cache 总显存可粗略估算为：
+
+[
+M_{\mathrm{KV}}
+===============
+
+2
+\cdot
+L
+\cdot
+B
+\cdot
+S
+\cdot
+n_{kv}
+\cdot
+d_h
+\cdot
+s_{\mathrm{dtype}}.
+]
+
+其中前面的 $2$ 表示 K 和 V 两份 cache。
+
+如果使用 tensor parallel，KV Cache 也可能按 head 或 hidden 维切分到多个 GPU 上。设 TP size 为 $P_{\mathrm{TP}}$，如果 $n_{kv}$ 能按 TP 维切分，则每 GPU KV Cache 近似为：
+
+[
+M_{\mathrm{KV,perGPU}}
+======================
+
+\frac{
+2
+\cdot
+L
+\cdot
+B
+\cdot
+S
+\cdot
+n_{kv}
+\cdot
+d_h
+\cdot
+s_{\mathrm{dtype}}
+}
+{P_{\mathrm{TP}}}.
+]
+
+如果使用 MHA，$n_{kv}=n_q$；如果使用 GQA，$n_{kv}$ 更小。以 $L=80$、$B=32$、$S=4096$、$n_{kv}=8$、$d_h=128$、BF16 为例：
+
+[
+M_{\mathrm{KV}}
+===============
+
+2
+\cdot
+80
+\cdot
+32
+\cdot
+4096
+\cdot
+8
+\cdot
+128
+\cdot
+2
+\ \mathrm{bytes}.
+]
+
+这个值约为：
+
+[
+42.95\ \mathrm{GB}.
+]
+
+这只是 KV Cache，不包括模型参数、临时 buffer、CUDA runtime、scheduler metadata 和其他开销。若 batch 更大、上下文更长，KV Cache 会迅速成为主要显存占用。
+
+下面给出一个 KV Cache 显存估算器。
+
+\begin{lstlisting}[language=Python,caption={KV Cache 显存估算器},label={lst:kv-cache-memory-estimator}]
+def estimate_kv_cache_gb(
+num_layers,
+batch_size,
+seq_len,
+num_kv_heads,
+head_dim,
+dtype_bytes=2,
+tensor_parallel_size=1,
+):
+"""
+Estimate per-GPU KV cache memory in GB.
+
+```
+KV cache shape:
+  K: [L, B, n_kv, S, d_h]
+  V: [L, B, n_kv, S, d_h]
+"""
+total_bytes = (
+    2
+    * num_layers
+    * batch_size
+    * seq_len
+    * num_kv_heads
+    * head_dim
+    * dtype_bytes
+)
+
+per_gpu_bytes = total_bytes / tensor_parallel_size
+return per_gpu_bytes / (1024 ** 3)
+```
+
+gb = estimate_kv_cache_gb(
+num_layers=80,
+batch_size=32,
+seq_len=4096,
+num_kv_heads=8,
+head_dim=128,
+dtype_bytes=2,
+tensor_parallel_size=1,
+)
+
+print(round(gb, 2), "GB")
+\end{lstlisting}
+
+KV Cache 显存估算有几个常见误区：
+
+\begin{itemize}
+\item \textbf{只看模型参数，不看 KV Cache}：对于长上下文和高并发，KV Cache 可能比参数更限制 batch size；
+\item \textbf{忽略 GQA/MQA}：$n_{kv}$ 直接影响 KV Cache；
+\item \textbf{忽略 TP 切分}：多卡推理时每 GPU cache 可能被切分；
+\item \textbf{忽略碎片}：连续分配可能造成大量未使用空间；
+\item \textbf{忽略最大长度预留}：为最大上下文预留会比实际 token 使用更多显存；
+\item \textbf{忽略多轮对话增长}：同一个会话可能随着轮次持续增长。
+\end{itemize}
+
+\section{KV Cache 的性能瓶颈}
+\label{sec:kv-cache-performance-bottlenecks}
+
+KV Cache 不只是显存问题，也是性能问题。Decode 阶段每生成一个 token，都要在每一层读取历史 K/V。随着上下文变长，读取的数据量线性增长。由于每一步只处理一个新 token，计算密度不高，decode 往往受 HBM 带宽、cache layout、batch 组织和 kernel 访存效率限制。
+
+\subsection{decode 阶段的 memory-bound 特性}
+\label{subsec:decode-memory-bound}
+
+在 decode 阶段，每层 attention 对当前 token 执行：
+
+[
+\vect{q}*t\mat{K}*{cache}^{\mathsf{T}},
+]
+[
+\softmax(\cdot)\mat{V}_{cache}.
+]
+
+对于每个新 token、每层、每个 KV head，需要读取长度为 $S$ 的 K 和 V：
+
+[
+\mat{K}*{cache}\in\mathbb{R}^{S\times d_h},
+\quad
+\mat{V}*{cache}\in\mathbb{R}^{S\times d_h}.
+]
+
+读取量随 $S$ 线性增长：
+
+[
+O(Sd_h).
+]
+
+而当前 query 只有一个 token，矩阵乘法形状通常较小。相对于训练或 prefill 中的大 GEMM，decode attention 的算术强度较低：
+
+[
+\text{Arithmetic Intensity}
+===========================
+
+\frac{\text{FLOPs}}
+{\text{Bytes read/written}}.
+]
+
+当算术强度低时，性能更受内存带宽限制，而不是 Tensor Core 峰值 FLOPs 限制。也就是说，即使 GPU 有很高的理论算力，decode 阶段也可能因为不断读取 KV Cache 而无法充分利用计算单元。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+box/.style={draw, rounded corners=3pt, minimum width=1.65cm, minimum height=0.65cm, align=center},
+mem/.style={draw, rounded corners=4pt, minimum width=2.2cm, minimum height=1.0cm, align=center, fill=orange!14},
+arrow/.style={-{Latex[length=2.1mm]}, thick}
+]
+
+```
+\node[font=\bfseries] at (0,3.25) {Decode 阶段为何容易 memory-bound};
+
+\node[box, fill=blue!6] (q) at (-4.8,1.2) {new token\\$q_t$};
+\node[mem] (kvcache) at (-1.8,1.2) {KV Cache\\history $1:t$};
+\node[box, fill=green!10] (attn) at (1.3,1.2) {Attention\\small compute};
+\node[box, fill=purple!10] (out) at (4.2,1.2) {next hidden};
+
+\draw[arrow] (q) -- (attn);
+\draw[arrow] (kvcache) -- node[above] {large HBM reads} (attn);
+\draw[arrow] (attn) -- (out);
+
+\node[box, fill=yellow!16] (ffn) at (1.3,-0.1) {FFN / Linear\\small batch GEMM};
+\draw[arrow] (out) -- (ffn);
+
+\node[align=left, text width=10.5cm] at (0,-1.65) {
+  Decode 每步只处理新 token，计算规模小；但必须读取历史 K/V。
+  上下文越长，KV Cache 读取越大，attention 越容易受 HBM 带宽限制。
+};
+```
+
+\end{tikzpicture}
+\caption{Decode 阶段的 memory-bound 特性}
+\label{fig:decode-memory-bound}
+\end{figure}
+
+\subsection{长上下文显存压力}
+\label{subsec:long-context-memory-pressure}
+
+KV Cache 显存与上下文长度 $S$ 线性相关：
+
+[
+M_{\mathrm{KV}}\propto S.
+]
+
+如果上下文长度从 $4096$ 增加到 $32768$，KV Cache 显存也增加 $8$ 倍。长上下文模型不仅 prefill 更贵，decode 时每步读取的 cache 也更大。
+
+设单请求 KV Cache 显存为：
+
+[
+M_{\mathrm{KV,req}}
+===================
+
+2L S n_{kv}d_hs_{\mathrm{dtype}}.
+]
+
+在固定 GPU 显存预算 $M_{\mathrm{budget}}$ 下，可并发请求数近似满足：
+
+[
+B_{\max}
+\le
+\frac{M_{\mathrm{budget}}}
+{M_{\mathrm{KV,req}}}.
+]
+
+这说明长上下文会直接降低可承载并发。对于在线服务，用户请求长度差异很大：有些请求只有几十 token，有些请求有几万 token。如果简单按最大长度预留 KV Cache，会浪费大量显存；如果按实际长度动态分配，又需要复杂内存管理。
+
+长上下文还会影响调度。一个很长的请求可能占用大量 KV Cache，降低 batch 中其他请求的可用空间。服务系统必须决定是否接收、排队、截断、分块处理或拒绝该请求。这属于 admission control 的问题，后续 continuous batching 章节会继续讨论。
+
+\subsection{batch size 与 cache 碎片}
+\label{subsec:batch-size-cache-fragmentation}
+
+推理中 batch size 不像训练那样固定。请求动态加入和退出，每个请求的 prompt length 和 output length 都不同。若使用简单连续分配，为每个请求预留最大长度，会产生两类浪费：
+
+\begin{itemize}
+\item \textbf{内部碎片}：请求实际使用长度小于预留长度，预留空间未使用；
+\item \textbf{外部碎片}：已释放的空间分散，难以满足新的大请求连续分配。
+\end{itemize}
+
+例如两个请求：
+
+[
+R_1:\ \text{最大预留 }4096,\quad \text{实际使用 }512,
+]
+[
+R_2:\ \text{最大预留 }4096,\quad \text{实际使用 }3800.
+]
+
+如果都按 $4096$ 预留，$R_1$ 浪费大量空间。如果按实际长度增长式分配，则当 $R_2$ 继续生成时，可能需要扩展连续空间；若后面空间已被其他请求占用，就需要搬移或重新分配。
+
+这正是 PagedAttention 和 block-based allocation 的动机。把 KV Cache 切成固定大小 block，可以像操作系统分页一样管理，避免要求每个请求拥有连续大块空间。本章先讨论基本策略，下一章会深入 PagedAttention。
+
+\subsection{多轮对话中的 cache 复用}
+\label{subsec:multi-turn-cache-reuse}
+
+多轮对话中，用户和助手的历史消息会不断追加。例如：
+
+[
+\text{System prompt}
++
+\text{User}_1
++
+\text{Assistant}_1
++
+\text{User}_2
++
+\cdots
+]
+
+如果每一轮都从头 prefill 整个对话历史，会重复计算大量相同前缀。KV Cache 可以在同一会话内复用历史前缀，只对新增用户消息做增量 prefill，再进入 decode。
+
+假设前一轮已经缓存了前缀长度 $S_{\mathrm{old}}$：
+
+[
+x_1,\ldots,x_{S_{\mathrm{old}}}.
+]
+
+新一轮用户追加了 $\Delta S$ 个 token：
+
+[
+x_{S_{\mathrm{old}}+1},\ldots,x_{S_{\mathrm{old}}+\Delta S}.
+]
+
+系统只需要对新增部分做 prefill，并让新增 token attend 到旧 cache：
+
+[
+\mat{K}*{cache}[1:S*{\mathrm{old}}+\Delta S].
+]
+
+这样可以降低多轮对话中的重复 prefill 成本。但 cache 复用也有工程问题：
+
+\begin{itemize}
+\item 会话 cache 需要在请求之间保留，占用显存；
+\item 用户可能长时间不继续对话，cache 是否保留需要 eviction 策略；
+\item 多副本部署时，后续请求是否路由到同一 worker 影响复用；
+\item 如果 system prompt 或采样参数变化，prefix 是否仍可复用需要判断；
+\item 对话历史超出上下文窗口时，需要截断或压缩。
+\end{itemize}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+req/.style={draw, rounded corners=3pt, minimum width=1.8cm, minimum height=0.55cm, align=center},
+cache/.style={draw, rounded corners=2pt, minimum width=0.65cm, minimum height=0.4cm, align=center},
+arrow/.style={-{Latex[length=2.1mm]}, thick}
+]
+
+```
+\node[font=\bfseries] at (0,3.25) {多请求 KV Cache 随生成过程增长};
+
+\foreach \r/\y/\len/\col in {1/1.65/4/blue!10,2/0.75/7/green!10,3/-0.15/3/orange!14} {
+  \node[req, fill=\col] at (-5.0,\y) {Request \r};
+  \foreach \i in {1,...,\len} {
+    \node[cache, fill=\col] at ({-3.5+0.45*\i},\y) {};
+  }
+  \draw[arrow] ({-3.5+0.45*\len+0.35},\y) -- ({-3.5+0.45*\len+1.0},\y);
+  \node[cache, fill=yellow!18] at ({-3.5+0.45*\len+1.3},\y) {new};
+}
+
+\node[align=left, text width=10.5cm] at (0,-1.45) {
+  不同请求的 KV Cache 长度不同，并且 decode 每步继续增长。
+  Serving 系统需要动态管理 cache 空间，避免长短请求混部造成显存碎片和调度低效。
+};
+```
+
+\end{tikzpicture}
+\caption{多请求 KV Cache 的增长过程}
+\label{fig:multi-request-kv-cache-growth}
+\end{figure}
+
+\section{KV Cache 管理策略}
+\label{sec:kv-cache-management-strategies}
+
+KV Cache 管理是 LLM serving 系统的核心模块之一。它不仅负责分配和释放显存，还要配合 scheduler、attention kernel、prefix cache、请求取消、长上下文、batch 重排和多 GPU 并行。
+
+本节讨论四类基础策略：
+
+\begin{itemize}
+\item contiguous allocation；
+\item block-based allocation；
+\item cache eviction；
+\item prefix caching。
+\end{itemize}
+
+\subsection{contiguous allocation}
+\label{subsec:contiguous-allocation}
+
+最简单的 KV Cache 管理方式是连续分配。系统为每个请求分配一段连续的 cache 空间：
+
+[
+[\text{start},\ \text{start}+S_{\max}).
+]
+
+每生成一个 token，就把新的 K/V 写入下一个位置。连续分配的优点是实现简单，attention kernel 读取也简单，因为一个请求的历史 K/V 在内存中是连续的。
+
+连续分配的常见布局可以是：
+
+[
+\texttt{cache[layer][batch_slot][kv_head][pos][head_dim]}.
+]
+
+写入第 $t$ 个 token 时：
+
+[
+\texttt{cache[layer][slot][head][t][:]}
+\leftarrow
+\texttt{new_kv}.
+]
+
+这种方式适合固定 batch、固定最大长度、请求长度较一致的场景。但在线服务中，连续分配有明显缺点：
+
+\begin{itemize}
+\item 需要提前预留最大长度，浪费显存；
+\item 请求长度不均导致内部碎片；
+\item 请求释放后产生外部碎片；
+\item 扩展请求长度可能需要重新分配；
+\item batch slot 与 request 绑定，动态调度不灵活。
+\end{itemize}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+cell/.style={draw, minimum width=0.48cm, minimum height=0.42cm},
+label/.style={font=\scriptsize}
+]
+
+```
+\node[font=\bfseries] at (0,3.0) {Contiguous KV Cache Allocation};
+
+\foreach \r/\y/\used/\col in {1/1.55/3/blue!10,2/0.85/6/green!10,3/0.15/2/orange!14} {
+  \node[label] at (-4.8,\y) {Request \r};
+  \foreach \i in {0,...,7} {
+    \ifnum\i<\used
+      \node[cell, fill=\col] at ({-3.8+0.52*\i},\y) {};
+    \else
+      \node[cell, fill=gray!16] at ({-3.8+0.52*\i},\y) {};
+    \fi
+  }
+}
+
+\node[draw, rounded corners=2pt, fill=blue!10, minimum width=0.55cm, minimum height=0.35cm] at (1.4,1.5) {};
+\node[anchor=west] at (1.8,1.5) {used tokens};
+\node[draw, rounded corners=2pt, fill=gray!16, minimum width=0.55cm, minimum height=0.35cm] at (1.4,0.9) {};
+\node[anchor=west] at (1.8,0.9) {reserved but unused};
+
+\node[align=left, text width=10.4cm] at (0,-1.35) {
+  连续分配简单、访存友好，但需要预留最大长度。
+  在线请求长度不均时，未使用的预留空间会造成显著显存浪费。
+};
+```
+
+\end{tikzpicture}
+\caption{连续 KV Cache 分配中的预留空间浪费}
+\label{fig:contiguous-kv-cache-allocation}
+\end{figure}
+
+\subsection{block-based allocation}
+\label{subsec:block-based-allocation}
+
+Block-based allocation 将 KV Cache 切成固定大小的 blocks。每个 block 可以保存固定数量 token 的 K/V，例如 block size 为 $16$ 或 $32$ tokens。请求不再需要一段连续大空间，而是持有一个 block 列表：
+
+[
+\text{Request }r
+\rightarrow
+[b_0,b_1,b_2,\ldots].
+]
+
+当请求继续生成，需要更多空间时，从 free block pool 中申请新 block；请求结束时，把它持有的 blocks 释放回池中。
+
+这种方式的优点是：
+
+\begin{itemize}
+\item 避免按最大长度连续预留；
+\item 释放后 block 可被其他请求复用；
+\item 更适合动态 batch 和长短请求混部；
+\item 支持 prefix cache 的 block 级共享；
+\item 为 PagedAttention 的 block table 奠定基础。
+\end{itemize}
+
+缺点是 attention kernel 读取 K/V 时不能简单假设请求的历史 token 连续存储。Kernel 需要通过 block table 把逻辑位置映射到物理 block。这会增加地址计算复杂度，但换来显存利用率提升。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+block/.style={draw, rounded corners=2pt, minimum width=0.7cm, minimum height=0.45cm, align=center},
+req/.style={draw, rounded corners=3pt, minimum width=1.55cm, minimum height=0.55cm, align=center, fill=blue!6},
+arrow/.style={-{Latex[length=2.1mm]}, thick}
+]
+
+```
+\node[font=\bfseries] at (0,3.15) {Block-based KV Cache Allocation};
+
+\node[req] (r1) at (-5.2,1.55) {Req 1};
+\node[req] (r2) at (-5.2,0.55) {Req 2};
+\node[req] (r3) at (-5.2,-0.45) {Req 3};
+
+\foreach \i/\x/\y/\col in {
+  0/-2.8/1.55/blue!10,
+  1/-1.85/1.55/blue!10,
+  2/-0.9/1.55/blue!10,
+  3/-2.8/0.55/green!10,
+  4/-1.85/0.55/green!10,
+  5/-0.9/0.55/green!10,
+  6/0.05/0.55/green!10,
+  7/-2.8/-0.45/orange!14,
+  8/-1.85/-0.45/orange!14
+} {
+  \node[block, fill=\col] (b\i) at (\x,\y) {$b_{\i}$};
+}
+
+\draw[arrow] (r1) -- (b0);
+\draw[arrow] (r2) -- (b3);
+\draw[arrow] (r3) -- (b7);
+
+\node[draw, rounded corners=3pt, fill=gray!12, minimum width=2.9cm, minimum height=0.75cm, align=center] (free) at (3.1,0.55)
+  {Free block pool};
+
+\foreach \i/\x in {9/2.25,10/3.1,11/3.95} {
+  \node[block, fill=gray!20] at (\x,-0.25) {$b_{\i}$};
+}
+
+\node[align=left, text width=10.5cm] at (0,-1.95) {
+  每个请求持有若干固定大小 block，而不是一段连续大空间。
+  新 token 写满当前 block 后，再从 free pool 申请新 block。
+};
+```
+
+\end{tikzpicture}
+\caption{Block-based KV Cache 分配}
+\label{fig:block-based-kv-cache-allocation}
+\end{figure}
+
+\subsection{cache eviction}
+\label{subsec:cache-eviction}
+
+KV Cache 占用显存，而显存是有限资源。当请求结束、取消、超时或被调度策略移除时，需要释放 cache。更复杂的是，系统可能为了 prefix caching 或多轮会话保留某些 cache，以便未来复用。此时需要 eviction 策略决定哪些 cache 可以被驱逐。
+
+常见 eviction 依据包括：
+
+\begin{itemize}
+\item \textbf{请求是否已结束}：结束请求的 cache 可立即释放；
+\item \textbf{会话是否仍活跃}：长时间无后续请求的 session cache 可释放；
+\item \textbf{prefix 复用频率}：高频 system prompt 或热门 prefix 值得保留；
+\item \textbf{cache 大小}：超大 cache 可能优先驱逐以释放显存；
+\item \textbf{SLA 优先级}：低优先级请求的 cache 可更早释放；
+\item \textbf{最近使用时间}：LRU 类策略；
+\item \textbf{预计重算成本}：prefill 很贵的 prefix 更值得缓存。
+\end{itemize}
+
+可以定义一个 cache value 分数：
+
+[
+\operatorname{score}(c)
+=======================
+
+\alpha\cdot \operatorname{reuse_prob}(c)
++
+\beta\cdot \operatorname{recompute_cost}(c)
+-------------------------------------------
+
+## \gamma\cdot \operatorname{memory_size}(c)
+
+\delta\cdot \operatorname{idle_time}(c).
+]
+
+分数低的 cache 更适合驱逐。真实系统不一定显式使用这样的公式，但背后的权衡类似：保留 cache 可以降低未来 prefill 成本，但会占用当前显存，降低当前可服务并发。
+
+\subsection{prefix caching}
+\label{subsec:prefix-caching}
+
+Prefix caching 指多个请求共享相同前缀时，复用该前缀的 KV Cache。典型场景包括：
+
+\begin{itemize}
+\item 所有请求共享同一个 system prompt；
+\item RAG 模板中前半部分相同；
+\item 多个用户请求使用相同 few-shot examples；
+\item 多轮对话中复用历史上下文；
+\item 批量评测中 prompt 模板一致。
+\end{itemize}
+
+假设两个请求前缀相同：
+
+[
+x_1,\ldots,x_K.
+]
+
+它们的 KV Cache 前 $K$ 个 token 完全相同。因此可以只保存一份 prefix KV，并让多个请求引用它。每个请求只为自己的 suffix 分配新的 cache：
+
+[
+\text{Request A}
+================
+
+\text{Shared Prefix}
++
+\text{Suffix A},
+]
+[
+\text{Request B}
+================
+
+\text{Shared Prefix}
++
+\text{Suffix B}.
+]
+
+Prefix cache 的收益是减少重复 prefill 和重复显存占用。但它带来引用计数和生命周期管理问题。共享 prefix 不能在仍有请求引用时释放；如果某个请求继续生成，只能追加自己的 suffix，不能修改共享 prefix。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+block/.style={draw, rounded corners=2pt, minimum width=0.6cm, minimum height=0.42cm, align=center},
+req/.style={draw, rounded corners=3pt, minimum width=1.45cm, minimum height=0.55cm, align=center, fill=blue!6},
+arrow/.style={-{Latex[length=2.1mm]}, thick}
+]
+
+```
+\node[font=\bfseries] at (0,3.25) {Prefix Cache 复用示意};
+
+\node[req] (ra) at (-5.2,1.25) {Req A};
+\node[req] (rb) at (-5.2,0.15) {Req B};
+
+\foreach \i/\x in {0/-2.9,1/-2.25,2/-1.6,3/-0.95} {
+  \node[block, fill=green!12] (p\i) at (\x,1.85) {$p_{\i}$};
+}
+\draw[decorate,decoration={brace,amplitude=5pt},thick]
+  (-3.25,2.25) -- (-0.6,2.25)
+  node[midway,above=6pt] {shared prefix KV};
+
+\foreach \i/\x in {0/0.4,1/1.05,2/1.7} {
+  \node[block, fill=blue!10] (a\i) at (\x,1.25) {$a_{\i}$};
+}
+\foreach \i/\x in {0/0.4,1/1.05} {
+  \node[block, fill=orange!14] (b\i) at (\x,0.15) {$b_{\i}$};
+}
+
+\draw[arrow] (ra) -- (p0);
+\draw[arrow] (rb) -- (p0);
+
+\draw[arrow] (p3) -- (a0);
+\draw[arrow] (p3) -- (b0);
+
+\node[align=left, text width=10.5cm] at (0,-1.25) {
+  多个请求可以共享相同 prefix 的 KV Cache，只为各自 suffix 分配额外 cache。
+  这能降低重复 prefill 和显存占用，但需要引用计数与生命周期管理。
+};
+```
+
+\end{tikzpicture}
+\caption{Prefix cache 在多个请求之间复用相同前缀}
+\label{fig:prefix-cache-reuse}
+\end{figure}
+
+下面给出一个极简 prefix cache 管理伪代码。
+
+\begin{lstlisting}[language=Python,caption={Prefix Cache 管理的极简伪代码},label={lst:prefix-cache-manager}]
+class PrefixCacheEntry:
+def **init**(self, blocks):
+self.blocks = blocks
+self.ref_count = 0
+self.last_used_time = 0
+
+class PrefixCacheManager:
+def **init**(self):
+self.table = {}  # prefix_hash -> PrefixCacheEntry
+
+```
+def lookup(self, prefix_tokens):
+    key = hash_tokens(prefix_tokens)
+    entry = self.table.get(key)
+    if entry is None:
+        return None
+
+    entry.ref_count += 1
+    entry.last_used_time = now()
+    return entry.blocks
+
+def insert(self, prefix_tokens, blocks):
+    key = hash_tokens(prefix_tokens)
+    entry = PrefixCacheEntry(blocks)
+    entry.ref_count = 1
+    entry.last_used_time = now()
+    self.table[key] = entry
+    return entry.blocks
+
+def release(self, prefix_tokens):
+    key = hash_tokens(prefix_tokens)
+    entry = self.table.get(key)
+    if entry is not None:
+        entry.ref_count -= 1
+
+def evict_if_needed(self, free_block_pool):
+    # Evict unused prefixes first.
+    candidates = [
+        (key, entry)
+        for key, entry in self.table.items()
+        if entry.ref_count == 0
+    ]
+
+    # Example policy: least recently used.
+    candidates.sort(key=lambda item: item[1].last_used_time)
+
+    for key, entry in candidates:
+        if free_block_pool.has_enough_free_blocks():
+            break
+        free_blocks(entry.blocks)
+        del self.table[key]
+```
+
+\end{lstlisting}
+
+真实 prefix caching 要处理更多细节，例如 tokenizer 一致性、prefix hash 冲突、block table 共享、copy-on-write、并发请求、跨 worker cache 命中、cache warmup 和安全隔离。
+
+\section{KV Cache 与并行推理}
+\label{sec:kv-cache-and-parallel-inference}
+
+前面主要从单 GPU 或单模型副本角度讨论 KV Cache。实际 serving 中，大模型常使用 tensor parallel、pipeline parallel 或 expert parallel 进行多 GPU 推理。此时 KV Cache 也必须与并行方式匹配。
+
+\subsection{Tensor Parallel 下的 KV Cache}
+\label{subsec:kv-cache-under-tensor-parallel}
+
+Tensor Parallel 推理中，attention heads 通常按 TP rank 切分。若 query heads 和 kv heads 都能整除 TP size，则每个 rank 保存一部分 KV heads：
+
+[
+n_{kv,\mathrm{local}}
+=====================
+
+\frac{n_{kv}}{P_{\mathrm{TP}}}.
+]
+
+每 GPU KV Cache 近似为：
+
+[
+M_{\mathrm{KV,local}}
+=====================
+
+2
+\cdot
+L
+\cdot
+B
+\cdot
+S
+\cdot
+n_{kv,\mathrm{local}}
+\cdot
+d_h
+\cdot
+s_{\mathrm{dtype}}.
+]
+
+也就是：
+
+[
+M_{\mathrm{KV,local}}
+=====================
+
+\frac{M_{\mathrm{KV,total}}}{P_{\mathrm{TP}}}.
+]
+
+在这种设计中，每个 rank 本地执行自己负责 heads 的 attention，读取本地 KV Cache。之后 attention output projection 通常需要 TP all-reduce 或其他通信恢复 hidden state。
+
+如果使用 GQA，需要保证 kv heads 与 TP 的映射合理。若 $n_{kv}$ 小于 TP size，某些 TP rank 可能没有独立 kv head，或者需要复制 K/V。实现上可能有多种策略：
+
+\begin{itemize}
+\item 让 TP size 不超过 $n_{kv}$；
+\item 在多个 query ranks 之间共享 kv heads；
+\item 复制 K/V 到多个 ranks；
+\item 使用更复杂的 attention kernel mapping。
+\end{itemize}
+
+这说明模型架构中的 GQA 参数会影响 serving 并行配置。
+
+\subsection{Pipeline Parallel 下的 KV Cache}
+\label{subsec:kv-cache-under-pipeline-parallel}
+
+Pipeline Parallel 推理中，不同 GPU 负责不同层。每个 pipeline stage 只保存自己负责层的 KV Cache。若第 $p$ 个 stage 负责层集合 $\mathcal{L}_p$，则它保存：
+
+[
+{\mat{K}^{(\ell)},\mat{V}^{(\ell)}\mid \ell\in\mathcal{L}_p}.
+]
+
+每个 token 在 decode 时依次经过所有 stages。Stage 0 处理完后把 hidden state 发送给 Stage 1，直到最后 stage 输出 logits。
+
+PP 推理中的 KV Cache 有几个问题：
+
+\begin{itemize}
+\item 每个 stage 的 cache 显存取决于它负责的层数；
+\item stage 间需要传递每个 decode step 的 hidden state；
+\item decode token-by-token 使 pipeline bubble 更明显；
+\item 如果 batch 很小，PP 利用率可能较低；
+\item pipeline stage 负载不均会影响 TPOT。
+\end{itemize}
+
+训练中的 pipeline 依靠多个 micro-batches 填充流水线；推理 decode 中，每个请求每步只有一个 token，流水线填充更加困难。因此很多推理系统更偏向 tensor parallel，而不是过深 pipeline parallel。对于非常大的模型，PP 仍可能必要，但需要结合 continuous batching 提高利用率。
+
+\subsection{KV Cache 与多副本部署}
+\label{subsec:kv-cache-and-replica-serving}
+
+在线服务通常部署多个模型副本。一个用户会话的 KV Cache 常驻在某个 worker 上。如果下一轮请求被路由到另一个 worker，就无法直接复用该 cache，除非做跨 worker cache 迁移或共享存储。
+
+这带来 sticky session 问题：
+
+[
+\text{same session}
+\rightarrow
+\text{same worker}
+]
+
+可以提高 cache 命中率，但可能导致负载不均。例如某些 worker 上积累了很多长会话，显存压力更高；另一些 worker 空闲。若为了负载均衡把会话迁移到其他 worker，则可能失去 KV Cache 复用，增加 prefill 成本。
+
+因此 serving router 需要在以下目标之间权衡：
+
+\begin{itemize}
+\item cache locality；
+\item worker load balance；
+\item GPU memory pressure；
+\item request priority；
+\item tail latency；
+\item session affinity。
+\end{itemize}
+
+\section{KV Cache 实现骨架}
+\label{sec:kv-cache-implementation-skeleton}
+
+下面给出一个教学版 KV Cache 类。它采用连续分配，不支持分页、prefix sharing 或动态 batch 退出，但有助于理解 cache 的基本操作：初始化、append、读取和长度维护。
+
+\begin{lstlisting}[language=Python,caption={教学版连续 KV Cache 实现骨架},label={lst:kv-cache-class-skeleton}]
+import torch
+
+class ContiguousKVCache:
+def **init**(
+self,
+num_layers,
+batch_size,
+max_seq_len,
+num_kv_heads,
+head_dim,
+dtype=torch.bfloat16,
+device="cuda",
+):
+self.num_layers = num_layers
+self.batch_size = batch_size
+self.max_seq_len = max_seq_len
+self.num_kv_heads = num_kv_heads
+self.head_dim = head_dim
+
+```
+    # K/V: [L, B, H_kv, S_max, D]
+    self.k_cache = torch.empty(
+        num_layers,
+        batch_size,
+        num_kv_heads,
+        max_seq_len,
+        head_dim,
+        dtype=dtype,
+        device=device,
+    )
+    self.v_cache = torch.empty_like(self.k_cache)
+
+    # Current valid length for each batch slot.
+    self.lengths = torch.zeros(
+        batch_size,
+        dtype=torch.long,
+        device=device,
+    )
+
+def append(self, layer_idx, batch_indices, k_new, v_new):
+    """
+    Append K/V for one decode step.
+
+    k_new, v_new: [B_active, H_kv, 1, D]
+    batch_indices: [B_active]
+    """
+    for local_i, batch_i in enumerate(batch_indices):
+        pos = self.lengths[batch_i].item()
+
+        if pos >= self.max_seq_len:
+            raise RuntimeError("KV cache is full")
+
+        self.k_cache[layer_idx, batch_i, :, pos:pos+1, :] = k_new[local_i]
+        self.v_cache[layer_idx, batch_i, :, pos:pos+1, :] = v_new[local_i]
+
+def increment_lengths(self, batch_indices):
+    self.lengths[batch_indices] += 1
+
+def get_prefix(self, layer_idx, batch_i):
+    """
+    Return valid K/V prefix for one request.
+
+    k: [H_kv, S, D]
+    v: [H_kv, S, D]
+    """
+    length = self.lengths[batch_i].item()
+    k = self.k_cache[layer_idx, batch_i, :, :length, :]
+    v = self.v_cache[layer_idx, batch_i, :, :length, :]
+    return k, v
+
+def reset_slot(self, batch_i):
+    # We do not need to clear memory immediately.
+    # Updating length is enough for correctness.
+    self.lengths[batch_i] = 0
+```
+
+\end{lstlisting}
+
+这个实现有许多生产系统不能接受的问题：
+
+\begin{itemize}
+\item Python loop 不能用于高性能 decode；
+\item batch slot 固定，动态加入退出不灵活；
+\item 每个请求预留 \texttt{max_seq_len}，浪费显存；
+\item 不支持 block table；
+\item 不支持 prefix cache；
+\item 不支持 paged attention kernel；
+\item 不支持 tensor parallel 中的 head 切分；
+\item 不支持请求取消后的 block 复用；
+\item 不支持异步调度与 stream 管理。
+\end{itemize}
+
+但它清楚地展示了 KV Cache 的基本语义：每一层、每个 batch slot、每个 KV head、每个 position 都保存一条 K/V 向量。
+
+生产级实现通常会将 append 和 attention 读取融合到 C++/CUDA/Triton kernel 中，并使用 block table 或 paged memory 避免连续分配问题。
+
+\section{本章小结}
+\label{sec:chapter12-summary}
+
+本章系统介绍了 KV Cache 的机制、推理流程、显存估算、性能瓶颈和管理策略。
+
+\begin{itemize}
+\item \textbf{LLM 推理分为 prefill 和 decode 两个阶段}。Prefill 一次处理完整 prompt，建立 KV Cache；decode 每次生成一个 token，并持续读取和追加 KV Cache。
+\item \textbf{Prefill 更像训练 forward}，计算密度较高，但长 prompt 会带来 $S^2$ attention 成本，并决定 TTFT。
+\item \textbf{Decode 是 token-by-token 的强依赖过程}，每步只处理新 token，但需要读取历史所有 K/V，因此容易 memory-bound。
+\item \textbf{Key 和 Value 可以缓存}，因为历史 token 在 causal decoder 中不会被未来 token 改变；未来 token 只需要用当前 query 查询历史 key，并加权历史 value。
+\item \textbf{Query 通常不缓存}，因为历史 query 不会被未来 token 复用。
+\item \textbf{KV Cache shape 通常为 $[L,B,n_{kv},S,d_h]$}，不同实现会根据 attention kernel 和内存访问模式选择不同 layout。
+\item \textbf{KV Cache 显存公式} 为 $M_{\mathrm{KV}}=2LBSn_{kv}d_hs_{\mathrm{dtype}}$，其中 $2$ 表示 K 和 V。
+\item \textbf{GQA/MQA 能显著降低 KV Cache}，因为 cache 大小与 $n_{kv}$ 成正比。
+\item \textbf{Decode 阶段的主要瓶颈常是 HBM 带宽}，因为每步需要读取随上下文长度线性增长的 K/V。
+\item \textbf{长上下文会线性增加 KV Cache 显存和 decode 读取量}，直接限制并发能力和成本。
+\item \textbf{连续 KV Cache 分配简单但容易浪费显存}，尤其在请求长度不均和动态加入退出的在线 serving 场景中。
+\item \textbf{Block-based allocation 更适合动态请求}，它把 cache 切成固定大小 blocks，为 PagedAttention 奠定基础。
+\item \textbf{Cache eviction 与 prefix caching 是 serving 系统中的关键策略}，它们在显存占用、重算成本和请求延迟之间做权衡。
+\item \textbf{并行推理中的 KV Cache 必须与 TP/PP 配合}：TP 常按 KV heads 切分 cache，PP 则按层切分 cache。
+\end{itemize}
+
+下一章将深入 PagedAttention 与 vLLM。我们会看到，KV Cache 最大的工程问题之一不是公式中的显存大小，而是在线请求中长度不均、动态增长和释放带来的碎片。PagedAttention 通过类似操作系统分页的 block table，把逻辑 token 位置映射到物理 cache blocks，从而显著提升显存利用率，并支撑 continuous batching。

@@ -1,0 +1,1320 @@
+\chapter{CUDA C++ 基础}
+\label{chap:cuda-cpp}
+
+\section{从 CPU 编程模型到 GPU 编程模型}
+\label{sec:cpu-to-gpu-programming-model}
+
+上一章我们从张量、矩阵乘法、自动微分和显存估算出发，建立了 AI Infrastructure 工程师理解模型计算成本的数学视角。本章开始，我们把这些数学对象真正放到硬件上执行。这里的核心问题不再只是：
+\[
+  \mat{C}=\mat{A}\mat{B}
+\]
+这条公式如何成立，而是进一步追问：
+
+\begin{itemize}
+  \item 这个矩阵乘法由多少个线程共同完成？
+  \item 每个线程负责哪些元素？
+  \item 数据从 HBM 进入 SM 的路径是什么？
+  \item 同一份数据能否在 shared memory 中被多个线程复用？
+  \item 为什么同样的 FLOPs，在不同 memory layout 下速度可能相差数倍？
+\end{itemize}
+
+CUDA C++ 是 NVIDIA GPU 编程的基础模型。即使现代 AI Infra 工程师更多使用 PyTorch、Triton、XLA、TensorRT、vLLM、DeepSpeed 或 Megatron-LM，也仍然需要理解 CUDA 的底层抽象。原因很简单：\textbf{所有高层框架最终都要落到 kernel、memory hierarchy、stream、event、collective communication 与 device runtime 这些基本机制上。}
+
+\subsection{CPU 的强控制流与 GPU 的强吞吐}
+\label{subsec:cpu-control-gpu-throughput}
+
+CPU 和 GPU 都能执行通用计算，但它们的设计目标非常不同。CPU 更强调低延迟、复杂控制流、分支预测、乱序执行和大缓存；GPU 更强调高吞吐、大规模并行、简单控制逻辑和海量线程调度。
+
+从 AI Infra 的角度看，可以把二者理解为两类不同的计算哲学：
+
+\begin{itemize}
+  \item \textbf{CPU 像少数几位经验丰富的工程师}：每个核心很强，擅长处理复杂逻辑、系统调用、调度、数据预处理、网络协议栈和控制面任务。
+  \item \textbf{GPU 像成千上万个执行统一任务的工人}：单个线程能力有限，但数量巨大，适合执行高度规则、数据并行、算术密集的任务。
+\end{itemize}
+
+深度学习中的矩阵乘法、卷积、attention、归一化和逐元素操作，大多具有可并行结构。以向量加法为例：
+\[
+  c_i=a_i+b_i,\quad i=0,1,\ldots,n-1.
+\]
+每个位置 $i$ 的计算互不依赖，因此可以让大量 GPU 线程同时处理不同元素。这种模式正是 GPU 擅长的。
+
+\begin{figure}[H]
+  \centering
+  \begin{tikzpicture}[
+      font=\small,
+      core/.style={draw, rounded corners=2pt, minimum width=0.75cm, minimum height=0.55cm, align=center},
+      cache/.style={draw, rounded corners=2pt, minimum width=3.4cm, minimum height=0.45cm, align=center, fill=yellow!15},
+      mem/.style={draw, rounded corners=2pt, minimum width=4.2cm, minimum height=0.65cm, align=center, fill=green!8},
+      title/.style={font=\bfseries},
+      note/.style={align=left, text width=5.0cm},
+      arrow/.style={-{Latex[length=2.3mm]}, thick}
+    ]
+
+    \node[title] at (-3.9,3.0) {CPU：低延迟与复杂控制};
+    \node[title] at (3.9,3.0) {GPU：高吞吐与海量并行};
+
+    \foreach \i/\x in {1/-5.0,2/-4.2,3/-3.4,4/-2.6} {
+      \node[core, fill=blue!8] (cpu\i) at (\x,2.0) {Core};
+    }
+    \node[cache] (l3) at (-3.8,1.15) {Large Cache};
+    \node[mem] (dram) at (-3.8,0.25) {System Memory};
+
+    \foreach \i in {0,...,7} {
+      \foreach \j in {0,...,3} {
+        \node[core, fill=orange!12, minimum width=0.55cm, minimum height=0.38cm]
+          at ({1.6+0.58*\i},{2.35-0.42*\j}) {};
+      }
+    }
+    \node[cache, minimum width=4.9cm] (smem) at (3.9,0.95) {Shared Memory / L1 / Register File};
+    \node[mem, minimum width=4.9cm] (hbm) at (3.9,0.05) {HBM};
+
+    \node[note] at (-3.8,-1.2) {
+      \textbf{典型任务：}\\
+      操作系统、调度器、RPC、数据加载、复杂业务逻辑、少量强依赖计算。
+    };
+
+    \node[note] at (3.9,-1.2) {
+      \textbf{典型任务：}\\
+      GEMM、attention、卷积、归一化、向量化逐元素计算、大规模并行训练。
+    };
+
+    \draw[arrow] (-3.8,-2.25) -- node[below] {控制流强} (-1.7,-2.25);
+    \draw[arrow] (2.0,-2.25) -- node[below] {数据并行强} (5.8,-2.25);
+  \end{tikzpicture}
+  \caption{CPU 与 GPU 编程模型的直观对比}
+  \label{fig:cpu-vs-gpu-programming-model}
+\end{figure}
+
+在实际 AI 系统中，CPU 和 GPU 并不是互相替代的关系。一个训练或推理任务通常包含如下路径：
+
+\begin{itemize}
+  \item CPU 负责数据读取、tokenization、batch 组装、调度、RPC、日志与监控；
+  \item GPU 负责大规模张量计算；
+  \item CPU 通过 CUDA runtime 向 GPU 提交 kernel；
+  \item GPU 异步执行 kernel，并通过 stream 和 event 与 CPU 协同；
+  \item 多 GPU 之间通过 NVLink、PCIe、InfiniBand 或 RoCE 完成通信。
+\end{itemize}
+
+因此，AI Infra 架构师不能只懂 GPU kernel，也不能只懂上层服务。真正的系统性能往往取决于 CPU 调度、GPU 执行、内存拷贝、通信同步和存储 IO 之间是否形成良好的流水线。
+
+\subsection{SIMD、SIMT 与 Warp}
+\label{subsec:simd-simt-warp}
+
+CPU 中常见的向量化模型是 SIMD，即 Single Instruction Multiple Data。一个 SIMD 指令可以对多个数据元素执行同一操作。例如，一个 AVX 指令可能同时对多个浮点数做加法。
+
+GPU 使用的模型通常称为 SIMT，即 Single Instruction Multiple Threads。程序员编写的是单个线程的逻辑，但硬件会把多个线程组织成一个执行单位。在 NVIDIA GPU 中，这个基本执行单位称为 \textbf{warp}。一个 warp 通常包含 $32$ 个线程。
+
+设一个 kernel 中有大量线程，每个线程执行如下逻辑：
+\[
+  c_i=a_i+b_i.
+\]
+逻辑上，我们可以认为每个线程独立处理一个 $i$；硬件上，GPU 会以 warp 为单位调度这些线程。若同一个 warp 中的线程走相同控制流，执行效率很高；若它们因为条件分支走不同路径，就会发生 \textbf{warp divergence}。
+
+\begin{figure}[H]
+  \centering
+  \begin{tikzpicture}[
+      font=\small,
+      thread/.style={draw, minimum width=0.45cm, minimum height=0.42cm, fill=blue!7},
+      warpbox/.style={draw, rounded corners=2pt, fill=blue!3},
+      arrow/.style={-{Latex[length=2.3mm]}, thick}
+    ]
+
+    \node[font=\bfseries] at (0,2.5) {一个 Warp 中的 32 个线程};
+
+    \foreach \i in {0,...,31} {
+      \node[thread] (t\i) at ({-7.4+0.48*\i},1.5) {\tiny \i};
+    }
+
+    \node[warpbox, fit=(t0)(t31), inner sep=4pt] (warp) {};
+    \node[align=center] at (0,0.75) {同一条指令被 32 个线程同时执行，线程 id 不同，处理的数据位置不同};
+
+    \node[draw, rounded corners=2pt, fill=green!8, minimum width=3.2cm, minimum height=0.8cm, align=center] (same) at (-3.4,-0.5)
+      {无分歧\\所有线程执行路径 A};
+    \node[draw, rounded corners=2pt, fill=red!8, minimum width=3.2cm, minimum height=0.8cm, align=center] (div) at (3.4,-0.5)
+      {有分歧\\部分线程路径 A，部分路径 B};
+
+    \draw[arrow] (-1.0,1.1) -- (same.north);
+    \draw[arrow] (1.0,1.1) -- (div.north);
+
+    \node[align=left, text width=5.2cm] at (-3.4,-1.75) {
+      \textbf{理想情况：}\\
+      warp 内线程执行相同指令，硬件吞吐高。
+    };
+
+    \node[align=left, text width=5.2cm] at (3.4,-1.75) {
+      \textbf{低效情况：}\\
+      分支路径需要串行化，部分线程暂时空转。
+    };
+  \end{tikzpicture}
+  \caption{SIMT、Warp 与控制流分歧}
+  \label{fig:simt-warp-divergence}
+\end{figure}
+
+对于 AI Infra 工程师，warp divergence 最常出现在以下场景：
+
+\begin{itemize}
+  \item 处理变长序列时，不同线程面对不同有效长度；
+  \item attention mask 或 padding mask 造成条件分支；
+  \item 稀疏模型、MoE routing 或 block-sparse attention 中，线程处理的数据形状不规则；
+  \item kernel 边界处理时，最后一个 block 的线程不满。
+\end{itemize}
+
+需要强调的是，分支本身并不一定糟糕。糟糕的是同一个 warp 内的线程频繁走不同分支，并且每个分支内工作量差异很大。很多高性能 kernel 会通过重排数据、固定 tile shape、使用 mask 计算替代显式分支等方式降低 divergence。
+
+\subsection{为什么 GPU 适合矩阵运算}
+\label{subsec:why-gpu-good-at-matmul}
+
+矩阵乘法：
+\[
+  C_{ij}=\sum_{k=0}^{K-1}A_{ik}B_{kj}
+\]
+天然具有大量并行性。不同的 $C_{ij}$ 可以由不同线程或线程组计算；同一个 $C_{ij}$ 的求和也可以被进一步并行化。更重要的是，矩阵乘法具有很强的数据复用：
+
+\begin{itemize}
+  \item $\mat{A}$ 的一行会被用于计算 $\mat{C}$ 中多个列位置；
+  \item $\mat{B}$ 的一列会被用于计算 $\mat{C}$ 中多个行位置；
+  \item 分块后，一个 tile 的 $\mat{A}$ 和 $\mat{B}$ 可以在 shared memory 中被多个线程反复使用。
+\end{itemize}
+
+算术强度是衡量一个算子是否适合 GPU 的重要指标。它通常定义为：
+\[
+  I=\frac{\text{FLOPs}}{\text{Bytes moved}}.
+\]
+若 $I$ 很高，说明每读取一个字节可以完成很多计算，算子更可能是 compute-bound；若 $I$ 很低，说明计算单元经常等待内存，算子更可能是 memory-bound。
+
+对一个理想化的 $N\times N$ 矩阵乘法，FLOPs 约为：
+\[
+  2N^3.
+\]
+如果只粗略考虑读取 $\mat{A}$、$\mat{B}$ 和写回 $\mat{C}$ 的数据量，约为：
+\[
+  3N^2s,
+\]
+其中 $s$ 是每个元素的字节数。算术强度近似为：
+\[
+  I\approx \frac{2N^3}{3N^2s}=\frac{2N}{3s}.
+\]
+随着 $N$ 增大，矩阵乘法的算术强度上升。这解释了为什么大尺寸 GEMM 往往能很好地利用 GPU，而小 batch、小矩阵、零散逐元素操作则更容易受 kernel launch 和访存开销影响。
+
+\section{CUDA 线程层次结构}
+\label{sec:cuda-thread-hierarchy}
+
+CUDA 编程模型把并行执行组织成三层：
+
+\begin{itemize}
+  \item \textbf{Grid}：一次 kernel launch 产生一个 grid；
+  \item \textbf{Block}：grid 由多个 block 组成；
+  \item \textbf{Thread}：每个 block 由多个 thread 组成。
+\end{itemize}
+
+线程通过内置变量识别自己的位置：
+
+\begin{itemize}
+  \item \texttt{threadIdx.x/y/z}：线程在 block 内的索引；
+  \item \texttt{blockIdx.x/y/z}：block 在 grid 内的索引；
+  \item \texttt{blockDim.x/y/z}：每个 block 的维度；
+  \item \texttt{gridDim.x/y/z}：grid 的维度。
+\end{itemize}
+
+\subsection{Grid、Block、Thread}
+\label{subsec:grid-block-thread}
+
+一个典型一维索引写法是：
+\[
+  i=\texttt{blockIdx.x}\cdot\texttt{blockDim.x}+\texttt{threadIdx.x}.
+\]
+这条公式几乎是 CUDA 入门的第一行公式，但它在 AI kernel 中反复出现。无论是向量加法、embedding lookup、LayerNorm 还是简单的 elementwise activation，本质上都需要把逻辑张量元素映射到线程索引。
+
+对于二维矩阵，我们常使用二维 block：
+\[
+  row=\texttt{blockIdx.y}\cdot\texttt{blockDim.y}+\texttt{threadIdx.y},
+\]
+\[
+  col=\texttt{blockIdx.x}\cdot\texttt{blockDim.x}+\texttt{threadIdx.x}.
+\]
+
+\begin{figure}[H]
+  \centering
+  \begin{tikzpicture}[
+      font=\small,
+      block/.style={draw, rounded corners=2pt, minimum width=1.35cm, minimum height=0.85cm, fill=blue!6, align=center},
+      thread/.style={draw, minimum width=0.35cm, minimum height=0.32cm, fill=orange!12},
+      arrow/.style={-{Latex[length=2.3mm]}, thick}
+    ]
+
+    \node[font=\bfseries] at (0,3.15) {CUDA 线程层次结构：Grid $\rightarrow$ Block $\rightarrow$ Thread};
+
+    \foreach \r in {0,...,1} {
+      \foreach \c in {0,...,3} {
+        \node[block] (b\r\c) at ({-3.6+2.4*\c},{1.85-1.2*\r})
+          {Block\\$(\c,\r)$};
+      }
+    }
+
+    \node[draw, rounded corners=4pt, fit=(b00)(b13), inner sep=8pt, label={[font=\small]above left:Grid}] (gridbox) {};
+
+    \node[block, fill=green!8, minimum width=2.1cm, minimum height=1.3cm] (oneblock) at (0,-1.4) {一个 Block};
+    \draw[arrow] (b12.south) -- (oneblock.north);
+
+    \foreach \r in {0,...,2} {
+      \foreach \c in {0,...,5} {
+        \node[thread] at ({-1.1+0.42*\c},{-0.95-0.35*\r}) {};
+      }
+    }
+
+    \node[align=left, text width=5.2cm] at (4.0,-1.3) {
+      \textbf{映射关系：}\\
+      Grid 是一次 kernel launch 的全局任务；\\
+      Block 是调度到 SM 的基本工作单元；\\
+      Thread 是执行标量逻辑的最小编程单位。
+    };
+  \end{tikzpicture}
+  \caption{Grid、Block、Thread 三层结构}
+  \label{fig:cuda-grid-block-thread}
+\end{figure}
+
+Block 是 CUDA 编程中的关键边界。一个 block 内的线程可以：
+
+\begin{itemize}
+  \item 通过 shared memory 共享数据；
+  \item 使用 \texttt{\_\_syncthreads()} 做同步；
+  \item 协作完成一个 tile 的计算。
+\end{itemize}
+
+不同 block 之间通常不能在同一个 kernel 内直接同步。若需要全局同步，常见方式是结束当前 kernel，再 launch 下一个 kernel。这个约束影响了很多算法设计。例如，一个大规模 reduction 往往需要多个阶段：每个 block 先做局部 reduction，再由另一个 kernel 汇总局部结果。
+
+\subsection{Warp 与线程束调度}
+\label{subsec:warp-scheduling}
+
+虽然程序员创建的是 thread，但硬件调度的基本单位是 warp。一个 block 会被划分成若干 warp。例如，一个 block 有 $256$ 个线程，则包含：
+\[
+  \frac{256}{32}=8
+\]
+个 warp。
+
+GPU 的 SM 会维护多个活跃 warp。当一个 warp 因为 global memory load 等待数据时，调度器可以切换到另一个 ready warp 执行。这样，GPU 用大量线程隐藏内存延迟。
+
+这与 CPU 的思路不同。CPU 通常依靠大缓存、分支预测和乱序执行降低单线程延迟；GPU 则通过同时驻留大量 warp，把某个 warp 的等待时间用另一个 warp 的计算填满。
+
+\begin{figure}[H]
+  \centering
+  \begin{tikzpicture}[
+      font=\small,
+      sm/.style={draw, rounded corners=3pt, fill=blue!5, minimum width=9.5cm, minimum height=3.5cm},
+      warp/.style={draw, rounded corners=2pt, fill=orange!12, minimum width=1.4cm, minimum height=0.55cm, align=center},
+      sched/.style={draw, rounded corners=2pt, fill=green!10, minimum width=2.2cm, minimum height=0.75cm, align=center},
+      arrow/.style={-{Latex[length=2.3mm]}, thick}
+    ]
+
+    \node[sm] (sm0) at (0,0) {};
+    \node[font=\bfseries] at (-4.1,1.45) {Streaming Multiprocessor};
+
+    \node[sched] (sched0) at (-2.9,0.75) {Warp Scheduler};
+    \node[sched] (exec0) at (2.8,0.75) {Execution Units};
+
+    \foreach \i/\y in {0/0.2,1/-0.45,2/-1.1} {
+      \node[warp] (w\i) at (-2.9,\y) {Warp \i};
+      \draw[arrow] (w\i.east) -- (exec0.west);
+    }
+
+    \node[warp, fill=red!10] (wait) at (-2.9,-1.75) {Warp 3\\waiting};
+    \draw[dashed, -{Latex[length=2.3mm]}, thick] (wait.east) -- (exec0.west);
+
+    \node[align=left, text width=4.2cm] at (2.7,-1.15) {
+      当某个 warp 等待内存时，\\
+      调度器选择其他 ready warp 执行，\\
+      以隐藏访存延迟。
+    };
+  \end{tikzpicture}
+  \caption{SM 内部的 warp 调度直觉}
+  \label{fig:warp-scheduling}
+\end{figure}
+
+在写 CUDA kernel 时，我们常看到两类优化目标：
+
+\begin{itemize}
+  \item \textbf{减少单个线程的无效工作}：避免冗余计算、减少分支、减少寄存器压力。
+  \item \textbf{提高 SM 上可驻留的活跃 warp 数量}：让硬件有足够 warp 用于隐藏延迟。
+\end{itemize}
+
+后者就是 occupancy 概念的入口。
+
+\subsection{Occupancy 的基本概念}
+\label{subsec:occupancy}
+
+Occupancy 通常指一个 SM 上实际活跃 warp 数量与硬件允许最大活跃 warp 数量的比例：
+\[
+  \mathrm{Occupancy}
+  =
+  \frac{\text{Active Warps per SM}}{\text{Maximum Warps per SM}}.
+\]
+更高 occupancy 可以帮助隐藏延迟，但 \textbf{occupancy 并不是越高越好}。原因是：
+
+\begin{itemize}
+  \item 如果 kernel 是纯计算密集型，较低 occupancy 也可能充分利用 Tensor Core；
+  \item 如果每个线程使用太多 register，会降低可驻留 warp 数量；
+  \item 如果每个 block 使用太多 shared memory，会减少同一 SM 上可同时驻留的 block；
+  \item 如果为了提高 occupancy 而降低 tile 复用，可能反而增加 HBM 访问。
+\end{itemize}
+
+Occupancy 受多种资源约束影响。可以粗略写成：
+\[
+  B_{\mathrm{active}}
+  =
+  \min
+  \left(
+    B_{\mathrm{thread}},
+    B_{\mathrm{reg}},
+    B_{\mathrm{smem}},
+    B_{\mathrm{arch}}
+  \right),
+\]
+其中：
+
+\begin{itemize}
+  \item $B_{\mathrm{thread}}$ 由每个 block 的线程数限制；
+  \item $B_{\mathrm{reg}}$ 由每个线程使用的寄存器数量限制；
+  \item $B_{\mathrm{smem}}$ 由每个 block 使用的 shared memory 限制；
+  \item $B_{\mathrm{arch}}$ 是硬件架构规定的最大 block 数限制。
+\end{itemize}
+
+对 AI kernel 来说，occupancy 只是性能分析的一个维度。更完整的判断需要结合：
+
+\begin{itemize}
+  \item achieved occupancy；
+  \item SM utilization；
+  \item memory throughput；
+  \item L2 hit rate；
+  \item tensor core utilization；
+  \item eligible warps per cycle；
+  \item stall reason。
+\end{itemize}
+
+这也是为什么后续 GPU 架构和 profiling 章节会重新讨论 roofline model 与 Nsight Compute。
+
+\subsection{\texttt{blockDim}、\texttt{gridDim}、\texttt{threadIdx}、\texttt{blockIdx}}
+\label{subsec:cuda-built-in-indices}
+
+下面这段代码展示了最典型的一维 CUDA 索引模式。它几乎是所有 CUDA kernel 的起点。
+
+\begin{lstlisting}[language=C++,caption={CUDA 一维线程索引模式},label={lst:cuda-1d-indexing}]
+__global__ void kernel_1d(float* out, const float* in, int n) {
+  // Global linear index of the current thread.
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+  // Boundary check is required because n may not be a multiple of blockDim.x.
+  if (idx < n) {
+    out[idx] = in[idx] * 2.0f;
+  }
+}
+\end{lstlisting}
+
+二维索引常用于矩阵、图像或二维 tile：
+
+\begin{lstlisting}[language=C++,caption={CUDA 二维线程索引模式},label={lst:cuda-2d-indexing}]
+__global__ void kernel_2d(float* out, const float* in, int rows, int cols) {
+  int col = blockIdx.x * blockDim.x + threadIdx.x;
+  int row = blockIdx.y * blockDim.y + threadIdx.y;
+
+  if (row < rows && col < cols) {
+    int offset = row * cols + col;
+    out[offset] = in[offset];
+  }
+}
+\end{lstlisting}
+
+这两个例子看似简单，但它们已经包含了 CUDA kernel 的三个基本要点：
+
+\begin{itemize}
+  \item \textbf{线程到数据的映射}：每个线程通过索引找到自己负责的元素。
+  \item \textbf{边界检查}：grid 通常会向上取整，最后一部分线程可能越界。
+  \item \textbf{内存访问模式}：连续线程最好访问连续地址，以形成合并访存。
+\end{itemize}
+
+\section{CUDA 内存模型}
+\label{sec:cuda-memory-model}
+
+如果说线程层次结构决定了计算如何并行展开，那么内存模型就决定了这些计算能否高效喂饱 GPU。AI Infra 中很多性能问题不是因为 FLOPs 不够，而是因为数据搬运太慢。
+
+CUDA 中常见的内存层级包括：
+
+\begin{itemize}
+  \item \textbf{Global Memory}：容量大，位于显存 HBM，延迟高，带宽高；
+  \item \textbf{Shared Memory}：位于 SM 内部，容量小，延迟低，可由同一 block 内线程共享；
+  \item \textbf{Register}：每个线程私有，速度最快，但数量有限；
+  \item \textbf{Constant Memory}：适合广播读取只读常量；
+  \item \textbf{Texture Memory}：适合某些具有空间局部性的只读访问模式；
+  \item \textbf{L1/L2 Cache}：硬件管理，用于缓解 global memory 访问成本。
+\end{itemize}
+
+\subsection{Global Memory}
+\label{subsec:global-memory}
+
+Global memory 是 GPU 上容量最大的显式可访问内存，通常对应 HBM。模型参数、激活、梯度、优化器状态、KV Cache 等绝大多数大张量都存储在 global memory 中。
+
+Global memory 的特点是：
+
+\begin{itemize}
+  \item 容量大，能容纳大模型张量；
+  \item 延迟高，单次访问成本远高于寄存器和 shared memory；
+  \item 带宽高，但需要良好的访问模式才能充分利用；
+  \item 所有 block 都可访问，但 block 之间不能依赖 global memory 实现安全同步，除非跨 kernel 或使用特定同步机制。
+\end{itemize}
+
+一个低效 kernel 的典型模式是：每次计算都直接从 global memory 读取数据，并且同一份数据被不同线程重复读取。高效 kernel 则尽量把可复用数据先加载到 shared memory 或 register，再在更快的层级中重复使用。
+
+\subsection{Shared Memory}
+\label{subsec:shared-memory}
+
+Shared memory 是 CUDA 性能优化中最重要的显式内存层级之一。它位于 SM 内部，被同一个 block 内的所有线程共享。访问 shared memory 通常远快于 global memory，因此适合保存 tile 数据、中间结果或 block 内 reduction 的临时数据。
+
+例如，在 tiled GEMM 中，一个 block 会负责计算 $\mat{C}$ 的一个 tile。线程先把 $\mat{A}$ 和 $\mat{B}$ 的对应 tile 从 global memory 读入 shared memory，然后反复使用：
+
+\[
+  \mat{C}_{\mathrm{tile}}
+  +=
+  \mat{A}_{\mathrm{tile}}
+  \mat{B}_{\mathrm{tile}}.
+\]
+
+这能显著减少 global memory 访问次数。若没有 shared memory，同一个 $\mat{A}$ 元素可能被多个线程反复从 HBM 读取；有了 shared memory，这个元素只需被加载一次，然后由多个线程复用。
+
+Shared memory 也有两个常见陷阱：
+
+\begin{itemize}
+  \item \textbf{容量有限}：每个 block 使用太多 shared memory，会降低 occupancy。
+  \item \textbf{bank conflict}：多个线程同时访问落在同一 bank 的地址，可能导致访问串行化。
+\end{itemize}
+
+本章先关注 shared memory 的基本复用思想，bank conflict 会在后续 GPU 架构与性能优化章节中进一步展开。
+
+\subsection{Register}
+\label{subsec:register}
+
+Register 是每个线程私有的最快存储资源。局部变量、循环累加器、临时标量通常会被编译器放入 register。例如矩阵乘法中，每个线程计算一个 $C_{ij}$ 时，累加变量：
+
+\[
+  acc=\sum_k A_{ik}B_{kj}
+\]
+通常应保存在 register 中。
+
+Register 使用过多会带来两个问题：
+
+\begin{itemize}
+  \item 降低一个 SM 上可同时驻留的线程或 warp 数量；
+  \item 触发 register spilling，把本应在 register 中的变量溢出到 local memory，而 local memory 实际上位于 global memory，代价很高。
+\end{itemize}
+
+因此，高性能 CUDA kernel 常常需要在单线程工作量、register 使用量、occupancy 和 memory reuse 之间做平衡。对于 Transformer 中的 attention、LayerNorm、RMSNorm 等 kernel，这种平衡尤其关键。
+
+\subsection{Constant Memory 与 Texture Memory}
+\label{subsec:constant-texture-memory}
+
+Constant memory 适合保存所有线程读取相同地址的只读数据。例如某些固定超参数、查表常量或小型配置数组。如果一个 warp 中所有线程读取同一个 constant memory 地址，硬件可以高效广播。
+
+Texture memory 原本服务于图形渲染，但在通用计算中也可用于某些只读、具有空间局部性的访问模式。现代深度学习框架中，开发者直接使用 texture memory 的机会不如 shared memory 和 register 多，但理解它有助于完整认识 GPU 的存储层级。
+
+对于 AI Infra 工程师，更常见的是通过高层库间接受益。例如 cuDNN、TensorRT 或某些 fused kernel 可能根据访问模式选择合适的缓存路径。大多数情况下，我们需要优先掌握 global memory、shared memory、register、L2 cache 与 HBM 带宽之间的关系。
+
+\subsection{Memory Coalescing}
+\label{subsec:memory-coalescing}
+
+Memory coalescing 是 CUDA 性能优化的核心概念之一。若同一个 warp 中的连续线程访问连续内存地址，硬件可以把这些访问合并成更少的内存事务。反之，如果线程访问地址分散，内存事务数量会增加，带宽利用率下降。
+
+考虑一个 FP32 数组 \texttt{x}，线程 $t$ 访问：
+\[
+  x[t].
+\]
+这是良好的连续访问。若线程 $t$ 访问：
+\[
+  x[t\cdot stride],
+\]
+当 $stride$ 很大时，同一个 warp 内线程访问的地址相距很远，coalescing 变差。
+
+\begin{figure}[H]
+  \centering
+  \begin{tikzpicture}[
+      font=\small,
+      cell/.style={draw, minimum width=0.38cm, minimum height=0.38cm},
+      thread/.style={draw, rounded corners=1pt, minimum width=0.38cm, minimum height=0.35cm, fill=blue!8},
+      arrow/.style={-{Latex[length=2.0mm]}, thick},
+      good/.style={draw, rounded corners=2pt, fill=green!7, align=center},
+      bad/.style={draw, rounded corners=2pt, fill=red!7, align=center}
+    ]
+
+    \node[font=\bfseries] at (0,3.0) {Coalesced vs. Uncoalesced Memory Access};
+
+    \node[good, minimum width=5.6cm, minimum height=0.55cm] at (-3.4,2.25) {连续线程访问连续地址};
+    \foreach \i in {0,...,7} {
+      \node[thread] (gt\i) at ({-5.0+0.45*\i},1.55) {\tiny T\i};
+      \node[cell, fill=green!8] (gm\i) at ({-5.0+0.45*\i},0.65) {};
+      \draw[arrow] (gt\i) -- (gm\i);
+    }
+    \node at (-3.4,0.05) {一次或少量内存事务};
+
+    \node[bad, minimum width=5.6cm, minimum height=0.55cm] at (3.4,2.25) {连续线程访问分散地址};
+    \foreach \i/\x in {0/1.2,1/1.8,2/2.7,3/3.5,4/4.4,5/5.2,6/5.9,7/6.5} {
+      \node[thread] (bt\i) at ({1.7+0.45*\i},1.55) {\tiny T\i};
+      \node[cell, fill=red!8] (bm\i) at (\x,0.65) {};
+      \draw[arrow] (bt\i) -- (bm\i);
+    }
+    \node at (3.4,0.05) {多次内存事务，带宽浪费};
+
+    \node[align=left, text width=10.8cm] at (0,-1.15) {
+      在张量计算中，coalescing 与 memory layout 密切相关。若张量最后一维连续，让相邻线程沿最后一维访问，通常更容易获得高带宽。
+      这也是上一章讨论 shape、stride 和 contiguous tensor 的工程原因。
+    };
+  \end{tikzpicture}
+  \caption{合并访存与非合并访存示意图}
+  \label{fig:memory-coalescing}
+\end{figure}
+
+在 LLM 推理中，KV Cache 的读取经常成为 decode 阶段瓶颈。若 KV Cache 布局不能让连续线程访问连续地址，或者请求长度高度不规则，attention kernel 就很难达到理想带宽。后续 PagedAttention 和 FlashAttention 章节会继续围绕这个问题展开。
+
+\subsection{GPU 内存层级图}
+\label{subsec:gpu-memory-hierarchy-placeholder}
+
+真实 GPU 的硬件结构非常复杂，不同架构在 SM、L1、L2、Tensor Core、HBM 和互联方面均有差异。本书在后续 GPU 架构章节会专门展开。这里先给出一个抽象内存层级图，帮助建立基本直觉。
+
+\begin{figure}[H]
+  \centering
+  \begin{tikzpicture}[
+      font=\small,
+      level/.style={draw, rounded corners=3pt, minimum width=8.5cm, minimum height=0.8cm, align=center},
+      arrow/.style={-{Latex[length=2.3mm]}, thick}
+    ]
+
+    \node[level, fill=red!10] (reg) at (0,2.4) {Register：线程私有，速度最快，容量最小};
+    \node[level, fill=orange!12] (smem) at (0,1.35) {Shared Memory / L1 Cache：Block 内共享，低延迟，容量有限};
+    \node[level, fill=yellow!18] (l2) at (0,0.3) {L2 Cache：跨 SM 共享缓存，硬件管理};
+    \node[level, fill=green!10] (hbm) at (0,-0.75) {Global Memory / HBM：容量大，带宽高，但访问延迟高};
+    \node[level, fill=blue!8] (host) at (0,-1.8) {Host Memory：CPU 内存，经 PCIe / NVLink-C2C 等路径访问};
+
+    \draw[arrow] (reg) -- node[right] {容量增加，延迟增加} (smem);
+    \draw[arrow] (smem) -- (l2);
+    \draw[arrow] (l2) -- (hbm);
+    \draw[arrow] (hbm) -- (host);
+
+    \draw[decorate,decoration={brace,amplitude=5pt},thick]
+      (-4.8,2.85) -- (-4.8,0.95)
+      node[midway,left=8pt,align=center] {SM 内部\\显式优化重点};
+
+    \draw[decorate,decoration={brace,amplitude=5pt},thick]
+      (-4.8,0.75) -- (-4.8,-1.2)
+      node[midway,left=8pt,align=center] {芯片/显存\\带宽瓶颈重点};
+  \end{tikzpicture}
+  \caption{GPU 内存层级的抽象视图}
+  \label{fig:gpu-memory-hierarchy-abstract}
+\end{figure}
+
+下面保留一个真实硬件图的位置，便于后续排版时替换为官方或自绘硬件结构图。即使图片文件不存在，本段也能正常编译。
+
+\begin{figure}[H]
+  \centering
+  \IfFileExists{figures/part1/gpu_memory_hierarchy_placeholder.png}{
+    \includegraphics[width=0.85\textwidth]{part1/gpu_memory_hierarchy_placeholder.png}
+  }{
+    \fbox{
+      \parbox{0.82\textwidth}{
+        \centering
+        \vspace{1.2cm}
+        \textbf{预留图片位：GPU 内存层级与 SM 结构}\\[2mm]
+        此处建议放入一张硬件风格示意图，展示 GPU 芯片中的多个 SM、每个 SM 内部的 register file、shared memory/L1、warp scheduler、Tensor Core，以及芯片级 L2 cache 与 HBM。\\[2mm]
+        \textbf{图片生成 Prompt 建议：}\\
+        ``Technical diagram of NVIDIA-style GPU memory hierarchy for AI infrastructure textbook, showing multiple streaming multiprocessors, register file, shared memory, L1 cache, L2 cache, HBM stacks, PCIe or NVLink connection, clean vector style, blue and green color palette, labeled components, high readability.''
+        \vspace{1.2cm}
+      }
+    }
+  }
+  \caption{GPU 内存层级结构示意图预留位}
+  \label{fig:gpu-memory-hierarchy-placeholder}
+\end{figure}
+
+\section{第一个 CUDA Kernel}
+\label{sec:first-cuda-kernel}
+
+本节从向量加法开始，逐步过渡到矩阵乘法。向量加法展示线程索引和 kernel launch；naive GEMM 展示二维线程映射；tiled GEMM 展示 shared memory 复用。这三者构成了理解深度学习 kernel 的最小路径。
+
+\subsection{向量加法}
+\label{subsec:cuda-vector-add}
+
+向量加法的数学定义非常简单：
+\[
+  \vect{c}=\vect{a}+\vect{b},
+\]
+即：
+\[
+  c_i=a_i+b_i.
+\]
+因为每个元素相互独立，所以可以让一个线程处理一个元素。
+
+\begin{lstlisting}[language=C++,caption={CUDA 向量加法 Kernel},label={lst:cuda-vector-add-kernel}]
+#include <cuda_runtime.h>
+#include <iostream>
+
+__global__ void vector_add_kernel(const float* a,
+                                  const float* b,
+                                  float* c,
+                                  int n) {
+  // Each thread computes one global element index.
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+  // The grid size is usually rounded up, so some threads may be out of range.
+  if (idx < n) {
+    c[idx] = a[idx] + b[idx];
+  }
+}
+
+int main() {
+  int n = 1 << 20;
+  size_t bytes = n * sizeof(float);
+
+  float* h_a = new float[n];
+  float* h_b = new float[n];
+  float* h_c = new float[n];
+
+  for (int i = 0; i < n; ++i) {
+    h_a[i] = 1.0f;
+    h_b[i] = 2.0f;
+  }
+
+  float *d_a, *d_b, *d_c;
+  cudaMalloc(&d_a, bytes);
+  cudaMalloc(&d_b, bytes);
+  cudaMalloc(&d_c, bytes);
+
+  cudaMemcpy(d_a, h_a, bytes, cudaMemcpyHostToDevice);
+  cudaMemcpy(d_b, h_b, bytes, cudaMemcpyHostToDevice);
+
+  int threads_per_block = 256;
+  int blocks = (n + threads_per_block - 1) / threads_per_block;
+
+  vector_add_kernel<<<blocks, threads_per_block>>>(d_a, d_b, d_c, n);
+
+  cudaMemcpy(h_c, d_c, bytes, cudaMemcpyDeviceToHost);
+
+  std::cout << "h_c[0] = " << h_c[0] << std::endl;
+
+  cudaFree(d_a);
+  cudaFree(d_b);
+  cudaFree(d_c);
+  delete[] h_a;
+  delete[] h_b;
+  delete[] h_c;
+
+  return 0;
+}
+\end{lstlisting}
+
+这段代码展示了 CUDA 程序的基本结构：
+
+\begin{itemize}
+  \item 在 CPU 侧分配 host memory；
+  \item 使用 \texttt{cudaMalloc} 在 GPU 侧分配 device memory；
+  \item 使用 \texttt{cudaMemcpy} 把数据从 CPU 拷贝到 GPU；
+  \item 使用 \texttt{kernel<<<grid, block>>>} 发起 kernel launch；
+  \item 把结果从 GPU 拷贝回 CPU；
+  \item 释放 GPU 和 CPU 资源。
+\end{itemize}
+
+注意，kernel launch 默认是异步的。CPU 发起 kernel 后不一定等待 GPU 执行完成。上面的 \texttt{cudaMemcpyDeviceToHost} 会隐式等待相关 kernel 完成，因为拷贝结果依赖 kernel 输出。在性能敏感场景中，我们会显式使用 stream、event、异步拷贝和同步控制。
+
+\subsection{矩阵乘法 naive 实现}
+\label{subsec:naive-matmul}
+
+接下来考虑矩阵乘法：
+\[
+  \mat{C}=\mat{A}\mat{B},
+\]
+其中：
+\[
+  \mat{A}\in\mathbb{R}^{M\times K},
+  \quad
+  \mat{B}\in\mathbb{R}^{K\times N},
+  \quad
+  \mat{C}\in\mathbb{R}^{M\times N}.
+\]
+每个输出元素为：
+\[
+  C_{row,col}
+  =
+  \sum_{k=0}^{K-1}A_{row,k}B_{k,col}.
+\]
+
+最直接的 CUDA 实现是：每个线程计算一个 $C_{row,col}$。
+
+\begin{lstlisting}[language=C++,caption={Naive CUDA 矩阵乘法 Kernel},label={lst:cuda-naive-matmul}]
+__global__ void matmul_naive_kernel(const float* A,
+                                    const float* B,
+                                    float* C,
+                                    int M,
+                                    int N,
+                                    int K) {
+  // 2D thread mapping:
+  // x dimension maps to columns of C
+  // y dimension maps to rows of C
+  int col = blockIdx.x * blockDim.x + threadIdx.x;
+  int row = blockIdx.y * blockDim.y + threadIdx.y;
+
+  if (row < M && col < N) {
+    float acc = 0.0f;
+
+    for (int k = 0; k < K; ++k) {
+      float a = A[row * K + k];
+      float b = B[k * N + col];
+      acc += a * b;
+    }
+
+    C[row * N + col] = acc;
+  }
+}
+\end{lstlisting}
+
+这个 kernel 的优点是简单，缺点也非常明显：它没有充分复用 global memory 数据。对于相邻的多个线程，它们可能读取相同的 $\mat{A}$ 行或相同的 $\mat{B}$ 列，但每个线程都独立从 global memory 加载，导致大量冗余访存。
+
+可以粗略分析其访存模式。每个 $C_{ij}$ 需要读取 $K$ 个 $A$ 元素和 $K$ 个 $B$ 元素，执行 $K$ 次乘加。若每个线程独立完成，global memory 读取量约为：
+\[
+  2MNK
+\]
+个浮点数，而 $\mat{A}$ 和 $\mat{B}$ 中的许多元素本可以被多个输出复用。这就是 tiled matrix multiplication 的动机。
+
+\subsection{使用 shared memory 优化 GEMM}
+\label{subsec:shared-memory-gemm}
+
+Tiled GEMM 的核心思想是把 $\mat{A}$、$\mat{B}$、$\mat{C}$ 切成小块。每个 block 负责计算 $\mat{C}$ 的一个 tile。计算过程中，线程协作把 $\mat{A}$ 和 $\mat{B}$ 的对应 tile 读入 shared memory，然后在 shared memory 中复用。
+
+设 tile size 为 $T$。对某个 $\mat{C}$ tile：
+\[
+  \mat{C}_{tile}
+  =
+  \sum_{p}
+  \mat{A}_{tile,p}
+  \mat{B}_{p,tile}.
+\]
+每轮加载一块 $\mat{A}_{tile,p}$ 和一块 $\mat{B}_{p,tile}$，同步后进行局部乘加。
+
+\begin{figure}[H]
+  \centering
+  \begin{tikzpicture}[
+      font=\small,
+      mat/.style={draw, rounded corners=2pt, fill=blue!4},
+      tileA/.style={draw, fill=orange!22},
+      tileB/.style={draw, fill=green!18},
+      tileC/.style={draw, fill=red!15},
+      arrow/.style={-{Latex[length=2.3mm]}, thick}
+    ]
+
+    \node[font=\bfseries] at (0,3.2) {Tiled Matrix Multiplication};
+
+    \draw[mat] (-5.8,0.2) rectangle (-2.6,2.6);
+    \node at (-4.2,2.85) {$\mat{A}\in\mathbb{R}^{M\times K}$};
+    \draw[tileA] (-5.8,1.0) rectangle (-4.4,1.8);
+    \node at (-5.1,1.4) {$A_t$};
+
+    \draw[mat] (-1.6,0.2) rectangle (1.8,2.6);
+    \node at (0.1,2.85) {$\mat{B}\in\mathbb{R}^{K\times N}$};
+    \draw[tileB] (-0.4,1.0) rectangle (0.6,1.8);
+    \node at (0.1,1.4) {$B_t$};
+
+    \draw[mat] (3.0,0.2) rectangle (5.8,2.6);
+    \node at (4.4,2.85) {$\mat{C}\in\mathbb{R}^{M\times N}$};
+    \draw[tileC] (3.7,1.0) rectangle (4.7,1.8);
+    \node at (4.2,1.4) {$C_t$};
+
+    \node[draw, rounded corners=2pt, fill=yellow!12, align=center, minimum width=2.5cm, minimum height=0.9cm] (shared) at (0,-1.1)
+      {Shared Memory\\缓存 $A_t,B_t$};
+
+    \draw[arrow] (-5.1,1.0) -- (-0.8,-0.8);
+    \draw[arrow] (0.1,1.0) -- (0.1,-0.65);
+    \draw[arrow] (shared.east) -- node[above] {复用后累加} (3.7,1.0);
+
+    \node[align=left, text width=10.5cm] at (0,-2.55) {
+      每个 tile 从 global memory 加载一次，随后被 block 内多个线程重复使用。
+      这种数据复用显著提高算术强度，是高性能 GEMM 的基本思想。
+    };
+  \end{tikzpicture}
+  \caption{Tiled GEMM 中的 shared memory 数据复用}
+  \label{fig:tiled-gemm-shared-memory}
+\end{figure}
+
+下面给出一个教学版 shared memory GEMM。它没有使用 Tensor Core，也没有做复杂的向量化和双缓冲，但足以展示 tiled 结构。
+
+\begin{lstlisting}[language=C++,caption={使用 shared memory 的教学版 tiled GEMM},label={lst:cuda-tiled-gemm}]
+#define TILE 16
+
+__global__ void matmul_tiled_kernel(const float* A,
+                                    const float* B,
+                                    float* C,
+                                    int M,
+                                    int N,
+                                    int K) {
+  __shared__ float As[TILE][TILE];
+  __shared__ float Bs[TILE][TILE];
+
+  int tx = threadIdx.x;
+  int ty = threadIdx.y;
+
+  int row = blockIdx.y * TILE + ty;
+  int col = blockIdx.x * TILE + tx;
+
+  float acc = 0.0f;
+
+  // Number of tiles along K dimension.
+  int num_tiles = (K + TILE - 1) / TILE;
+
+  for (int t = 0; t < num_tiles; ++t) {
+    int a_col = t * TILE + tx;
+    int b_row = t * TILE + ty;
+
+    // Load A tile into shared memory.
+    if (row < M && a_col < K) {
+      As[ty][tx] = A[row * K + a_col];
+    } else {
+      As[ty][tx] = 0.0f;
+    }
+
+    // Load B tile into shared memory.
+    if (b_row < K && col < N) {
+      Bs[ty][tx] = B[b_row * N + col];
+    } else {
+      Bs[ty][tx] = 0.0f;
+    }
+
+    // Make sure all threads finish loading before computation.
+    __syncthreads();
+
+    // Compute partial dot product using data in shared memory.
+    for (int k = 0; k < TILE; ++k) {
+      acc += As[ty][k] * Bs[k][tx];
+    }
+
+    // Make sure all threads finish using the current tile before overwrite.
+    __syncthreads();
+  }
+
+  if (row < M && col < N) {
+    C[row * N + col] = acc;
+  }
+}
+\end{lstlisting}
+
+这段代码中有两个 \texttt{\_\_syncthreads()}。第一个同步保证所有线程已经把 tile 加载到 shared memory；第二个同步保证所有线程完成当前 tile 的使用，然后才能进入下一轮覆盖 shared memory。
+
+需要特别注意：
+
+\begin{itemize}
+  \item \texttt{\_\_syncthreads()} 是 block 内同步，不是 grid 全局同步；
+  \item 所有线程必须以一致方式到达同步点，否则可能死锁；
+  \item shared memory tile 的大小会影响 occupancy；
+  \item 实际高性能 GEMM 会使用更复杂的 tiling、register blocking、warp-level MMA、Tensor Core、pipeline 和 double buffering。
+\end{itemize}
+
+现代深度学习框架中的 GEMM 通常不由工程师手写，而是调用 cuBLAS、cuBLASLt 或 CUTLASS 风格的高性能实现。但理解 tiled GEMM 对后续理解 FlashAttention、fused MLP、blockwise quantization 和 Tensor Core mapping 都非常关键。
+
+\subsection{CUDA kernel 性能分析初步}
+\label{subsec:cuda-kernel-performance-basics}
+
+写出正确的 CUDA kernel 只是第一步。对 AI Infra 来说，更重要的是判断它为什么快或为什么慢。最基本的性能分析可以从以下四个指标开始：
+
+\begin{itemize}
+  \item \textbf{吞吐}：单位时间处理多少元素、token 或 FLOPs；
+  \item \textbf{访存带宽}：实际达到的 HBM bandwidth；
+  \item \textbf{算术强度}：每搬运一个字节执行多少计算；
+  \item \textbf{kernel launch overhead}：大量小 kernel 是否被 launch 开销主导。
+\end{itemize}
+
+对于一个向量加法：
+\[
+  c_i=a_i+b_i,
+\]
+每个元素读取 $a_i,b_i$，写回 $c_i$，FP32 情况下数据移动约：
+\[
+  3\times 4=12\ \mathrm{bytes}.
+\]
+计算只有一次加法，即 $1$ FLOP。因此算术强度约为：
+\[
+  I_{\mathrm{vecadd}}=\frac{1}{12}\ \mathrm{FLOPs/byte}.
+\]
+这显然是 memory-bound 操作。
+
+而 GEMM 的算术强度随矩阵尺寸增加，通常更容易成为 compute-bound。因此，在 GPU 上优化深度学习模型时，我们经常追求两类目标：
+
+\begin{itemize}
+  \item 把小而碎的 elementwise 操作融合，减少 HBM 往返和 kernel launch；
+  \item 把矩阵乘法组织成适合 Tensor Core 的大块计算，提高 compute utilization。
+\end{itemize}
+
+一个简单的 kernel 计时代码如下：
+
+\begin{lstlisting}[language=C++,caption={使用 CUDA Event 统计 kernel 执行时间},label={lst:cuda-event-timing}]
+cudaEvent_t start, stop;
+cudaEventCreate(&start);
+cudaEventCreate(&stop);
+
+cudaEventRecord(start);
+
+vector_add_kernel<<<blocks, threads_per_block>>>(d_a, d_b, d_c, n);
+
+cudaEventRecord(stop);
+cudaEventSynchronize(stop);
+
+float milliseconds = 0.0f;
+cudaEventElapsedTime(&milliseconds, start, stop);
+
+std::cout << "Kernel time: " << milliseconds << " ms" << std::endl;
+
+cudaEventDestroy(start);
+cudaEventDestroy(stop);
+\end{lstlisting}
+
+CUDA event 计时适合初步测量 GPU 端 kernel 时间。但生产级性能分析需要使用 Nsight Systems 和 Nsight Compute：
+
+\begin{itemize}
+  \item \textbf{Nsight Systems} 更适合观察整体时间线，包括 CPU 调度、CUDA API、kernel launch、memory copy、NCCL 通信等；
+  \item \textbf{Nsight Compute} 更适合深入单个 kernel，分析 occupancy、warp stall、memory throughput、L2 hit rate、shared memory conflict 等。
+\end{itemize}
+
+\section{CUDA 与深度学习框架}
+\label{sec:cuda-and-dl-frameworks}
+
+实际 AI Infra 工作中，我们很少直接把完整模型写成 CUDA C++。更常见的路径是：
+
+\begin{itemize}
+  \item 使用 PyTorch、JAX、TensorFlow 等框架描述模型；
+  \item 框架把张量操作映射为 operator；
+  \item operator 调用 cuBLAS、cuDNN、NCCL、Triton kernel 或自定义 CUDA kernel；
+  \item GPU driver 和 runtime 负责调度执行；
+  \item profiler 帮助工程师定位瓶颈。
+\end{itemize}
+
+\subsection{PyTorch Tensor 与 CUDA Tensor}
+\label{subsec:pytorch-tensor-cuda-tensor}
+
+在 PyTorch 中，一个张量既包含数据，也包含元数据。元数据包括：
+
+\begin{itemize}
+  \item shape；
+  \item stride；
+  \item dtype；
+  \item device；
+  \item storage pointer；
+  \item requires grad；
+  \item layout。
+\end{itemize}
+
+当我们执行：
+
+\begin{lstlisting}[language=Python,caption={PyTorch CUDA Tensor 示例},label={lst:pytorch-cuda-tensor}]
+import torch
+
+x = torch.randn(1024, 4096, device="cuda", dtype=torch.float16)
+w = torch.randn(4096, 4096, device="cuda", dtype=torch.float16)
+
+y = x @ w
+
+print(y.shape)
+print(y.device)
+print(y.dtype)
+\end{lstlisting}
+
+表面上只有一行 \texttt{x @ w}，但背后发生了多层映射：
+
+\begin{itemize}
+  \item PyTorch dispatcher 根据 dtype、device 和 operator 类型选择实现；
+  \item 对 CUDA tensor，矩阵乘法通常会调用 cuBLAS 或 cuBLASLt；
+  \item cuBLAS 根据矩阵 shape、transpose、dtype 等选择具体 kernel；
+  \item kernel 在 GPU 上执行，可能使用 Tensor Core；
+  \item 输出 tensor 的 metadata 被返回给 PyTorch。
+\end{itemize}
+
+这说明 AI Infra 工程师面对性能问题时，不能只看 Python 层代码。一个简单 operator 背后可能有复杂的 backend 选择、workspace 分配、算法启发式选择和 kernel 实现。
+
+\subsection{cuBLAS、cuDNN、NCCL 的角色}
+\label{subsec:cublas-cudnn-nccl}
+
+NVIDIA 深度学习软件栈中有几个核心库：
+
+\begin{itemize}
+  \item \textbf{cuBLAS}：提供高性能 BLAS，尤其是 GEMM，是 Transformer 中 Linear、QKV projection、FFN 的核心。
+  \item \textbf{cuBLASLt}：提供更灵活的 GEMM 接口，支持 layout、epilogue fusion、算法选择等能力。
+  \item \textbf{cuDNN}：提供卷积、归一化、RNN、attention 等深度学习算子。
+  \item \textbf{NCCL}：提供多 GPU 通信 collective，例如 all-reduce、all-gather、reduce-scatter、broadcast。
+  \item \textbf{CUDA Runtime / Driver}：负责 kernel launch、memory management、stream、event、device 控制等基础能力。
+\end{itemize}
+
+\begin{figure}[H]
+  \centering
+  \begin{tikzpicture}[
+      font=\small,
+      layer/.style={draw, rounded corners=3pt, minimum width=8.5cm, minimum height=0.72cm, align=center},
+      arrow/.style={-{Latex[length=2.3mm]}, thick}
+    ]
+
+    \node[layer, fill=blue!8] (app) at (0,3.0) {应用层：训练脚本 / 推理服务 / 调度系统};
+    \node[layer, fill=green!8] (fw) at (0,2.05) {框架层：PyTorch / JAX / TensorFlow / vLLM / DeepSpeed};
+    \node[layer, fill=yellow!14] (op) at (0,1.1) {Operator 层：Linear / Attention / LayerNorm / Softmax};
+    \node[layer, fill=orange!14] (lib) at (0,0.15) {库与 Kernel：cuBLAS / cuDNN / NCCL / Triton / Custom CUDA};
+    \node[layer, fill=red!10] (rt) at (0,-0.8) {CUDA Runtime / Driver：Stream / Event / Memory / Launch};
+    \node[layer, fill=purple!10] (hw) at (0,-1.75) {GPU Hardware：SM / Tensor Core / L2 / HBM / NVLink};
+
+    \draw[arrow] (app) -- (fw);
+    \draw[arrow] (fw) -- (op);
+    \draw[arrow] (op) -- (lib);
+    \draw[arrow] (lib) -- (rt);
+    \draw[arrow] (rt) -- (hw);
+
+    \node[align=left, text width=4.3cm] at (5.0,0.35) {
+      \textbf{性能问题定位：}\\
+      需要从 Python 代码一路追踪到 kernel、通信和硬件计数器。
+    };
+  \end{tikzpicture}
+  \caption{从深度学习框架到 CUDA kernel 的软件栈}
+  \label{fig:dl-framework-cuda-stack}
+\end{figure}
+
+在分布式训练中，NCCL 的重要性尤其突出。DDP 的梯度同步、Tensor Parallel 的 all-reduce、ZeRO 的 reduce-scatter 和 all-gather，最终大多依赖 NCCL collective。对于大规模集群，一个训练任务能否扩展到数百甚至数千卡，不仅取决于模型结构，也取决于 NCCL 对拓扑、带宽、延迟和通信重叠的利用。
+
+\subsection{自定义 CUDA Extension}
+\label{subsec:custom-cuda-extension}
+
+当框架内置算子无法满足需求时，我们可能需要编写自定义 CUDA extension。常见动机包括：
+
+\begin{itemize}
+  \item 将多个小算子融合成一个 kernel，减少 HBM 读写和 kernel launch；
+  \item 实现框架暂不支持的新算子；
+  \item 针对特定 shape、dtype 或硬件进行优化；
+  \item 实现自定义量化、稀疏计算或特殊 attention 模式。
+\end{itemize}
+
+下面给出一个极简 PyTorch CUDA extension 的结构。真实工程中还需要处理错误检查、dtype dispatch、contiguous 检查、反向传播绑定和构建脚本。
+
+\begin{lstlisting}[language=C++,caption={PyTorch CUDA Extension 的 C++ 绑定示意},label={lst:pytorch-cuda-extension-cpp}]
+#include <torch/extension.h>
+
+// CUDA launcher declaration.
+torch::Tensor scale_forward_cuda(torch::Tensor x, float scale);
+
+torch::Tensor scale_forward(torch::Tensor x, float scale) {
+  TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
+  TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+
+  return scale_forward_cuda(x, scale);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("scale_forward", &scale_forward, "Scale tensor forward on CUDA");
+}
+\end{lstlisting}
+
+对应的 CUDA kernel 可以写成：
+
+\begin{lstlisting}[language=C++,caption={PyTorch CUDA Extension 的 CUDA Kernel 示意},label={lst:pytorch-cuda-extension-cu}]
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+
+template <typename scalar_t>
+__global__ void scale_kernel(const scalar_t* x,
+                             scalar_t* y,
+                             float scale,
+                             int64_t n) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < n) {
+    y[idx] = static_cast<scalar_t>(x[idx] * scale);
+  }
+}
+
+torch::Tensor scale_forward_cuda(torch::Tensor x, float scale) {
+  auto y = torch::empty_like(x);
+  int64_t n = x.numel();
+
+  int threads = 256;
+  int blocks = (n + threads - 1) / threads;
+
+  AT_DISPATCH_FLOATING_TYPES(x.scalar_type(), "scale_forward_cuda", ([&] {
+    scale_kernel<scalar_t><<<blocks, threads>>>(
+      x.data_ptr<scalar_t>(),
+      y.data_ptr<scalar_t>(),
+      scale,
+      n
+    );
+  }));
+
+  return y;
+}
+\end{lstlisting}
+
+在生产环境中，自定义 CUDA extension 的复杂度往往不在 kernel 本身，而在工程边界：
+
+\begin{itemize}
+  \item 如何支持 FP16、BF16、FP32、INT8 等 dtype；
+  \item 如何处理非 contiguous tensor；
+  \item 如何与 PyTorch autograd 对接；
+  \item 如何避免 silent correctness bug；
+  \item 如何在不同 GPU 架构上保持性能；
+  \item 如何进行单元测试、基准测试和 profiler 分析；
+  \item 如何在容器、CI、驱动版本和 CUDA Toolkit 版本之间保持兼容。
+\end{itemize}
+
+\subsection{从 kernel 到 operator}
+\label{subsec:from-kernel-to-operator}
+
+一个 operator 不一定只对应一个 kernel。例如标准 attention 可以拆成：
+
+\begin{itemize}
+  \item QKV projection GEMM；
+  \item QK 转置乘法；
+  \item mask；
+  \item softmax；
+  \item dropout；
+  \item attention weights 与 V 相乘；
+  \item output projection GEMM。
+\end{itemize}
+
+如果每一步都是独立 kernel，那么中间张量需要反复写回 HBM，再从 HBM 读出。对于长序列 attention，中间的 attention score 形如：
+\[
+  (B,\;H_{\mathrm{heads}},\;S,\;S).
+\]
+当 $S$ 很大时，这个张量会占用巨大显存和带宽。FlashAttention 的关键思想之一，就是把多个操作融合在一个分块 kernel 内，并避免物化完整 attention matrix。
+
+从 kernel 到 operator，可以用如下层次理解：
+
+\begin{table}[H]
+  \centering
+  \small
+  \caption{Kernel、Operator 与 Model Layer 的关系}
+  \label{tab:kernel-operator-layer}
+  \begin{tabular}{p{0.20\textwidth}p{0.34\textwidth}p{0.34\textwidth}}
+    \toprule
+    \textbf{层次} & \textbf{例子} & \textbf{工程关注点} \\
+    \midrule
+    Kernel
+    & 一个 CUDA 函数，例如 vector add、LayerNorm kernel、GEMM kernel
+    & 线程映射、寄存器、shared memory、访存合并、occupancy。 \\
+    \midrule
+    Operator
+    & PyTorch 中的 \texttt{matmul}、\texttt{layer\_norm}、\texttt{scaled\_dot\_product\_attention}
+    & dtype dispatch、layout、autograd、workspace、kernel 选择。 \\
+    \midrule
+    Model Layer
+    & Transformer block 中的 attention、MLP、norm、residual
+    & 算子组合、显存占用、激活保存、通信切分、并行策略。 \\
+    \midrule
+    End-to-end System
+    & 训练任务或推理服务
+    & 调度、batching、通信、checkpoint、容错、SLA 和成本。 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+很多 AI Infra 优化的本质，是把高层模型结构重新组织为更适合硬件执行的 operator 和 kernel。例如：
+
+\begin{itemize}
+  \item 把 bias add、activation、dropout 融合；
+  \item 把 LayerNorm 与 residual add 融合；
+  \item 使用 fused optimizer 减少参数更新阶段的小 kernel；
+  \item 使用 FlashAttention 避免 attention score 物化；
+  \item 使用 paged KV Cache 改善推理阶段内存管理；
+  \item 使用 Tensor Parallel 把大 GEMM 切分到多个 GPU 上。
+\end{itemize}
+
+\section{CUDA 编程中的工程痛点}
+\label{sec:cuda-engineering-pain-points}
+
+本章已经介绍了 CUDA 的基本概念，但真实工程远比教材示例复杂。这里提前总结几个常见痛点，帮助读者建立问题雷达。
+
+\subsection{异步执行导致的错误定位困难}
+\label{subsec:async-debugging}
+
+CUDA kernel launch 通常是异步的。CPU 提交 kernel 后继续执行，错误可能在后续同步点才暴露。例如某个 kernel 越界访问，报错可能出现在后面的 \texttt{cudaMemcpy} 或另一个无关 API 调用处。
+
+调试时常用方法包括：
+
+\begin{itemize}
+  \item 在关键位置调用 \texttt{cudaDeviceSynchronize()} 缩小错误范围；
+  \item 检查每个 CUDA API 返回值；
+  \item 使用 \texttt{cuda-memcheck} 或 compute sanitizer；
+  \item 使用较小输入复现问题；
+  \item 为自定义 kernel 编写 CPU reference 结果做对比。
+\end{itemize}
+
+在训练框架中，异步错误更隐蔽。一个 CUDA illegal memory access 可能导致后续所有 CUDA 调用失败，最终表现为 PyTorch 抛出一个看似不相关的异常。因此，定位 CUDA 错误时，要始终记住：\textbf{报错位置不一定是出错位置。}
+
+\subsection{小 kernel 与 launch overhead}
+\label{subsec:small-kernel-launch-overhead}
+
+GPU 擅长大规模并行计算，但 kernel launch 本身有固定开销。如果模型中存在大量小张量操作，每个操作单独 launch 一个 kernel，那么端到端性能可能被 launch overhead 和 HBM 往返吞噬。
+
+这在 Transformer 中尤其常见。例如一个 block 内有许多 elementwise 操作：
+
+\begin{itemize}
+  \item residual add；
+  \item bias add；
+  \item dropout；
+  \item activation；
+  \item norm；
+  \item mask fill；
+  \item scale。
+\end{itemize}
+
+如果这些操作拆得太碎，GPU 时间线会出现大量短 kernel，中间夹杂频繁 HBM 读写。优化策略通常是 kernel fusion。以 MLP 为例，可以把 bias add 和 GELU 融合到 GEMM epilogue 中，减少一次读写。
+
+\subsection{非连续张量与隐式拷贝}
+\label{subsec:non-contiguous-hidden-copy}
+
+上一章讨论过 shape 与 stride。这里从 CUDA 角度再强调一次：很多高性能 kernel 假设输入 tensor 是 contiguous 或满足特定 stride。如果上层代码传入非连续张量，框架可能隐式插入 \texttt{contiguous()}，导致额外 HBM 拷贝。
+
+例如：
+
+\begin{lstlisting}[language=Python,caption={非连续张量可能触发额外拷贝},label={lst:non-contiguous-copy}]
+import torch
+
+x = torch.randn(8, 2048, 4096, device="cuda", dtype=torch.float16)
+
+# Transpose changes stride but usually does not move data immediately.
+y = x.transpose(1, 2)
+
+print(y.is_contiguous())  # False
+
+# Some custom CUDA kernels may require contiguous input.
+# This line may allocate a new tensor and copy a large amount of data.
+z = y.contiguous()
+\end{lstlisting}
+
+在大模型训练中，一个激活张量可能非常大。一次隐式 contiguous copy 可能比某些计算本身更昂贵。性能优化时，要特别检查 profiler 中是否出现意料之外的 memory copy 或 layout transform。
+
+\subsection{数值精度与硬件路径}
+\label{subsec:numeric-precision-hardware-path}
+
+深度学习 kernel 的性能与 dtype 密切相关。FP32、TF32、FP16、BF16、FP8、INT8、INT4 会走不同硬件路径。以矩阵乘法为例，使用 Tensor Core 的低精度矩阵乘通常远快于普通 FP32 CUDA core 路径。
+
+但精度不是越低越好。工程上必须同时考虑：
+
+\begin{itemize}
+  \item 模型精度是否可接受；
+  \item accumulation 使用什么精度；
+  \item 是否需要 loss scaling；
+  \item 是否出现 overflow 或 underflow；
+  \item kernel 是否真正使用了 Tensor Core；
+  \item shape 是否满足 Tensor Core 友好的对齐要求。
+\end{itemize}
+
+例如，某些 GEMM 维度如果不是特定倍数，可能无法充分利用 Tensor Core。模型架构设计和 batch size 选择有时也会考虑硬件对齐，这就是算法与系统共同设计的一个例子。
+
+\section{本章小结}
+\label{sec:chapter02-summary}
+
+本章从 CPU 与 GPU 编程模型的差异出发，介绍了 CUDA C++ 的核心概念，并把它们与深度学习系统中的真实问题联系起来。
+
+\begin{itemize}
+  \item \textbf{CPU 与 GPU 的设计目标不同}：CPU 强控制流、低延迟；GPU 强吞吐、海量并行。AI 系统需要二者协同。
+  \item \textbf{SIMT 与 Warp 是 GPU 执行的基本抽象}：程序员写线程逻辑，硬件以 warp 为单位调度。warp divergence 会降低执行效率。
+  \item \textbf{Grid、Block、Thread 构成 CUDA 线程层次结构}：block 是共享 shared memory 和同步的基本边界。
+  \item \textbf{Occupancy 是理解 GPU 延迟隐藏的重要概念}：但它不是唯一目标，必须与 register、shared memory、访存带宽和 Tensor Core 利用率一起分析。
+  \item \textbf{CUDA 内存层级决定 kernel 性能上限}：global memory 容量大但延迟高；shared memory 适合 block 内复用；register 最快但数量有限。
+  \item \textbf{Memory coalescing 对带宽利用至关重要}：连续线程访问连续地址通常更高效，这与张量 layout 和 stride 密切相关。
+  \item \textbf{Tiled GEMM 展示了高性能 kernel 的基本思想}：通过 shared memory 复用数据，提高算术强度，减少 HBM 访问。
+  \item \textbf{深度学习框架最终仍会落到 CUDA kernel 和通信库}：PyTorch operator、cuBLAS、cuDNN、NCCL、自定义 extension 构成了 AI Infra 的执行底座。
+\end{itemize}
+
+下一章将回到深度学习模型本身，系统讲解神经网络基本结构、反向传播、优化器、归一化与混合精度训练。届时，本章中的 kernel、显存、dtype 和硬件执行路径，会与模型训练中的参数、梯度、激活和优化器状态连接起来。

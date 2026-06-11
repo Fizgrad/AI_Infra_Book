@@ -1,0 +1,1054 @@
+\chapter{Kubernetes 在 AI 集群中的调度}
+\label{chap:k8s-ai-scheduling}
+
+前几章我们已经沿着 AI Infrastructure 的物理路径逐层展开：第 17 章讨论单个 GPU 的计算与内存层级，第 18 章讨论单机多卡的 NVLink 与 NVSwitch，第 19 章讨论跨节点的 RDMA、RoCE 与 AI 集群网络。到这里，一个大模型系统的硬件底座已经逐渐清晰：GPU 提供计算，HBM 提供显存，NVLink/NVSwitch 提供节点内高速互联，RDMA/RoCE 提供节点间高速网络。
+
+但是，硬件本身不会自动变成可用的集群能力。一个真实 AI 集群通常同时运行多种任务：
+
+\begin{itemize}
+  \item 大规模预训练作业，可能需要几百到几千张 GPU 连续运行数周；
+  \item SFT、RLHF、DPO、评测、数据清洗等中小规模离线任务；
+  \item 在线 LLM 推理服务，需要低延迟、高可用和弹性伸缩；
+  \item embedding、rerank、多模态模型、语音模型等不同形态的服务；
+  \item 多个团队、多个项目、多个优先级、多个预算池共享同一批 GPU；
+  \item 硬件故障、节点维护、驱动升级、镜像升级、网络异常和 checkpoint 恢复。
+\end{itemize}
+
+这时，一个核心问题出现了：谁来决定哪个任务运行在哪里？谁来保证一个 256 GPU 的训练作业不会只启动了 200 个 worker 就陷入死锁？谁来保证在线推理服务不会被离线训练任务挤占 GPU？谁来记录 GPU 利用率、HBM 占用、网络吞吐、队列等待时间和每 token 成本？谁来在节点故障后重启任务并恢复 checkpoint？
+
+这就是 AI 集群调度系统的任务。
+
+Kubernetes 已经成为云原生基础设施的事实标准之一。它擅长管理容器、Pod、服务发现、滚动升级、健康检查、资源声明和控制器模式。因此，很多 AI 平台选择以 Kubernetes 作为统一资源管理底座，再结合 NVIDIA Device Plugin、GPU Operator、Volcano、Kueue、Ray Operator、Kubeflow Training Operator、MPI Operator、模型服务框架和自研调度器，构建面向训练与推理的一体化 AI 集群平台。
+
+本章不试图把 Kubernetes 所有概念完整讲一遍，而是聚焦 AI Infra 工程中最关键的调度问题：
+
+\begin{itemize}
+  \item 为什么 AI 集群不能只用普通 Kubernetes 调度策略？
+  \item GPU 如何在 Kubernetes 中被发现、上报、分配和隔离？
+  \item MIG、GPU sharing、拓扑感知调度分别解决什么问题？
+  \item 分布式训练为什么需要 gang scheduling？
+  \item Volcano 和 Kueue 在 AI batch 调度中分别扮演什么角色？
+  \item LLM 推理服务如何在 Kubernetes 上部署、扩缩容和混部？
+  \item AI 集群应该监控哪些指标，如何从利用率走向成本和 SLA？
+\end{itemize}
+
+\section{为什么 AI 集群需要调度系统}
+\label{sec:why-ai-cluster-scheduler}
+
+调度系统的本质是把有限资源分配给无限需求。普通在线服务调度关注 CPU、内存、端口、亲和性、反亲和性和服务可用性；AI 集群调度则更加复杂，因为 GPU 是昂贵、异构、拓扑敏感且经常以“成组”方式被使用的资源。
+
+\subsection{GPU 资源昂贵}
+\label{subsec:gpu-expensive}
+
+GPU 是 AI 集群中最昂贵的资源之一。一台 8 GPU 服务器的采购成本、机架空间、供电、散热、网络端口和运维成本都很高。对于大模型公司或 AI 平台团队来说，GPU 空闲就是直接的资本浪费；GPU 被低效任务占用，则意味着更隐蔽的机会成本。
+
+因此，AI 集群调度系统不能只回答“有没有空闲 GPU”，还要回答：
+
+\begin{itemize}
+  \item 空闲 GPU 是否属于同一节点、同一 NVSwitch 域或同一网络拓扑区域？
+  \item 这些 GPU 的型号、显存容量、驱动版本、MIG 配置是否符合任务要求？
+  \item 这个任务是在线推理还是离线训练？是否可以被抢占？
+  \item 这个任务需要连续运行多久？是否支持 checkpoint 恢复？
+  \item 把它放在这里会不会影响更高优先级的任务？
+  \item 当前集群是否应该等待更多 GPU 空出来再启动大作业，而不是立即启动小作业造成碎片？
+\end{itemize}
+
+对于普通 Kubernetes scheduler 来说，一个 Pod 请求 1 个 GPU，调度器只要找一个有可分配 GPU 的节点即可。但对于 AI 训练，一个作业可能请求 8、16、64、256 张 GPU，并且这些 GPU 之间的拓扑关系会显著影响性能。如果只做局部贪心分配，很容易产生 GPU 碎片：表面上集群还有很多空闲 GPU，但没有足够连续、同构、拓扑良好的 GPU group 来启动大作业。
+
+\subsection{多租户}
+\label{subsec:multi-tenancy}
+
+AI 集群通常被多个团队共享。例如基础模型团队、算法研究团队、推理平台团队、数据团队、评测团队和业务团队都需要 GPU。不同团队之间存在不同优先级、预算、配额和 SLA。
+
+多租户调度需要解决几个问题：
+
+\begin{itemize}
+  \item \textbf{配额}：每个团队最多能使用多少 GPU、多少 GPU 小时、多少 HBM 或多少节点？
+  \item \textbf{公平性}：当资源不足时，如何避免某个团队长期霸占集群？
+  \item \textbf{优先级}：紧急线上修复、重要训练作业和普通实验如何排序？
+  \item \textbf{抢占}：低优先级任务是否可以被高优先级任务抢占？
+  \item \textbf{隔离}：不同租户之间的网络、存储、镜像、权限和日志如何隔离？
+  \item \textbf{审计}：谁在什么时间使用了多少 GPU，产出了什么成本？
+\end{itemize}
+
+多租户不是简单地给 namespace 设置 resource quota。AI 任务经常是 batch job，有排队、等待、成组启动、运行数小时或数天、checkpoint 恢复等特征。调度系统需要理解“作业”而不仅仅是“Pod”。
+
+\begin{figure}[H]
+  \centering
+  \begin{tikzpicture}[
+    font=\small,
+    box/.style={draw, rounded corners, minimum width=2.4cm, minimum height=0.75cm, align=center},
+    pool/.style={draw, rounded corners, minimum width=9.8cm, minimum height=2.2cm, align=center},
+    arrow/.style={-{Stealth[length=2mm]}, thick}
+  ]
+    \node[box] (teamA) at (-4,4.0) {基础模型团队};
+    \node[box] (teamB) at (-1.3,4.0) {推理平台团队};
+    \node[box] (teamC) at (1.4,4.0) {评测团队};
+    \node[box] (teamD) at (4.1,4.0) {数据团队};
+
+    \node[box, minimum width=8.8cm] (queue) at (0,2.7) {队列 / 配额 / 优先级 / 抢占策略};
+
+    \node[pool] (cluster) at (0,1.0) {};
+    \node at (0,1.75) {AI GPU 资源池};
+    \foreach \i/\x in {0/-4.0,1/-3.0,2/-2.0,3/-1.0,4/0.0,5/1.0,6/2.0,7/3.0,8/4.0} {
+      \node[draw, rounded corners, minimum width=0.65cm, minimum height=0.45cm] at (\x,0.65) {G};
+    }
+
+    \draw[arrow] (teamA.south) -- (queue.north);
+    \draw[arrow] (teamB.south) -- (queue.north);
+    \draw[arrow] (teamC.south) -- (queue.north);
+    \draw[arrow] (teamD.south) -- (queue.north);
+    \draw[arrow] (queue.south) -- (cluster.north);
+
+    \node[align=center] at (0,-0.55) {多租户 AI 集群调度：不同团队通过队列、配额和优先级共享 GPU 资源池。};
+  \end{tikzpicture}
+  \caption{多租户 AI 集群资源池：调度系统需要同时考虑配额、公平性、优先级和资源碎片。}
+  \label{fig:multi-tenant-ai-cluster}
+\end{figure}
+
+\subsection{训练、推理、评测混部}
+\label{subsec:training-serving-eval-colocation}
+
+AI 集群中的任务类型差异很大。预训练任务通常是长时间、大规模、通信密集型；推理服务是长期运行、延迟敏感、需要弹性伸缩；评测任务可能是短时突发、吞吐型；数据处理可能主要消耗 CPU、内存、存储和网络；微调任务规模较小但数量很多。
+
+不同任务对调度系统的要求不同：
+
+\begin{table}[H]
+  \centering
+  \caption{AI 集群中不同任务类型的调度特征}
+  \label{tab:ai-workload-scheduling-characteristics}
+  \begin{tabular}{p{2.8cm}p{3.5cm}p{4.2cm}p{4.0cm}}
+    \toprule
+    任务类型 & 资源特征 & 调度重点 & 典型风险 \\
+    \midrule
+    预训练 & 大规模 GPU、长时间、强通信 & gang scheduling、拓扑感知、checkpoint 恢复 & 启动碎片、通信慢、故障重启成本高 \\
+    SFT / 微调 & 中小规模 GPU、任务数量多 & 队列、公平性、镜像和数据准备 & 小任务挤占大作业资源、低利用率 \\
+    RLHF / DPO & 多阶段、多角色、可能混合训练和推理 & workflow 编排、actor/rollout/reference 模型资源协调 & 阶段不均衡、资源等待 \\
+    在线推理 & 长期运行、延迟敏感、显存常驻 & 高可用、扩缩容、bin packing、SLA & 冷启动、尾延迟、显存碎片 \\
+    离线评测 & 短时突发、吞吐型 & 快速启动、低优先级抢占、批量排队 & 影响线上服务或重要训练 \\
+    数据处理 & CPU、内存、存储、网络为主 & 与 GPU 任务隔离、I/O 调度 & 抢占网络和存储带宽 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+混部可以提高资源利用率，但也会增加干扰。例如在线推理服务可能 SM utilization 不高，但 HBM 占用高且对延迟敏感；训练作业可能吞吐高但通信突发；评测任务可能频繁启动和释放 GPU，造成资源碎片。调度系统需要根据任务特征做隔离和分层，而不是把所有 GPU workload 当成同一种 Pod。
+
+\subsection{利用率与公平性}
+\label{subsec:utilization-and-fairness}
+
+AI 集群调度的两个目标经常冲突：提高利用率和保证公平性。为了提高利用率，调度器希望尽快把空闲 GPU 分配出去；为了公平性和大作业启动，调度器又可能需要让一些小任务等待，以便积累足够连续资源给大任务。
+
+例如，集群当前有 4 个节点，每个节点剩余 2 张 GPU，总共 8 张空闲 GPU。一个 8 GPU 单节点 TP 推理实例无法启动，因为它需要同一节点的 8 张 GPU；一个 8 GPU 训练作业如果要求 NVSwitch 单节点，也无法启动。此时从总量看资源足够，从拓扑和连续性看资源不足。这就是 GPU 碎片。
+
+调度系统需要在以下策略之间权衡：
+
+\begin{itemize}
+  \item \textbf{bin packing}：尽量把任务塞满少数节点，减少碎片；
+  \item \textbf{spread}：把任务分散到多个节点，提高可用性或降低局部干扰；
+  \item \textbf{reservation}：为大作业预留资源，避免小作业打散集群；
+  \item \textbf{backfill}：在不影响高优先级大作业预计启动时间的前提下，运行短小任务；
+  \item \textbf{preemption}：通过抢占低优先级任务释放资源；
+  \item \textbf{quota borrowing}：允许队列临时借用其他队列未使用的配额。
+\end{itemize}
+
+优秀的 AI 调度系统不是简单地追求某一时刻 GPU utilization 最高，而是要优化更长期的目标：整体吞吐、队列等待时间、SLA、训练完成时间、公平性和成本。
+
+\section{Kubernetes 基础回顾}
+\label{sec:kubernetes-basics-review}
+
+本节快速回顾 Kubernetes 中与 AI 调度关系最密切的几个概念：Pod、Node、Scheduler、Device Plugin 和 Operator。熟悉 Kubernetes 的读者可以快速浏览。
+
+\subsection{Pod}
+\label{subsec:pod}
+
+Pod 是 Kubernetes 中最小的调度单元。一个 Pod 可以包含一个或多个容器，这些容器共享网络 namespace、部分存储卷和生命周期。在 AI 任务中，一个 Pod 可能代表：
+
+\begin{itemize}
+  \item 一个训练 worker；
+  \item 一个 parameter server；
+  \item 一个 PyTorch distributed rank；
+  \item 一个 Ray worker；
+  \item 一个 vLLM / TensorRT-LLM / Triton model server 实例；
+  \item 一个数据预处理任务；
+  \item 一个评测 worker。
+\end{itemize}
+
+Pod 通过 \texttt{resources.requests} 和 \texttt{resources.limits} 声明资源需求。GPU 通常以扩展资源的形式出现，例如 \texttt{nvidia.com/gpu: 1}。一个最小 GPU Pod 示例：
+
+\begin{lstlisting}[caption={请求 1 张 GPU 的 Pod 示例},label={lst:k8s-gpu-pod}]
+apiVersion: v1
+kind: Pod
+metadata:
+  name: gpu-demo
+spec:
+  restartPolicy: Never
+  containers:
+  - name: app
+    image: nvcr.io/nvidia/pytorch:xx.xx-py3
+    command: ["python", "train.py"]
+    resources:
+      limits:
+        nvidia.com/gpu: 1
+\end{lstlisting}
+
+在 Kubernetes 中，GPU 这类设备资源通常要求 request 与 limit 相等，常见写法是只写 limits。实际行为取决于 device plugin 和 Kubernetes 版本，但工程上应避免对 GPU 做类似 CPU 那样的 overcommit，除非明确使用 GPU sharing 或 MIG 等机制。
+
+\subsection{Node}
+\label{subsec:node}
+
+Node 是 Kubernetes 集群中的工作节点。对 AI 集群来说，一个 Node 通常是一台 GPU 服务器，包含：
+
+\begin{itemize}
+  \item 多张 GPU；
+  \item CPU 和内存；
+  \item 本地 NVMe；
+  \item 网卡和 RDMA 设备；
+  \item NVIDIA driver、CUDA runtime、container runtime；
+  \item kubelet、device plugin、monitoring agent；
+  \item 可能还包括 MIG 配置、拓扑标签和健康检查组件。
+\end{itemize}
+
+Node 会向 Kubernetes API Server 上报可分配资源。调度器根据 Pod 的资源请求、node selector、affinity、taint/toleration、topology spread、priority 等信息选择目标节点。
+
+AI 集群中常见的 node label 包括：
+
+\begin{lstlisting}[language=bash,caption={AI 集群常见 Node Label 示例},label={lst:ai-node-labels}]
+accelerator=nvidia
+gpu.vendor=nvidia
+gpu.model=h100
+gpu.count=8
+gpu.memory=80gb
+gpu.fabric=nvswitch
+rdma=true
+network.rail=4
+zone=az-a
+pool=training
+\end{lstlisting}
+
+这些 label 可以帮助调度器或平台层把任务放到合适资源池。例如，预训练任务只允许调度到 \texttt{pool=training} 且 \texttt{gpu.fabric=nvswitch} 的节点；在线推理任务调度到 \texttt{pool=serving}；评测任务可以使用较低优先级节点池。
+
+\subsection{Scheduler}
+\label{subsec:scheduler}
+
+Kubernetes Scheduler 的基本职责是为 Pending Pod 选择一个 Node。它通常经历两个阶段：
+
+\begin{enumerate}
+  \item \textbf{Filter}：过滤掉不满足资源、亲和性、污点容忍、端口、卷等条件的节点；
+  \item \textbf{Score}：对可行节点打分，选择最优节点。
+\end{enumerate}
+
+默认 scheduler 对通用 workload 很有效，但对 AI batch workload 有几个不足：
+
+\begin{itemize}
+  \item 它以 Pod 为基本单位，不天然理解一个分布式训练 Job 需要所有 worker 一起启动；
+  \item 它不一定理解 GPU 拓扑、NVLink、NIC 亲和性、MIG profile 等细节；
+  \item 它不提供复杂队列、配额借用、gang scheduling 和 backfill 能力；
+  \item 它对长时间运行的 batch job 与在线 service 的混部策略有限；
+  \item 它不直接处理 checkpoint-aware preemption 和作业级恢复。
+\end{itemize}
+
+因此，AI 集群常常在默认 scheduler 之外引入 Volcano、Kueue、自研 scheduler extender、scheduler plugin 或更上层的 batch queueing system。
+
+\subsection{Device Plugin}
+\label{subsec:device-plugin}
+
+Device Plugin 是 Kubernetes 管理 GPU、NIC、FPGA 等特殊硬件资源的扩展机制。设备厂商或平台团队通过 device plugin 向 kubelet 注册资源类型、上报设备列表，并在 Pod 被分配设备时执行必要的环境变量、设备文件、挂载和 runtime 配置。
+
+以 NVIDIA GPU 为例，NVIDIA device plugin 会向 Kubernetes 暴露类似 \texttt{nvidia.com/gpu} 的资源。Pod 请求该资源后，kubelet 会调用 device plugin 分配具体 GPU，并把对应设备注入容器。
+
+Device Plugin 的重要性在于：Kubernetes 本身并不知道 GPU 内部细节。它需要 device plugin 告诉它节点上有哪些设备、哪些设备健康、如何把设备分配给容器。对于 AI Infra 工程师来说，device plugin 是 GPU 从“物理硬件”变成“Kubernetes 可调度资源”的关键桥梁。
+
+\subsection{Operator}
+\label{subsec:operator}
+
+Operator 是 Kubernetes 的一种控制器模式，用自定义资源 CRD 和控制循环管理复杂应用。AI 集群中常见 operator 包括：
+
+\begin{itemize}
+  \item NVIDIA GPU Operator：安装和管理 driver、device plugin、DCGM exporter、MIG manager 等 GPU 组件；
+  \item Training Operator / Kubeflow Operator：管理 PyTorchJob、TFJob、MPIJob 等分布式训练任务；
+  \item Ray Operator：管理 Ray cluster 和 Ray job；
+  \item Model serving operator：管理模型部署、版本、扩缩容和流量切换；
+  \item Volcano / Kueue 相关控制器：管理队列、作业准入和调度。
+\end{itemize}
+
+Operator 的价值是把复杂运维动作自动化。例如 GPU 节点加入集群后，GPU Operator 可以自动部署驱动相关组件和监控 exporter；用户提交一个 PyTorchJob 后，训练 operator 可以创建 master 和 worker Pod，配置 rendezvous，监控状态，并在失败时重试。
+
+\begin{figure}[H]
+  \centering
+  \begin{tikzpicture}[
+    font=\small,
+    box/.style={draw, rounded corners, minimum width=2.2cm, minimum height=0.75cm, align=center},
+    wide/.style={draw, rounded corners, minimum width=8.8cm, minimum height=0.85cm, align=center},
+    nodebox/.style={draw, rounded corners, minimum width=8.8cm, minimum height=2.1cm, align=center},
+    arrow/.style={-{Stealth[length=2mm]}, thick}
+  ]
+    \node[wide] (api) at (0,4.7) {API Server};
+    \node[box] (sched) at (-3.2,3.4) {Scheduler};
+    \node[box] (ctrl) at (0,3.4) {Controller\\Manager};
+    \node[box] (op) at (3.2,3.4) {Operators};
+
+    \node[nodebox] (node) at (0,1.55) {};
+    \node[anchor=north west] at ($(node.north west)+(0.2,-0.2)$) {GPU Node};
+    \node[box] (kubelet) at (-3.0,1.4) {kubelet};
+    \node[box] (dp) at (0,1.4) {Device\\Plugin};
+    \node[box] (pod) at (3.0,1.4) {GPU Pods};
+
+    \node[box, minimum width=7.5cm] (runtime) at (0,0.35) {Container Runtime / NVIDIA Runtime / Driver};
+
+    \draw[arrow] (sched) -- (api);
+    \draw[arrow] (ctrl) -- (api);
+    \draw[arrow] (op) -- (api);
+    \draw[arrow] (api) -- (kubelet);
+    \draw[arrow] (dp) -- (kubelet);
+    \draw[arrow] (kubelet) -- (pod);
+    \draw[arrow] (pod) -- (runtime);
+
+    \node[align=center] at (0,-0.65) {Kubernetes 控制面通过 kubelet、device plugin 和 operator 管理 GPU 节点与 AI workload。};
+  \end{tikzpicture}
+  \caption{Kubernetes 控制面与 GPU 节点组件关系图。}
+  \label{fig:k8s-control-plane-gpu-node}
+\end{figure}
+
+\section{GPU 资源管理}
+\label{sec:gpu-resource-management}
+
+GPU 资源管理是 Kubernetes AI 平台的核心。它不仅包括“让 Pod 能请求 GPU”，还包括设备健康检查、驱动管理、MIG、GPU sharing、拓扑感知、资源隔离、监控和故障处理。
+
+\subsection{NVIDIA Device Plugin}
+\label{subsec:nvidia-device-plugin}
+
+NVIDIA Device Plugin 的主要职责是把节点上的 NVIDIA GPU 暴露给 Kubernetes。它通常以 DaemonSet 形式部署在 GPU 节点上，与 kubelet 通信。工作流程可以简化为：
+
+\begin{enumerate}
+  \item device plugin 启动后发现节点上的 GPU；
+  \item 向 kubelet 注册资源名，例如 \texttt{nvidia.com/gpu}；
+  \item 周期性上报设备健康状态；
+  \item 当 Pod 请求 GPU 时，kubelet 调用 device plugin 的 Allocate 接口；
+  \item device plugin 返回容器需要的设备文件、环境变量和挂载信息；
+  \item 容器启动后只能看到被分配的 GPU。
+\end{enumerate}
+
+从平台角度看，需要关注以下问题：
+
+\begin{itemize}
+  \item device plugin 版本是否与驱动、container runtime、Kubernetes 版本兼容；
+  \item GPU 健康状态是否能正确反映到 Kubernetes；
+  \item GPU reset、Xid error、ECC error 后是否自动隔离节点；
+  \item 容器中 \texttt{CUDA\_VISIBLE\_DEVICES} 是否符合预期；
+  \item MIG 模式下资源名和 profile 是否正确上报；
+  \item 与 GPU Operator、DCGM exporter、MIG manager 是否协同。
+\end{itemize}
+
+\subsection{GPU Request / Limit}
+\label{subsec:gpu-request-limit}
+
+用户通常通过 Pod spec 声明 GPU 需求：
+
+\begin{lstlisting}[caption={在 Kubernetes 中请求 GPU 资源},label={lst:k8s-gpu-resource-request}]
+resources:
+  limits:
+    nvidia.com/gpu: 4
+\end{lstlisting}
+
+这里的 \texttt{4} 表示该容器需要 4 张 GPU。Kubernetes 会把该 Pod 调度到一个可分配至少 4 张 GPU 的节点上。对于分布式训练，通常每个 Pod 请求 1 张或多张 GPU，然后由训练框架根据 rank、world size 和 local rank 建立通信。
+
+一个 PyTorch 分布式训练 worker 的 Pod 可能类似：
+
+\begin{lstlisting}[caption={分布式训练 Worker Pod 的资源声明示例},label={lst:pytorch-worker-gpu-request}]
+apiVersion: v1
+kind: Pod
+metadata:
+  name: train-worker-0
+spec:
+  restartPolicy: Never
+  containers:
+  - name: worker
+    image: my-registry/pytorch-train:latest
+    command: ["bash", "-lc", "torchrun --nproc_per_node=8 train.py"]
+    resources:
+      limits:
+        nvidia.com/gpu: 8
+        cpu: "64"
+        memory: "512Gi"
+\end{lstlisting}
+
+需要注意，Kubernetes 原生资源声明并不表达 GPU 拓扑。例如请求 8 张 GPU，只表示需要同一节点上 8 个 GPU 设备，并不说明这些 GPU 是否通过 NVSwitch 互联，也不说明 GPU 与 NIC 的关系。要表达这些约束，需要结合 node label、node affinity、scheduler plugin、device plugin 拓扑信息或自研调度层。
+
+\subsection{MIG}
+\label{subsec:mig}
+
+MIG，即 Multi-Instance GPU，是 NVIDIA 在部分数据中心 GPU 上提供的硬件级 GPU 切分能力。它可以把一张物理 GPU 切分成多个 GPU instance，每个 instance 拥有独立的一部分计算资源、显存、缓存和带宽隔离能力。MIG 的目标不是提高单个大训练任务性能，而是提高小任务、小模型推理和多租户场景下的资源利用率与隔离性。
+
+例如，一张大显存 GPU 如果直接分配给一个只需要少量显存和算力的小模型，会造成浪费。通过 MIG，可以把它切分成多个较小 profile，让多个推理实例或轻量任务共享同一张物理 GPU，同时获得比普通进程共享更强的硬件隔离。
+
+\begin{figure}[H]
+  \centering
+  \begin{tikzpicture}[
+    font=\small,
+    gpu/.style={draw, rounded corners, minimum width=7.8cm, minimum height=2.5cm, align=center},
+    slice/.style={draw, rounded corners, minimum width=1.2cm, minimum height=1.7cm, align=center, fill=gray!10},
+    arrow/.style={-{Stealth[length=2mm]}, thick}
+  ]
+    \node[gpu] (full) at (0,3.2) {};
+    \node at (0,4.15) {Physical GPU};
+    \node at (0,3.2) {完整 GPU：SM / HBM / L2 / Copy Engine};
+
+    \node[gpu] (mig) at (0,0.7) {};
+    \node at (0,1.65) {MIG Mode};
+    \foreach \i/\x/\txt in {
+      0/-3.0/{GI 0},
+      1/-1.8/{GI 1},
+      2/-0.6/{GI 2},
+      3/0.6/{GI 3},
+      4/1.8/{GI 4},
+      5/3.0/{GI 5}
+    } {
+      \node[slice] at (\x,0.65) {\txt\\SM\\HBM};
+    }
+
+    \draw[arrow] (full.south) -- (mig.north);
+    \node[align=center] at (0,-1.0) {MIG 将一张物理 GPU 切分为多个具有硬件隔离的 GPU instance。};
+  \end{tikzpicture}
+  \caption{MIG GPU 切分示意图：适合小模型推理、多租户隔离和提高碎片资源利用率。}
+  \label{fig:mig-gpu-partition}
+\end{figure}
+
+MIG 在 Kubernetes 中通常由 GPU Operator 和 MIG Manager 管理。平台可以为节点设置不同 MIG strategy，例如单一 profile 或混合 profile。调度时，MIG instance 会以不同扩展资源的形式暴露给 Kubernetes，例如某种 \texttt{nvidia.com/mig-...} 资源名。
+
+MIG 的使用需要权衡：
+
+\begin{itemize}
+  \item \textbf{优点}：硬件隔离更强，适合多租户小模型推理，提高大 GPU 的切分利用率；
+  \item \textbf{缺点}：切分后无法灵活合并，profile 选择不当会造成新的碎片；
+  \item \textbf{限制}：并非所有 GPU 支持，且某些多卡通信、NVLink、profiling 或共享场景会有额外约束；
+  \item \textbf{运维复杂度}：需要管理 MIG 模式切换、profile 配置、节点 drain、资源上报和监控。
+\end{itemize}
+
+实践中，MIG 更适合稳定的推理资源池，而不是频繁变化的大规模训练资源池。对于训练，通常更希望保留完整 GPU，以获得完整算力、显存和互联能力。
+
+\subsection{GPU Sharing}
+\label{subsec:gpu-sharing}
+
+GPU sharing 指多个工作负载共享同一张 GPU。它与 MIG 不同，MIG 是硬件切分，GPU sharing 更多是软件或 runtime 层的共享。常见方式包括：
+
+\begin{itemize}
+  \item 多个进程直接共享同一 GPU；
+  \item NVIDIA MPS；
+  \item time-slicing；
+  \item framework-level batching；
+  \item serving runtime 内部的多模型复用；
+  \item MIG + sharing 的组合。
+\end{itemize}
+
+GPU sharing 的价值在于提高小任务利用率。例如某些 notebook、开发调试、小模型推理、embedding 服务或低 QPS 模型不需要独占整张 GPU。共享可以减少浪费。
+
+但 GPU sharing 风险也很大：
+
+\begin{itemize}
+  \item 显存 OOM 会相互影响；
+  \item SM、HBM 带宽、L2 cache、copy engine 竞争导致性能抖动；
+  \item 在线推理尾延迟变差；
+  \item 监控和计费复杂；
+  \item 故障隔离弱于 MIG；
+  \item 用户容易误以为自己独占 GPU。
+\end{itemize}
+
+因此，GPU sharing 更适合低优先级、开发测试或可容忍抖动的推理场景。对于强 SLA 在线推理和大规模训练，应谨慎使用。
+
+\subsection{Topology-Aware Scheduling}
+\label{subsec:topology-aware-scheduling}
+
+拓扑感知调度是 AI 集群调度的关键能力。它需要理解 GPU 与 GPU、GPU 与 NIC、GPU 与 CPU NUMA、节点与交换机之间的关系。前两章已经解释过，TP、EP、RDMA 和 GPUDirect RDMA 都强依赖拓扑。
+
+在 Kubernetes 中，可以通过多种方式实现拓扑感知：
+
+\begin{itemize}
+  \item 节点标签：例如 \texttt{gpu.fabric=nvswitch}、\texttt{rdma=true}；
+  \item node affinity：限制 Pod 只能调度到满足拓扑条件的节点；
+  \item pod affinity / anti-affinity：控制 Pod 之间靠近或分散；
+  \item topology spread constraints：控制副本在 zone、rack、node 间分布；
+  \item device plugin 上报拓扑信息；
+  \item scheduler extender 或 scheduler plugin；
+  \item 上层 batch scheduler 进行作业级节点选择；
+  \item 自研资源画像系统记录 GPU/NIC/NVLink/NVSwitch 拓扑。
+\end{itemize}
+
+\begin{figure}[H]
+  \centering
+  \begin{tikzpicture}[
+    font=\small,
+    gpu/.style={draw, rounded corners, minimum width=0.9cm, minimum height=0.5cm, align=center},
+    group/.style={draw, rounded corners, dashed, inner sep=0.22cm},
+    task/.style={draw, rounded corners, minimum width=2.0cm, minimum height=0.65cm, align=center, fill=gray!10},
+    link/.style={line width=0.8pt},
+    arrow/.style={-{Stealth[length=2mm]}, thick}
+  ]
+    \foreach \i/\x in {0/-3.5,1/-2.5,2/-1.5,3/-0.5,4/0.7,5/1.7,6/2.7,7/3.7} {
+      \node[gpu] (g\i) at (\x,0.6) {G\i};
+    }
+
+    \node[group, fit=(g0)(g1)(g2)(g3), label=below:{NVSwitch Group A}] {};
+    \node[group, fit=(g4)(g5)(g6)(g7), label=below:{NVSwitch Group B}] {};
+
+    \node[task] (job) at (0,3.1) {TP=4 推理实例};
+
+    \draw[arrow] (job.south) -- (-2.0,1.25);
+    \node[align=center] at (0,2.25) {拓扑感知调度选择同一高速互联 group 内的 GPU};
+
+    \foreach \a/\b in {0/1,1/2,2/3,4/5,5/6,6/7} {
+      \draw[link] (g\a) -- (g\b);
+    }
+  \end{tikzpicture}
+  \caption{拓扑感知 GPU 分配示意：通信密集任务应优先绑定同一高速互联域内的 GPU。}
+  \label{fig:topology-aware-gpu-allocation}
+\end{figure}
+
+拓扑感知调度尤其适用于：
+
+\begin{itemize}
+  \item TP 推理实例；
+  \item 单节点 8 GPU 训练；
+  \item 多节点训练中的 GPU-NIC 亲和；
+  \item MoE expert parallel；
+  \item 多 rail RDMA；
+  \item 同机多模型混部。
+\end{itemize}
+
+\section{分布式训练作业调度}
+\label{sec:distributed-training-scheduling}
+
+分布式训练与普通 Pod 调度最大的区别是：它通常需要一组 Pod 共同启动、共同运行、共同失败或共同成功。一个 64 GPU PyTorch 训练作业如果只启动了 50 个 worker，剩下 14 个 worker 处于 Pending，已经启动的 worker 可能会一直等待 rendezvous，浪费 GPU。这个问题就是 gang scheduling 的动机。
+
+\subsection{Gang Scheduling}
+\label{subsec:gang-scheduling}
+
+Gang scheduling，也称 coscheduling，要求一个作业的一组任务要么一起调度成功，要么都不运行。对于分布式训练来说，这非常重要。一个 PyTorchJob、MPIJob 或 Ray cluster 往往有最小可运行副本数。如果资源不够，调度器应该让整个 job 等待，而不是只启动一部分 Pod。
+
+\begin{figure}[H]
+  \centering
+  \begin{tikzpicture}[
+    font=\small,
+    pod/.style={draw, rounded corners, minimum width=0.85cm, minimum height=0.45cm, align=center},
+    node/.style={draw, rounded corners, minimum width=2.0cm, minimum height=0.7cm, align=center},
+    arrow/.style={-{Stealth[length=2mm]}, thick}
+  ]
+    \node at (0,4.0) {Job 需要 8 个 worker，minAvailable = 8};
+
+    \foreach \i/\x in {0/-3.5,1/-2.5,2/-1.5,3/-0.5,4/0.5,5/1.5,6/2.5,7/3.5} {
+      \node[pod] (p\i) at (\x,3.2) {W\i};
+    }
+
+    \node[node] (n0) at (-3,1.7) {Node A\\4 GPU};
+    \node[node] (n1) at (-0.5,1.7) {Node B\\2 GPU};
+    \node[node] (n2) at (2.0,1.7) {Node C\\1 GPU};
+
+    \draw[arrow, dashed] (p0.south) -- (n0.north);
+    \draw[arrow, dashed] (p1.south) -- (n0.north);
+    \draw[arrow, dashed] (p2.south) -- (n0.north);
+    \draw[arrow, dashed] (p3.south) -- (n0.north);
+    \draw[arrow, dashed] (p4.south) -- (n1.north);
+    \draw[arrow, dashed] (p5.south) -- (n1.north);
+    \draw[arrow, dashed] (p6.south) -- (n2.north);
+
+    \node[draw, rounded corners, minimum width=8.5cm, minimum height=0.7cm, align=center, fill=gray!10] at (0,0.35) {资源不足 8 个 worker：整个 Job 等待，避免部分启动浪费 GPU};
+  \end{tikzpicture}
+  \caption{Gang scheduling 等待与启动流程：资源不足时不应只启动部分训练 worker。}
+  \label{fig:gang-scheduling}
+\end{figure}
+
+Gang scheduling 需要调度器理解 job 级语义，而不是只看单个 Pod。它通常与队列、配额、优先级和抢占结合使用。例如一个高优先级 128 GPU 训练 job 等待时，调度器可能需要抢占一些低优先级任务，释放足够资源后一次性启动整个 job。
+
+\subsection{Volcano}
+\label{subsec:volcano}
+
+Volcano 是面向云原生 batch 和高性能计算 workload 的调度系统。它与 Kubernetes 兼容，并提供队列、gang scheduling、优先级、抢占、资源回收、backfill、DRF、公平调度等能力。对 AI 训练来说，Volcano 常用于调度 PyTorch、TensorFlow、MPI、Spark、Ray 等计算密集型任务。
+
+Volcano 的核心价值在于它把调度对象从单个 Pod 提升到 Job 和 Queue。一个 VolcanoJob 可以包含多个 task，每个 task 可以有副本数、资源需求和最小可用数量。调度器根据队列和作业约束决定是否启动。
+
+一个简化 VolcanoJob 示例：
+
+\begin{lstlisting}[caption={VolcanoJob 的概念示例},label={lst:volcano-job-example}]
+apiVersion: batch.volcano.sh/v1alpha1
+kind: Job
+metadata:
+  name: pretrain-job
+spec:
+  minAvailable: 8
+  schedulerName: volcano
+  queue: foundation-model
+  tasks:
+  - name: worker
+    replicas: 8
+    template:
+      spec:
+        restartPolicy: Never
+        containers:
+        - name: trainer
+          image: my-registry/pretrain:latest
+          command: ["bash", "-lc", "torchrun --nnodes=1 --nproc_per_node=8 train.py"]
+          resources:
+            limits:
+              nvidia.com/gpu: 1
+\end{lstlisting}
+
+这个示例表达了一个重要语义：作业至少需要 8 个 worker 才能运行。如果只调度了 3 个 worker，它没有意义。Volcano 的 gang plugin 可以帮助避免这种部分启动问题。
+
+Volcano 适合的场景包括：
+
+\begin{itemize}
+  \item 大规模分布式训练；
+  \item 多队列、多租户 batch 集群；
+  \item 需要 gang scheduling 的 MPI/PyTorch/Ray workload；
+  \item 需要公平调度、优先级、抢占和 backfill 的场景；
+  \item HPC 与 AI 混合计算集群。
+\end{itemize}
+
+\subsection{Kueue}
+\label{subsec:kueue}
+
+Kueue 是 Kubernetes 原生的作业排队系统，面向 batch、HPC、AI/ML 等 workload。它的核心思想不是替代所有调度逻辑，而是在 Pod 真正创建或运行之前，对作业进行准入控制：根据队列、配额、资源可用性和优先级判断作业什么时候可以进入集群运行。
+
+Kueue 中常见概念包括：
+
+\begin{itemize}
+  \item \textbf{Workload}：代表一个待调度的作业抽象；
+  \item \textbf{LocalQueue}：namespace 内用户提交作业的队列；
+  \item \textbf{ClusterQueue}：跨 namespace 的资源配额和队列管理对象；
+  \item \textbf{ResourceFlavor}：不同类型资源，例如不同 GPU 型号、不同节点池；
+  \item \textbf{Admission}：当资源和配额满足时，Kueue 接纳作业运行；
+  \item \textbf{Preemption}：在策略允许时，抢占低优先级 workload。
+\end{itemize}
+
+Kueue 的一个典型价值是把“排队”和“运行”分开。用户可以提交大量训练或评测任务，但只有被接纳的任务才真正创建大量 Pod 消耗资源。这对于控制集群压力、实现配额、公平性和多租户非常重要。
+
+一个简化的 Kueue 资源概念如下：
+
+\begin{lstlisting}[caption={Kueue ClusterQueue 与 ResourceFlavor 的概念示例},label={lst:kueue-clusterqueue-example}]
+apiVersion: kueue.x-k8s.io/v1beta1
+kind: ResourceFlavor
+metadata:
+  name: h100-nvswitch
+---
+apiVersion: kueue.x-k8s.io/v1beta1
+kind: ClusterQueue
+metadata:
+  name: foundation-model-queue
+spec:
+  namespaceSelector: {}
+  resourceGroups:
+  - coveredResources: ["cpu", "memory", "nvidia.com/gpu"]
+    flavors:
+    - name: h100-nvswitch
+      resources:
+      - name: nvidia.com/gpu
+        nominalQuota: 256
+      - name: cpu
+        nominalQuota: 2048
+      - name: memory
+        nominalQuota: 16Ti
+\end{lstlisting}
+
+Kueue 适合与 Job、RayJob、MPIJob、PyTorchJob 等作业控制器结合，作为统一准入和配额层。它尤其适合多团队共享 batch 集群，希望按照资源 flavor 和队列控制不同团队使用资源的场景。
+
+\subsection{Priority 与 Preemption}
+\label{subsec:priority-preemption}
+
+优先级和抢占是调度系统必须谨慎设计的能力。没有优先级，紧急任务无法快速获得资源；没有抢占，高优先级任务可能长期等待；但如果抢占过于激进，低优先级任务可能永远无法完成，集群也会频繁浪费已经完成的训练进度。
+
+AI 任务的抢占策略需要结合 checkpoint。对于支持 checkpoint 的训练任务，可以在抢占前发送信号，让任务保存状态；对于不支持 checkpoint 的任务，抢占意味着从头开始，成本很高。对于在线推理服务，抢占必须考虑流量迁移、连接 draining 和 SLA。
+
+常见策略包括：
+
+\begin{itemize}
+  \item 高优先级线上服务不被抢占；
+  \item 低优先级实验任务可被抢占；
+  \item 预训练任务只有在 checkpoint 完成后才允许安全抢占；
+  \item 抢占前设置 grace period；
+  \item 被抢占任务重新进入队列；
+  \item 对频繁被抢占的任务提供 aging 或补偿机制；
+  \item 抢占应尽量释放连续资源，而不是随机杀 Pod。
+\end{itemize}
+
+\subsection{Checkpoint-Based Rescheduling}
+\label{subsec:checkpoint-based-rescheduling}
+
+大规模训练不可能假设节点永远不坏。GPU Xid、ECC error、网络抖动、节点重启、驱动问题、存储故障、作业代码异常都可能导致训练中断。因此，调度系统必须与 checkpoint 机制结合。
+
+Checkpoint-based rescheduling 的流程通常是：
+
+\begin{enumerate}
+  \item 训练任务周期性保存 distributed checkpoint；
+  \item 调度系统监控 Pod、Node 和 Job 状态；
+  \item 节点故障或抢占发生时，Job 标记为失败或待恢复；
+  \item 调度器重新为 Job 分配资源；
+  \item 训练任务从最近 checkpoint 恢复；
+  \item 平台记录失败原因、恢复耗时和损失的训练步数。
+\end{enumerate}
+
+对大模型训练来说，checkpoint 本身也是重 I/O 操作。如果所有大作业同时 checkpoint，会冲击存储和网络。调度系统可以参与 checkpoint policy，例如错峰 checkpoint、限制并发 checkpoint、根据作业优先级调整 checkpoint 间隔。
+
+\section{推理服务编排}
+\label{sec:serving-orchestration}
+
+训练作业通常是 batch workload，而推理服务是 online workload。它们都使用 GPU，但调度目标完全不同。训练追求吞吐和完成时间，推理追求可用性、延迟、吞吐和成本。Kubernetes 原生适合管理长期运行服务，因此很多 LLM Serving 系统会部署在 Kubernetes 上，但 GPU 推理服务仍然有大量特殊问题。
+
+\subsection{Model Server Deployment}
+\label{subsec:model-server-deployment}
+
+一个 LLM 推理服务通常包含：
+
+\begin{itemize}
+  \item 前端 API gateway；
+  \item tokenizer / request processor；
+  \item model server，例如 vLLM、TensorRT-LLM、Triton、Text Generation Inference 或自研 runtime；
+  \item scheduler，用于 continuous batching、prefill/decode 调度和 admission control；
+  \item KV Cache manager；
+  \item metrics exporter；
+  \item model artifact loader；
+  \item 日志、trace 和计费组件。
+\end{itemize}
+
+在 Kubernetes 中，最简单的部署方式是使用 Deployment 或 StatefulSet 管理模型服务 Pod，用 Service 暴露访问入口。对于需要多 GPU tensor parallel 的模型，一个 Pod 可能请求 2、4 或 8 张 GPU，并在容器内部启动多进程 runtime。
+
+\begin{lstlisting}[caption={LLM Model Server Deployment 的概念示例},label={lst:llm-serving-deployment}]
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llama-serving
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: llama-serving
+  template:
+    metadata:
+      labels:
+        app: llama-serving
+    spec:
+      nodeSelector:
+        pool: serving
+        gpu.fabric: nvswitch
+      containers:
+      - name: server
+        image: my-registry/llm-serving:latest
+        command: ["bash", "-lc", "python -m server --model /models/llama --tensor-parallel-size 4"]
+        ports:
+        - containerPort: 8000
+        resources:
+          limits:
+            nvidia.com/gpu: 4
+            cpu: "32"
+            memory: "256Gi"
+\end{lstlisting}
+
+需要注意，Deployment 的滚动升级语义对大模型服务未必总是合适。模型加载可能需要数分钟，显存初始化和 CUDA graph capture 也需要时间。如果滚动策略设置不当，可能造成可用副本不足或冷启动抖动。对于大模型服务，通常需要自定义 readiness probe、预热流程、流量切换和灰度发布策略。
+
+\subsection{Autoscaling}
+\label{subsec:autoscaling}
+
+普通 Web 服务常用 CPU utilization 或 QPS 做 autoscaling，但 LLM 推理服务的扩缩容指标更复杂。常见指标包括：
+
+\begin{itemize}
+  \item QPS；
+  \item active requests；
+  \item waiting queue length；
+  \item TTFT；
+  \item TPOT；
+  \item request latency P50/P95/P99；
+  \item GPU utilization；
+  \item HBM usage；
+  \item KV Cache usage；
+  \item tokens per second；
+  \item prefill queue length 与 decode queue length；
+  \item SLA violation rate。
+\end{itemize}
+
+LLM serving 的扩缩容难点在于冷启动成本高。一个大模型实例启动需要拉取镜像、加载权重、初始化 CUDA context、构建通信组、预热 kernel，甚至加载量化权重和构建 CUDA graph。这个过程可能远慢于普通服务。因此，autoscaling 不能只在流量升高后才启动新实例，还需要预测、预留和 warm pool。
+
+推理扩缩容的常见策略包括：
+
+\begin{itemize}
+  \item 保留最小 warm replicas；
+  \item 根据 queue length 和 token throughput 扩容；
+  \item 对 prefill-heavy 和 decode-heavy 资源池分别扩缩容；
+  \item 使用 admission control 防止队列无限增长；
+  \item 在流量低谷缩容，但保留热点模型；
+  \item 对多模型服务做模型级别的容量规划。
+\end{itemize}
+
+\subsection{GPU Bin Packing}
+\label{subsec:gpu-bin-packing}
+
+推理服务通常比训练更容易产生 GPU 碎片。原因包括：
+
+\begin{itemize}
+  \item 不同模型大小不同，显存需求不同；
+  \item 不同模型 QPS 不同，SM 和 HBM 带宽使用率不同；
+  \item 一些模型需要 1 张 GPU，一些需要 4 张或 8 张 GPU；
+  \item LoRA adapter、多租户模型和 embedding/rerank 服务共存；
+  \item 在线服务不能随意迁移，否则会影响 SLA。
+\end{itemize}
+
+Bin packing 的目标是把模型实例合理放置到 GPU 节点上，提高资源利用率并减少碎片。例如，一个 8 GPU 节点可以放置两个 TP=4 的模型实例，也可以放置一个 TP=8 的大模型实例，还可以放置多个 MIG 小实例。不同放置方式对显存、通信、带宽和可用性影响不同。
+
+推理 bin packing 需要考虑：
+
+\begin{itemize}
+  \item GPU 显存；
+  \item HBM 带宽；
+  \item SM utilization；
+  \item KV Cache 峰值；
+  \item 模型权重常驻；
+  \item TP group 拓扑；
+  \item 实例之间的干扰；
+  \item 负载均衡和故障域。
+\end{itemize}
+
+如果只按显存打包，可能把多个 memory-bound decode 服务放在同一节点，导致 HBM 带宽争用和尾延迟上升。如果只按 SM utilization 打包，也可能忽略 KV Cache 和网络通信。因此，高质量推理调度需要 workload profiling。
+
+\subsection{Cold Start}
+\label{subsec:cold-start}
+
+大模型推理的冷启动是一个严重问题。普通微服务冷启动可能是秒级，而大模型服务可能需要几十秒到数分钟。冷启动包括：
+
+\begin{itemize}
+  \item 镜像拉取；
+  \item 模型权重从对象存储或分布式文件系统加载；
+  \item 权重反序列化和分片；
+  \item GPU 显存分配；
+  \item CUDA context 初始化；
+  \item NCCL communicator 初始化；
+  \item kernel autotuning；
+  \item CUDA graph capture；
+  \item KV Cache block 初始化；
+  \item readiness probe 通过。
+\end{itemize}
+
+降低冷启动的策略包括：
+
+\begin{itemize}
+  \item 使用本地 NVMe 缓存模型权重；
+  \item 预拉取镜像；
+  \item 使用 warm pool；
+  \item 模型分层加载；
+  \item 权重格式优化；
+  \item 避免频繁 scale-to-zero；
+  \item 将热点模型常驻；
+  \item 使用灰度流量切换，避免未预热实例接收真实请求。
+\end{itemize}
+
+\subsection{多模型共存}
+\label{subsec:multi-model-coexistence}
+
+一个生产集群通常同时服务多个模型：大模型、小模型、embedding、rerank、多模态、代码模型、专用领域模型、实验版本和灰度版本。多模型共存带来几个调度问题：
+
+\begin{itemize}
+  \item 热点模型需要更多副本，冷门模型是否常驻？
+  \item 多个小模型是否合并到同一 serving runtime？
+  \item LoRA adapter 是否动态加载？
+  \item 模型之间如何共享 KV Cache 或 prefix cache？
+  \item 不同模型的 SLA 是否不同？
+  \item 模型升级时如何做流量切换和回滚？
+\end{itemize}
+
+\begin{figure}[H]
+  \centering
+  \begin{tikzpicture}[
+    font=\small,
+    box/.style={draw, rounded corners, minimum width=2.1cm, minimum height=0.7cm, align=center},
+    wide/.style={draw, rounded corners, minimum width=8.5cm, minimum height=0.75cm, align=center},
+    arrow/.style={-{Stealth[length=2mm]}, thick}
+  ]
+    \node[wide] (client) at (0,5.0) {Clients / Applications};
+    \node[wide] (gw) at (0,4.0) {API Gateway / Auth / Rate Limit};
+    \node[wide] (router) at (0,3.0) {Model Router / Admission Control};
+
+    \node[box] (s0) at (-3.2,1.8) {Prefill Pool\\GPU Pods};
+    \node[box] (s1) at (0,1.8) {Decode Pool\\GPU Pods};
+    \node[box] (s2) at (3.2,1.8) {Embedding /\\Rerank};
+
+    \node[wide] (obs) at (0,0.6) {Metrics / Logs / Traces / Cost Accounting};
+    \node[wide] (store) at (0,-0.55) {Model Registry / Object Storage / NVMe Cache};
+
+    \draw[arrow] (client) -- (gw);
+    \draw[arrow] (gw) -- (router);
+    \draw[arrow] (router) -- (s0);
+    \draw[arrow] (router) -- (s1);
+    \draw[arrow] (router) -- (s2);
+    \draw[arrow] (s0) -- (obs);
+    \draw[arrow] (s1) -- (obs);
+    \draw[arrow] (s2) -- (obs);
+    \draw[arrow] (store) -- (s0);
+    \draw[arrow] (store) -- (s1);
+    \draw[arrow] (store) -- (s2);
+  \end{tikzpicture}
+  \caption{LLM Serving on Kubernetes 架构图：模型路由、GPU Pod、观测系统和模型存储共同构成在线服务平台。}
+  \label{fig:llm-serving-on-k8s}
+\end{figure}
+
+\section{AI 集群可观测性}
+\label{sec:ai-cluster-observability}
+
+没有可观测性，就没有真正的调度优化。AI 集群的可观测性必须跨越 Kubernetes、GPU、网络、存储、作业和业务指标。只看 GPU utilization 会误导决策；只看 Pod 状态也无法解释训练慢在哪里。
+
+\subsection{GPU Utilization}
+\label{subsec:gpu-utilization}
+
+GPU utilization 是最常见指标，但也是最容易被误解的指标。它通常表示一段采样时间内 GPU 是否有活跃 work，而不是 Tensor Core 是否高效运行。一个 NCCL kernel、一个 memory-bound kernel、一个低效小 kernel 都可能让 GPU utilization 看起来不低，但业务吞吐并不好。
+
+因此，GPU utilization 应与以下指标一起看：
+
+\begin{itemize}
+  \item SM utilization；
+  \item Tensor Core utilization；
+  \item HBM bandwidth；
+  \item GPU memory usage；
+  \item kernel timeline；
+  \item NCCL communication time；
+  \item tokens per second 或 samples per second；
+  \item cost per token 或 cost per step。
+\end{itemize}
+
+\subsection{SM Occupancy}
+\label{subsec:sm-occupancy-monitoring}
+
+SM occupancy 或 SM active 反映计算单元活跃程度。训练中的大 GEMM 通常希望 SM 和 Tensor Core 利用率较高；推理 decode 阶段则可能因为 batch 小、KV Cache 读取和小 GEMM 导致 SM 利用率不高。
+
+调度系统可以利用 SM 指标判断混部机会。例如一个服务显存占用高但 SM 使用低，理论上可以与另一个计算型任务混部；但如果它对延迟敏感，混部可能导致 SLA 抖动。因此，资源利用率指标必须与 workload 类型和 SLA 结合。
+
+\subsection{HBM Usage}
+\label{subsec:hbm-usage-monitoring}
+
+HBM usage 是训练和推理都非常关键的指标。训练中，HBM 被参数、梯度、优化器状态、activation 和临时 buffer 占用；推理中，HBM 被模型权重、KV Cache、workspace 和 runtime buffer 占用。
+
+推理服务尤其需要监控 KV Cache 使用率。如果 KV Cache block 使用率接近上限，新的请求可能被拒绝、排队或触发 eviction。调度系统可以根据 KV Cache 压力而不是只根据 QPS 做扩容。
+
+\subsection{Network Throughput}
+\label{subsec:network-throughput-monitoring}
+
+网络指标包括节点内和节点间两类：
+
+\begin{itemize}
+  \item 节点内：NVLink/NVSwitch 带宽、PCIe 带宽、GPU P2P；
+  \item 节点间：NIC TX/RX、RDMA counters、PFC、ECN、丢包、重传、交换机端口利用率。
+\end{itemize}
+
+对于训练作业，需要把 NCCL collective 时间与网络指标关联起来。如果某个 job step time 变长，同时某些 leaf-spine 链路利用率接近上限，说明可能存在网络热点。如果 NCCL timeout 与 PFC pause storm 同时出现，说明 RoCE 拥塞控制需要排查。
+
+\subsection{Job Queue Time}
+\label{subsec:job-queue-time}
+
+队列等待时间是 AI 平台用户最关心的指标之一。一个训练任务真正的完成时间不是运行时间，而是：
+
+\[
+  T_{\text{completion}} = T_{\text{queue}} + T_{\text{startup}} + T_{\text{run}} + T_{\text{recovery}}.
+\]
+
+其中 $T_{\text{queue}}$ 可能非常长。大作业经常因为资源碎片等待，小作业则可能因为低优先级等待。平台应监控：
+
+\begin{itemize}
+  \item 不同队列的平均等待时间；
+  \item P95/P99 等待时间；
+  \item 不同 GPU flavor 的等待时间；
+  \item 大作业与小作业等待差异；
+  \item 被抢占次数；
+  \item backfill 成功率；
+  \item 资源碎片率。
+\end{itemize}
+
+队列时间可以反向指导容量规划。如果 H100 队列长期拥塞，而 A100 队列空闲，说明资源结构与需求不匹配；如果 8 GPU 单节点作业长期等待，但单卡任务很快启动，说明 bin packing 或 reservation 策略需要调整。
+
+\subsection{Cost Per Token / Cost Per Step}
+\label{subsec:cost-per-token-step}
+
+最终，AI Infra 的目标不是让某个指标好看，而是降低单位业务产出的成本。训练中常用 cost per step、cost per token、tokens per GPU-hour；推理中常用 cost per 1K tokens、cost per request、GPU-hour per SLA bucket。
+
+这些指标把硬件利用率、调度效率和业务结果连接起来。例如：
+
+\begin{itemize}
+  \item 一个推理服务 GPU utilization 很高，但 P99 延迟也很高，可能需要扩容；
+  \item 一个训练作业 GPU utilization 不低，但 tokens per GPU-hour 低，可能是通信瓶颈；
+  \item 一个队列 GPU 使用率高，但大量作业被抢占，实际有效训练 token 低；
+  \item 一个量化模型成本低，但质量下降导致重试率上升，端到端成本未必低。
+\end{itemize}
+
+\begin{figure}[H]
+  \centering
+  \begin{tikzpicture}[
+    font=\small,
+    layer/.style={draw, rounded corners, minimum width=9.0cm, minimum height=0.7cm, align=center},
+    arrow/.style={-{Stealth[length=2mm]}, thick}
+  ]
+    \node[layer] (biz) at (0,5.0) {业务层：QPS、Latency、SLA、Cost per Token、用户体验};
+    \node[layer] (job) at (0,4.0) {作业层：Queue Time、Run Time、Checkpoint、Failure、Preemption};
+    \node[layer] (k8s) at (0,3.0) {Kubernetes 层：Pod、Node、Scheduler、Quota、Events};
+    \node[layer] (gpu) at (0,2.0) {GPU 层：Utilization、SM、HBM、Tensor Core、Xid、ECC};
+    \node[layer] (net) at (0,1.0) {网络层：NVLink、RDMA、NIC、PFC、ECN、NCCL Bandwidth};
+    \node[layer] (storage) at (0,0.0) {存储层：Dataset、Checkpoint、Model Loading、NVMe Cache};
+
+    \draw[arrow] (storage) -- (net);
+    \draw[arrow] (net) -- (gpu);
+    \draw[arrow] (gpu) -- (k8s);
+    \draw[arrow] (k8s) -- (job);
+    \draw[arrow] (job) -- (biz);
+  \end{tikzpicture}
+  \caption{AI Infra 监控指标分层图：从硬件资源到业务成本需要跨层关联。}
+  \label{fig:ai-infra-monitoring-layers}
+\end{figure}
+
+\section{从 Kubernetes 到 AI 平台}
+\label{sec:from-kubernetes-to-ai-platform}
+
+Kubernetes 是强大的基础设施底座，但一个完整 AI 平台通常还需要更上层的能力：
+
+\begin{itemize}
+  \item 训练任务提交系统；
+  \item 模型注册与版本管理；
+  \item 数据集管理；
+  \item 实验追踪；
+  \item 分布式 checkpoint 管理；
+  \item 镜像构建与依赖管理；
+  \item 权限、审计和成本分摊；
+  \item 自动调参和超参搜索；
+  \item 模型评测流水线；
+  \item 推理流量治理；
+  \item 多集群和多区域调度；
+  \item 故障自动诊断。
+\end{itemize}
+
+因此，不要把“在 Kubernetes 上跑 GPU Pod”误认为“已经有了 AI 平台”。真正的平台需要把用户体验、资源效率、可靠性和成本闭环起来。对用户来说，他们希望提交一个训练配置或模型部署配置，而不是手写复杂 YAML；对平台来说，需要把这些高级意图翻译成队列、配额、Pod、Service、PVC、Secret、ConfigMap、Job、监控和告警。
+
+一个成熟 AI 平台通常会形成如下分层：
+
+\begin{enumerate}
+  \item \textbf{硬件层}：GPU、NIC、NVMe、交换机、机架和供电；
+  \item \textbf{系统层}：驱动、CUDA、container runtime、RDMA、存储客户端；
+  \item \textbf{Kubernetes 层}：Pod、Node、Service、Scheduler、Device Plugin、Operator；
+  \item \textbf{Batch / Serving 层}：Volcano、Kueue、Training Operator、Serving Runtime；
+  \item \textbf{平台层}：任务提交、模型管理、数据管理、权限、计费、可观测性；
+  \item \textbf{业务层}：训练产出、推理 SLA、模型质量、成本收益。
+\end{enumerate}
+
+AI Infra 工程师的价值就在于能跨越这些层次定位问题。例如用户反馈“训练慢”，原因可能是模型代码、GEMM shape、NCCL all-reduce、RoCE 拥塞、GPU-NIC 亲和、Pod 被错误调度、存储读取慢或 checkpoint 阻塞。只懂其中一层，很难完成端到端优化。
+
+\section{本章小结}
+\label{sec:k8s-ai-scheduling-summary}
+
+本章介绍了 Kubernetes 在 AI 集群中的调度角色。我们从 GPU 资源昂贵、多租户、训练推理混部、利用率与公平性的矛盾出发，解释了为什么 AI 集群需要比普通 Kubernetes 更强的调度能力。
+
+本章核心要点如下：
+
+\begin{itemize}
+  \item AI 集群调度不是简单分配 GPU 数量，而是要同时考虑 GPU 型号、显存、拓扑、网络、队列、优先级、SLA 和成本。
+  \item Kubernetes 的 Pod、Node、Scheduler、Device Plugin 和 Operator 构成了 GPU 集群管理的基础。
+  \item NVIDIA Device Plugin 把 GPU 暴露为 Kubernetes 扩展资源，GPU Operator 可以进一步管理驱动、监控、MIG 等组件。
+  \item MIG 适合小模型推理和多租户隔离，GPU sharing 适合低优先级或可容忍抖动的共享场景，但二者都需要谨慎处理性能隔离。
+  \item 拓扑感知调度对 TP、EP、多 rail RDMA 和多卡推理至关重要，不能只按 GPU count 调度。
+  \item 分布式训练需要 gang scheduling，避免 worker 部分启动造成 GPU 浪费。
+  \item Volcano 提供面向 batch/HPC/AI workload 的队列、gang、优先级、抢占和 backfill 等能力。
+  \item Kueue 提供 Kubernetes 原生作业队列、配额和准入控制，适合多租户 batch/AI 集群。
+  \item 推理服务编排关注 Deployment、autoscaling、bin packing、cold start、多模型共存和 SLA。
+  \item AI 集群可观测性必须跨越业务、作业、Kubernetes、GPU、网络和存储层，最终落到 cost per token 与 cost per step。
+\end{itemize}
+
+至此，本书第五篇完成了从 GPU 硬件到集群调度的完整路径：单卡计算、单机互联、多机网络、Kubernetes 调度。结合前面几篇内容，我们已经从数学、CUDA、Transformer、分布式训练、推理优化一路走到了 AI Infrastructure 的完整系统视角。后续附录将补充符号约定、CUDA 与分布式环境搭建、AI 集群上线检查清单以及参考资料索引，帮助读者把本书内容进一步落到工程实践中。

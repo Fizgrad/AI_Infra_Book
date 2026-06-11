@@ -1,0 +1,1512 @@
+\chapter{ZeRO 优化器与 DeepSpeed}
+\label{chap:zero-deepspeed}
+
+\section{ZeRO 的问题背景}
+\label{sec:zero-background}
+
+前面几章讨论了 DP、TP、PP 与 3D 并行。数据并行通过复制模型来提升吞吐；张量并行切分层内矩阵；流水线并行切分模型层；3D 并行将三者组合，解决超大模型的训练扩展问题。
+
+但即使使用 3D 并行，我们仍然会遇到一个非常现实的问题：\textbf{训练状态太大}。
+
+在大模型训练中，显存不只被模型参数占用。对于每个参数，训练系统还要保存梯度、优化器状态、可能的 FP32 master weight、通信 buffer、激活和临时 workspace。尤其使用 AdamW 时，优化器状态通常比参数本身大得多。
+
+ZeRO，全称 Zero Redundancy Optimizer，其核心目标是消除数据并行中的冗余训练状态。普通 DDP 中，每个 data parallel rank 都保存完整参数、完整梯度和完整优化器状态。ZeRO 则把这些状态在数据并行 rank 之间切分，让每个 rank 只保存一部分，从而显著降低每卡显存。
+
+从一句话理解：
+
+[
+\text{DDP: 每个 DP rank 都保存完整训练状态。}
+]
+[
+\text{ZeRO: 在 DP ranks 之间切分训练状态，减少冗余。}
+]
+
+ZeRO 并不替代数据并行。相反，它是在数据并行维度上的显存优化。ZeRO 也可以与 TP、PP、Sequence Parallel、Activation Checkpointing、CPU/NVMe Offload 等技术组合使用。
+
+\subsection{Adam 优化器状态膨胀}
+\label{subsec:adam-state-explosion}
+
+先从显存账本开始。假设模型参数量为 $N$。若使用 BF16 参数训练，参数本身占用：
+
+[
+M_{\mathrm{param}}=2N\ \mathrm{bytes}.
+]
+
+反向传播后，每个参数有对应梯度。如果梯度也使用 BF16 保存：
+
+[
+M_{\mathrm{grad}}=2N\ \mathrm{bytes}.
+]
+
+AdamW 通常维护两个 FP32 状态：
+
+[
+m_t,\quad v_t,
+]
+分别是一阶矩和二阶矩。它们各占：
+
+[
+4N\ \mathrm{bytes}.
+]
+
+很多混合精度训练还会保留 FP32 master weight，用于更稳定的优化器更新：
+
+[
+M_{\mathrm{master}}=4N\ \mathrm{bytes}.
+]
+
+因此，仅参数相关训练状态就可能达到：
+
+[
+M_{\mathrm{train\ states}}
+==========================
+
+2N
++
+2N
++
+4N
++
+4N
++
+4N
+==
+
+16N\ \mathrm{bytes}.
+]
+
+这就是常说的 AdamW 训练状态约为每参数 16 bytes。注意这个数字还没有包括 activation、临时 buffer、通信 buffer、CUDA allocator fragment、dropout mask、attention 中间结果、checkpoint buffer 等。
+
+如果模型参数量为 $7$B，则仅训练状态约为：
+
+[
+16\times 7\times 10^9
+=====================
+
+112\times 10^9\ \mathrm{bytes}
+\approx 112\ \mathrm{GB}.
+]
+
+如果模型参数量为 $70$B：
+
+[
+16\times 70\times 10^9
+======================
+
+1120\ \mathrm{GB}
+\approx 1.12\ \mathrm{TB}.
+]
+
+这说明，大模型训练中的显存压力并不只是“参数太大”，而是“参数相关状态成倍膨胀”。
+
+\begin{table}[H]
+\centering
+\small
+\caption{混合精度 AdamW 训练中常见的参数相关状态}
+\label{tab:adamw-state-memory}
+\begin{tabular}{p{0.24\textwidth}p{0.24\textwidth}p{0.18\textwidth}p{0.24\textwidth}}
+\toprule
+\textbf{状态} & \textbf{用途} & \textbf{常见 dtype} & \textbf{每参数字节数} \
+\midrule
+参数 $\theta$
+& 前向和反向计算
+& BF16 / FP16
+& 2 bytes \
+\midrule
+梯度 $\nabla\theta$
+& 反向传播结果
+& BF16 / FP16 / FP32
+& 常见 2 或 4 bytes \
+\midrule
+FP32 master weight
+& 优化器高精度更新
+& FP32
+& 4 bytes \
+\midrule
+Adam 一阶矩 $m$
+& 动量估计
+& FP32
+& 4 bytes \
+\midrule
+Adam 二阶矩 $v$
+& 方差估计
+& FP32
+& 4 bytes \
+\bottomrule
+\end{tabular}
+\end{table}
+
+如果使用 SGD，优化器状态可能更少；如果使用 Adafactor、8-bit optimizer 或其他低精度优化器，状态也可能下降。但 AdamW 仍是大模型训练中最常见的基线之一，因此理解 AdamW 状态膨胀非常重要。
+
+\subsection{DDP 中的冗余}
+\label{subsec:ddp-redundancy}
+
+普通 DDP 中，每个 data parallel rank 保存完整模型副本。假设 DP size 为 $P_{\mathrm{DP}}$，每个 rank 的参数状态为：
+
+[
+\theta^{(r)},\quad
+r=0,\ldots,P_{\mathrm{DP}}-1.
+]
+
+DDP 的不变量是所有 rank 的参数相同：
+
+[
+\theta^{(0)}=\theta^{(1)}=\cdots=\theta^{(P_{\mathrm{DP}}-1)}.
+]
+
+每个 rank 处理不同数据分片，得到本地梯度：
+
+[
+g^{(r)}.
+]
+
+然后通过 all-reduce 得到平均梯度：
+
+[
+\bar{g}
+=======
+
+\frac{1}{P_{\mathrm{DP}}}
+\sum_{r=0}^{P_{\mathrm{DP}}-1}
+g^{(r)}.
+]
+
+所有 rank 使用相同梯度更新参数，因此继续保持一致。
+
+这个设计简单可靠，但存在显存冗余。对于同一个参数张量，所有 DP ranks 都保存：
+
+\begin{itemize}
+\item 完整参数；
+\item 完整梯度；
+\item 完整优化器状态；
+\item 完整 FP32 master weight。
+\end{itemize}
+
+从数据并行角度看，这些状态是冗余的。因为所有 DP ranks 上的参数最终应该相同，优化器状态也逻辑相同。ZeRO 的核心问题是：\textbf{既然 DP ranks 之间有冗余，为什么不把这些状态分片保存？}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+rank/.style={draw, rounded corners=4pt, minimum width=2.0cm, minimum height=1.2cm, align=center, fill=blue!6},
+state/.style={draw, rounded corners=2pt, minimum width=1.55cm, minimum height=0.35cm, align=center, fill=orange!14},
+arrow/.style={-{Latex[length=2.2mm]}, thick}
+]
+
+```
+\node[font=\bfseries] at (0,3.25) {DDP 中每个 rank 保存完整训练状态};
+
+\foreach \i/\x in {0/-4.5,1/-1.5,2/1.5,3/4.5} {
+  \node[rank] (r\i) at (\x,1.1) {DP Rank \i};
+  \node[state] at (\x,1.45) {params};
+  \node[state] at (\x,1.05) {grads};
+  \node[state] at (\x,0.65) {optimizer};
+}
+
+\draw[<->, thick, red!70] (-3.5,-0.15) -- (3.5,-0.15)
+  node[midway,below=4pt] {gradient all-reduce};
+
+\node[align=left, text width=10.5cm] at (0,-1.6) {
+  DDP 的简单性来自完整复制：每个 rank 都有完整模型和完整优化器状态。
+  但这种复制使显存随 DP size 线性重复，而不是被 DP size 分摊。
+};
+```
+
+\end{tikzpicture}
+\caption{DDP 中参数、梯度和优化器状态的冗余复制}
+\label{fig:ddp-redundant-states}
+\end{figure}
+
+\subsection{ZeRO 的核心思想}
+\label{subsec:zero-core-idea}
+
+ZeRO 将训练状态分为三类：
+
+\begin{itemize}
+\item Optimizer States；
+\item Gradients；
+\item Parameters。
+\end{itemize}
+
+然后分阶段将这些状态在 data parallel ranks 之间切分。
+
+[
+\text{ZeRO Stage 1: partition optimizer states}
+]
+[
+\text{ZeRO Stage 2: partition optimizer states + gradients}
+]
+[
+\text{ZeRO Stage 3: partition optimizer states + gradients + parameters}
+]
+
+如果 DP size 为 $P_{\mathrm{DP}}$，被切分的状态理想情况下每卡下降为：
+
+[
+\frac{1}{P_{\mathrm{DP}}}.
+]
+
+这种思想与 TP/PP 不同。TP/PP 是模型并行，切的是层内矩阵或模型层；ZeRO 是数据并行维度上的状态分片，切的是 DP replica 之间原本冗余的训练状态。
+
+可以把 ZeRO 看作对 DDP 的显存账本重写：
+
+[
+M_{\mathrm{DDP}}
+================
+
+M_{\theta}
++
+M_g
++
+M_{\mathrm{optim}},
+]
+
+[
+M_{\mathrm{ZeRO1}}
+==================
+
+M_{\theta}
++
+M_g
++
+\frac{M_{\mathrm{optim}}}{P_{\mathrm{DP}}},
+]
+
+[
+M_{\mathrm{ZeRO2}}
+==================
+
+M_{\theta}
++
+\frac{M_g}{P_{\mathrm{DP}}}
++
+\frac{M_{\mathrm{optim}}}{P_{\mathrm{DP}}},
+]
+
+[
+M_{\mathrm{ZeRO3}}
+==================
+
+\frac{M_{\theta}}{P_{\mathrm{DP}}}
++
+\frac{M_g}{P_{\mathrm{DP}}}
++
+\frac{M_{\mathrm{optim}}}{P_{\mathrm{DP}}}
++
+M_{\mathrm{gather\ buffers}}.
+]
+
+这里 $M_{\mathrm{gather\ buffers}}$ 是 Stage 3 中为了计算某层而临时 all-gather 参数所需的显存。Stage 3 显存最低，但通信和实现复杂度最高。
+
+\section{ZeRO Stage 1}
+\label{sec:zero-stage1}
+
+ZeRO Stage 1 切分优化器状态，但参数和梯度仍然在每个 DP rank 上完整保存。它是 ZeRO 中最容易理解、通信变化相对较小的一档。
+
+\subsection{partition optimizer states}
+\label{subsec:zero1-partition-optimizer-states}
+
+假设模型参数为：
+
+[
+\theta=
+{\theta_0,\theta_1,\ldots,\theta_{K-1}}.
+]
+
+在 DDP 中，每个 rank 保存所有参数的 Adam 状态：
+
+[
+{m_i,v_i,\theta_{master,i}}_{i=0}^{K-1}.
+]
+
+ZeRO Stage 1 将这些 optimizer states 按参数分片给不同 DP ranks。若 $P_{\mathrm{DP}}=4$，则 rank 0 可能负责参数 0 到 25% 的 optimizer states，rank 1 负责 25% 到 50%，以此类推。
+
+每个 rank 仍然保存完整参数 $\theta$ 和完整梯度 $g$，但只保存自己负责参数分片的优化器状态：
+
+[
+\mathcal{O}^{(r)}
+=================
+
+{m_i,v_i,\theta_{master,i}\mid i\in\mathcal{I}_r}.
+]
+
+其中 $\mathcal{I}_r$ 是 rank $r$ 负责的参数索引集合。
+
+优化器 step 时，每个 rank 只更新自己负责的参数 shard：
+
+[
+\theta_{\mathcal{I}*r}
+\leftarrow
+\operatorname{AdamWUpdate}
+(
+\theta*{\mathcal{I}*r},
+g*{\mathcal{I}*r},
+m*{\mathcal{I}*r},
+v*{\mathcal{I}_r}
+).
+]
+
+更新完成后，需要让所有 DP ranks 得到完整、最新的参数。因为 Stage 1 中参数仍然是 replicated 的，所以更新后的参数 shards 需要同步到所有 ranks。这个同步可以通过 all-gather、broadcast 或等价的通信实现。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+rank/.style={draw, rounded corners=4pt, minimum width=2.0cm, minimum height=1.4cm, align=center, fill=blue!6},
+full/.style={draw, rounded corners=2pt, minimum width=1.55cm, minimum height=0.35cm, align=center, fill=orange!14},
+shard/.style={draw, rounded corners=2pt, minimum width=1.55cm, minimum height=0.35cm, align=center, fill=green!12}
+]
+
+```
+\node[font=\bfseries] at (0,3.35) {ZeRO Stage 1：切分优化器状态};
+
+\foreach \i/\x in {0/-4.5,1/-1.5,2/1.5,3/4.5} {
+  \node[rank] at (\x,1.2) {Rank \i};
+  \node[full] at (\x,1.65) {full params};
+  \node[full] at (\x,1.2) {full grads};
+  \node[shard] at (\x,0.75) {optim shard};
+}
+
+\node[align=left, text width=10.5cm] at (0,-0.95) {
+  Stage 1 只切分 optimizer states。参数和梯度仍然完整复制，因此实现相对简单。
+  显存收益主要来自 Adam 状态和 master weight 的分片。
+};
+```
+
+\end{tikzpicture}
+\caption{ZeRO Stage 1 的状态分片方式}
+\label{fig:zero-stage1-states}
+\end{figure}
+
+\subsection{显存节省}
+\label{subsec:zero1-memory-saving}
+
+设参数使用 BF16，梯度使用 BF16，FP32 master weight、Adam $m$、Adam $v$ 各 4 bytes。DDP 每参数训练状态约为：
+
+[
+2+2+4+4+4=16\ \mathrm{bytes}.
+]
+
+ZeRO Stage 1 中，参数和梯度仍完整保存：
+
+[
+M_{\theta}=2N,
+\quad
+M_g=2N.
+]
+
+优化器相关状态为：
+
+[
+M_{\mathrm{optim}}=12N,
+]
+
+并被 $P_{\mathrm{DP}}$ 分片：
+
+[
+M_{\mathrm{optim,perGPU}}
+=========================
+
+\frac{12N}{P_{\mathrm{DP}}}.
+]
+
+因此每卡参数相关状态约为：
+
+[
+M_{\mathrm{ZeRO1}}
+==================
+
+4N+\frac{12N}{P_{\mathrm{DP}}}.
+]
+
+当 $P_{\mathrm{DP}}=8$ 时：
+
+[
+M_{\mathrm{ZeRO1}}
+==================
+
+# 4N+\frac{12N}{8}
+
+5.5N\ \mathrm{bytes}.
+]
+
+相比 DDP 的 $16N$：
+
+[
+\frac{5.5}{16}
+\approx 34.4%.
+]
+
+这已经是非常明显的显存节省。
+
+\subsection{通信特征}
+\label{subsec:zero1-communication}
+
+Stage 1 的通信主要包括两部分：
+
+\begin{itemize}
+\item backward 后仍然需要梯度同步；
+\item optimizer step 后需要同步更新后的参数。
+\end{itemize}
+
+由于参数和梯度在每个 rank 上完整存在，Stage 1 与 DDP 在训练流程上比较接近。它的主要复杂度在 optimizer step：每个 rank 只更新自己负责的参数分片，因此更新结果需要传播给所有 rank。
+
+Stage 1 的优点是显存收益大、实现相对容易；缺点是梯度仍然完整保存，参数也完整复制，显存节省有上限。
+
+\section{ZeRO Stage 2}
+\label{sec:zero-stage2}
+
+ZeRO Stage 2 在 Stage 1 的基础上进一步切分梯度。它保存完整参数，但优化器状态和梯度都在 DP ranks 之间分片。
+
+\subsection{partition gradients}
+\label{subsec:zero2-partition-gradients}
+
+DDP 的梯度同步通常是 all-reduce。每个 rank 输入完整梯度，输出完整平均梯度。ZeRO Stage 2 的目标是：既然每个参数分片的优化器状态只在某个 rank 上，那么该参数分片的梯度也只需要被那个 rank 保存和用于更新。
+
+因此 Stage 2 用 reduce-scatter 替代完整 all-reduce。对完整梯度 $g$，按参数维切分为：
+
+[
+g=[g_0,g_1,\ldots,g_{P_{\mathrm{DP}}-1}].
+]
+
+每个 rank 本地计算完整梯度贡献 $g^{(r)}$，然后 reduce-scatter：
+
+[
+\bar{g}_r
+=========
+
+\frac{1}{P_{\mathrm{DP}}}
+\sum_{q=0}^{P_{\mathrm{DP}}-1}
+g_r^{(q)}.
+]
+
+最终 rank $r$ 只获得自己负责的平均梯度 shard $\bar{g}_r$，而不是完整平均梯度。
+
+这与 DDP all-reduce 的区别是：
+
+[
+\operatorname{AllReduce}
+========================
+
+\operatorname{ReduceScatter}
++
+\operatorname{AllGather}.
+]
+
+DDP 做完整 all-reduce，相当于 reduce-scatter 后再 all-gather，让所有 rank 拿到完整梯度。ZeRO Stage 2 只需要 reduce-scatter，因为每个 rank 只需要自己负责的梯度分片来更新对应参数。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+rank/.style={draw, rounded corners=4pt, minimum width=2.0cm, minimum height=1.35cm, align=center, fill=blue!6},
+full/.style={draw, rounded corners=2pt, minimum width=1.55cm, minimum height=0.35cm, align=center, fill=orange!14},
+shard/.style={draw, rounded corners=2pt, minimum width=1.55cm, minimum height=0.35cm, align=center, fill=green!12}
+]
+
+```
+\node[font=\bfseries] at (0,3.35) {ZeRO Stage 2：切分优化器状态与梯度};
+
+\foreach \i/\x in {0/-4.5,1/-1.5,2/1.5,3/4.5} {
+  \node[rank] at (\x,1.2) {Rank \i};
+  \node[full] at (\x,1.65) {full params};
+  \node[shard] at (\x,1.2) {grad shard};
+  \node[shard] at (\x,0.75) {optim shard};
+}
+
+\node[align=left, text width=10.5cm] at (0,-0.95) {
+  Stage 2 使用 reduce-scatter 聚合梯度，每个 rank 只保留自己负责的梯度 shard。
+  参数仍然完整复制，因此 forward/backward 不需要频繁 all-gather 参数。
+};
+```
+
+\end{tikzpicture}
+\caption{ZeRO Stage 2 的状态分片方式}
+\label{fig:zero-stage2-states}
+\end{figure}
+
+\subsection{reduce-scatter}
+\label{subsec:zero2-reduce-scatter}
+
+Reduce-scatter 的语义是：所有 ranks 输入相同 shape 的 tensor，先按元素规约求和，再把结果分片散发给不同 ranks。
+
+对于 $P$ 个 ranks，每个 rank 输入：
+
+[
+\mat{G}^{(r)}\in\mathbb{R}^{N}.
+]
+
+Reduce-scatter 后，rank $r$ 得到：
+
+[
+\mat{Y}^{(r)}
+=============
+
+\left[
+\sum_{q=0}^{P-1}\mat{G}^{(q)}
+\right]_{\mathrm{shard}\ r}.
+]
+
+如果需要平均梯度，再除以 $P$。
+
+与 all-reduce 相比，reduce-scatter 的输出大小只有原来的：
+
+[
+\frac{1}{P}.
+]
+
+这直接降低了每 rank 保存梯度的显存。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+chunk/.style={draw, rounded corners=2pt, minimum width=0.65cm, minimum height=0.38cm, align=center},
+rank/.style={draw, rounded corners=3pt, minimum width=1.5cm, minimum height=0.55cm, align=center, fill=blue!6},
+op/.style={draw, rounded corners=4pt, minimum width=2.1cm, minimum height=0.7cm, align=center, fill=orange!14},
+arrow/.style={-{Latex[length=2.1mm]}, thick}
+]
+
+```
+\node[font=\bfseries] at (0,3.25) {Reduce-Scatter：规约后只保留本 rank 的 shard};
+
+\foreach \i/\x in {0/-4.5,1/-1.5,2/1.5,3/4.5} {
+  \node[rank] (r\i) at (\x,1.65) {Rank \i};
+  \foreach \j/\dx/\col in {0/-0.45/red!12,1/-0.15/green!12,2/0.15/purple!12,3/0.45/yellow!18} {
+    \node[chunk, fill=\col] at (\x+\dx,1.05) {};
+  }
+}
+
+\node[op] (rs) at (0,0.0) {ReduceScatter\\sum + shard};
+
+\foreach \i in {0,1,2,3} {
+  \draw[arrow] (r\i) -- (rs);
+}
+
+\foreach \i/\x/\col in {0/-4.5/red!12,1/-1.5/green!12,2/1.5/purple!12,3/4.5/yellow!18} {
+  \node[rank] (out\i) at (\x,-1.25) {Rank \i};
+  \node[chunk, fill=\col, minimum width=1.1cm] at (\x,-1.85) {reduced shard};
+  \draw[arrow] (rs) -- (out\i);
+}
+
+\node[align=left, text width=10.5cm] at (0,-2.75) {
+  Stage 2 不需要每个 rank 保存完整平均梯度。
+  Reduce-scatter 直接把规约后的梯度分片交给对应 optimizer shard 的 owner rank。
+};
+```
+
+\end{tikzpicture}
+\caption{ZeRO Stage 2 中 reduce-scatter 梯度聚合}
+\label{fig:zero2-reduce-scatter}
+\end{figure}
+
+\subsection{显存节省}
+\label{subsec:zero2-memory-saving}
+
+Stage 2 中，参数完整保存，梯度和优化器状态分片。若仍使用 BF16 参数和梯度、FP32 master/m/v，则：
+
+[
+M_{\theta}=2N.
+]
+
+梯度分片：
+
+[
+M_g=\frac{2N}{P_{\mathrm{DP}}}.
+]
+
+优化器状态分片：
+
+[
+M_{\mathrm{optim}}=\frac{12N}{P_{\mathrm{DP}}}.
+]
+
+所以：
+
+[
+M_{\mathrm{ZeRO2}}
+==================
+
+2N+\frac{14N}{P_{\mathrm{DP}}}.
+]
+
+当 $P_{\mathrm{DP}}=8$：
+
+[
+M_{\mathrm{ZeRO2}}
+==================
+
+# 2N+\frac{14N}{8}
+
+3.75N\ \mathrm{bytes}.
+]
+
+相比 DDP 的 $16N$：
+
+[
+\frac{3.75}{16}
+\approx 23.4%.
+]
+
+Stage 2 比 Stage 1 进一步节省了梯度显存，但参数仍然完整复制，因此显存下限仍有参数本身的 $2N$。
+
+\subsection{通信特征}
+\label{subsec:zero2-communication}
+
+Stage 2 的 backward 梯度同步使用 reduce-scatter，而不是 all-reduce。通信量与 DDP all-reduce 同量级，但输出显存更小，并且不需要完整梯度 all-gather。
+
+不过，由于参数仍然完整复制，optimizer step 后仍然需要让所有 ranks 获得一致的参数。这通常涉及将更新后的参数 shard 同步回所有 ranks。
+
+Stage 2 的优点是：
+
+\begin{itemize}
+\item 显存比 Stage 1 更低；
+\item forward/backward 不需要按层 all-gather 参数；
+\item 比 Stage 3 通信模式简单；
+\item 适合许多中等到大型模型训练。
+\end{itemize}
+
+Stage 2 的缺点是：
+
+\begin{itemize}
+\item 参数仍然完整复制，模型非常大时仍可能放不下；
+\item optimizer step 后参数同步仍有成本；
+\item 与 TP/PP 组合时，梯度分片 owner 必须与参数 shard 映射一致。
+\end{itemize}
+
+\section{ZeRO Stage 3}
+\label{sec:zero-stage3}
+
+ZeRO Stage 3 是最彻底的一档。它将优化器状态、梯度和参数都在 DP ranks 之间分片。每个 rank 只保存一部分参数。需要某层参数参与 forward/backward 时，再临时 all-gather 该层参数，用完后释放。
+
+Stage 3 的显存最低，但通信最复杂，也最依赖实现质量。
+
+\subsection{partition parameters}
+\label{subsec:zero3-partition-parameters}
+
+Stage 3 中，每个参数张量也被切分到 DP ranks 上。设参数向量化后为：
+
+[
+\theta=[\theta_0,\theta_1,\ldots,\theta_{P_{\mathrm{DP}}-1}].
+]
+
+Rank $r$ 只常驻保存：
+
+[
+\theta_r.
+]
+
+这意味着在任意时刻，单个 rank 不再拥有完整模型参数。为了执行某一层的 forward，需要把该层参数从各 DP ranks all-gather 到当前计算 rank 组中。
+
+对于某层权重 $\mat{W}^{(\ell)}$：
+
+[
+\mat{W}^{(\ell)}
+================
+
+\operatorname{AllGather}
+(
+\mat{W}^{(\ell)}*0,
+\mat{W}^{(\ell)}*1,
+\ldots,
+\mat{W}^{(\ell)}*{P*{\mathrm{DP}}-1}
+).
+]
+
+Forward 使用完整 $\mat{W}^{(\ell)}$ 计算。Backward 也需要对应参数用于梯度计算。用完后，可以释放完整参数，只保留本 rank 的 shard。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+rank/.style={draw, rounded corners=4pt, minimum width=2.0cm, minimum height=1.45cm, align=center, fill=blue!6},
+shard/.style={draw, rounded corners=2pt, minimum width=1.5cm, minimum height=0.35cm, align=center, fill=green!12},
+temp/.style={draw, rounded corners=2pt, minimum width=1.5cm, minimum height=0.35cm, align=center, fill=orange!14},
+op/.style={draw, rounded corners=4pt, minimum width=2.4cm, minimum height=0.65cm, align=center, fill=purple!10},
+arrow/.style={-{Latex[length=2.1mm]}, thick}
+]
+
+```
+\node[font=\bfseries] at (0,3.45) {ZeRO Stage 3：参数也被分片，计算前临时 AllGather};
+
+\foreach \i/\x in {0/-4.5,1/-1.5,2/1.5,3/4.5} {
+  \node[rank] (r\i) at (\x,1.55) {Rank \i};
+  \node[shard] at (\x,1.95) {param shard};
+  \node[shard] at (\x,1.55) {grad shard};
+  \node[shard] at (\x,1.15) {optim shard};
+}
+
+\node[op] (ag) at (0,0.15) {AllGather layer params};
+
+\foreach \i in {0,1,2,3} {
+  \draw[arrow] (r\i) -- (ag);
+}
+
+\foreach \i/\x in {0/-4.5,1/-1.5,2/1.5,3/4.5} {
+  \node[temp] at (\x,-0.95) {full layer temp};
+  \draw[arrow] (ag) -- (\x,-0.7);
+}
+
+\node[align=left, text width=10.5cm] at (0,-2.2) {
+  Stage 3 常驻状态都是 sharded 的。某层计算前临时聚合完整参数，用完后释放。
+  因此显存最低，但 forward/backward 中会出现频繁参数 all-gather。
+};
+```
+
+\end{tikzpicture}
+\caption{ZeRO Stage 3 的参数分片与临时 all-gather}
+\label{fig:zero-stage3-param-gather}
+\end{figure}
+
+\subsection{all-gather 参数}
+\label{subsec:zero3-allgather-parameters}
+
+Stage 3 的关键性能问题是参数 all-gather。如果每一层都在使用前同步等待参数聚合，GPU 会大量空等。高性能实现必须做：
+
+\begin{itemize}
+\item \textbf{bucketed all-gather}：把多个小参数合并成较大 bucket；
+\item \textbf{prefetch}：在当前层计算时提前聚合后续层参数；
+\item \textbf{release}：某层参数不再需要时尽快释放完整副本；
+\item \textbf{reuse distance 控制}：对即将再次使用的参数暂时保留，避免反复 gather；
+\item \textbf{overlap communication and computation}：尽量隐藏参数 all-gather 时间。
+\end{itemize}
+
+Stage 3 的 forward 可以抽象为：
+
+[
+\text{prefetch params of layer }\ell+1,
+]
+[
+\text{gather params of layer }\ell,
+]
+[
+\text{compute layer }\ell,
+]
+[
+\text{release params of layer }\ell-k.
+]
+
+Backward 也类似，但方向相反。由于 backward 需要参数计算梯度，参数释放时机要特别小心。
+
+下面给出一个简化的 ZeRO-3 forward 伪代码。
+
+\begin{lstlisting}[language=Python,caption={ZeRO Stage 3 forward 中参数 gather/prefetch/release 的伪代码},label={lst:zero3-forward-pseudocode}]
+def zero3_forward(layers, input_tensor, param_manager):
+x = input_tensor
+
+```
+for layer_id, layer in enumerate(layers):
+    # Start prefetching future layer parameters if possible.
+    if layer_id + 1 < len(layers):
+        param_manager.prefetch(layer_id + 1)
+
+    # Ensure current layer parameters are available.
+    param_manager.all_gather(layer_id)
+
+    # Compute with full temporary parameters.
+    x = layer.forward(x)
+
+    # Release parameters that will not be reused soon.
+    param_manager.release_if_safe(layer_id)
+
+return x
+```
+
+\end{lstlisting}
+
+真实实现要处理 autograd、backward、参数生命周期、gradient hooks、bucket、CUDA stream、通信 group、CPU/NVMe offload 和异常恢复，复杂度远高于这段伪代码。
+
+\subsection{显存节省}
+\label{subsec:zero3-memory-saving}
+
+Stage 3 中，参数、梯度、优化器状态都被 DP size 分片。理想情况下，每参数常驻显存约为：
+
+[
+M_{\mathrm{ZeRO3,resident}}
+===========================
+
+\frac{16N}{P_{\mathrm{DP}}}.
+]
+
+但这只是常驻状态。计算时需要临时聚合某些层的参数，因此要加上 gather buffer：
+
+[
+M_{\mathrm{ZeRO3}}
+==================
+
+\frac{16N}{P_{\mathrm{DP}}}
++
+M_{\mathrm{param\ gather}}
++
+M_{\mathrm{activations}}
++
+M_{\mathrm{buffers}}.
+]
+
+如果 all-gather bucket 太大，$M_{\mathrm{param\ gather}}$ 会很高；bucket 太小，通信效率下降。因此 Stage 3 的性能高度依赖 bucket 配置和参数生命周期管理。
+
+当 $P_{\mathrm{DP}}=8$ 时，常驻参数相关状态理论上为：
+
+[
+\frac{16N}{8}=2N\ \mathrm{bytes}.
+]
+
+这非常低，甚至接近原始 BF16 参数大小。但 Stage 3 的通信代价也最高。
+
+\subsection{通信特征}
+\label{subsec:zero3-communication}
+
+Stage 3 的通信包括：
+
+\begin{itemize}
+\item forward 前参数 all-gather；
+\item backward 前或 backward 中参数 all-gather；
+\item backward 后梯度 reduce-scatter；
+\item optimizer step 只更新本地 shard；
+\item 可能的参数 prefetch 和释放；
+\item 若使用 offload，还包含 GPU 与 CPU/NVMe 之间的数据搬运。
+\end{itemize}
+
+Stage 3 的通信量可能很大，但它允许训练远超单卡显存限制的模型。它非常适合以下场景：
+
+\begin{itemize}
+\item 模型太大，Stage 1/2 仍放不下；
+\item DP size 足够大，可以有效分摊参数；
+\item 网络带宽较好；
+\item 实现支持通信计算重叠；
+\item 可以接受一定训练吞吐下降换取显存可行性。
+\end{itemize}
+
+Stage 3 不适合盲目开启。对于能用 Stage 1/2 或 FSDP 更简单配置跑起来的模型，Stage 3 可能因为参数 all-gather 造成额外开销。工程上常见做法是：先用较低 stage 满足显存，再逐步提高 stage，而不是一开始就默认使用 Stage 3。
+
+\section{DeepSpeed 实践}
+\label{sec:deepspeed-practice}
+
+DeepSpeed 是围绕大模型训练和推理构建的一套系统工具，其中 ZeRO 是其最著名的训练优化之一。本节不介绍安装细节，而关注 DeepSpeed 配置与训练系统设计思想。
+
+DeepSpeed 典型使用方式是：用户定义 PyTorch 模型、优化器和数据，然后通过 DeepSpeed engine 接管分布式训练、混合精度、ZeRO 分片、梯度累积、通信和 checkpoint。
+
+\subsection{DeepSpeed engine}
+\label{subsec:deepspeed-engine}
+
+普通 PyTorch 训练循环大致是：
+
+\begin{lstlisting}[language=Python,caption={普通 PyTorch 训练循环的抽象形式},label={lst:normal-pytorch-loop}]
+for batch in dataloader:
+optimizer.zero_grad()
+output = model(batch)
+loss = loss_fn(output, batch["labels"])
+loss.backward()
+optimizer.step()
+\end{lstlisting}
+
+DeepSpeed 会把模型、优化器、scheduler 包装到 engine 中。训练循环变为：
+
+\begin{lstlisting}[language=Python,caption={DeepSpeed engine 训练循环的抽象形式},label={lst:deepspeed-engine-loop}]
+import deepspeed
+
+model_engine, optimizer, _, scheduler = deepspeed.initialize(
+model=model,
+model_parameters=model.parameters(),
+config=ds_config,
+)
+
+for batch in dataloader:
+output = model_engine(batch)
+loss = compute_loss(output, batch["labels"])
+
+```
+model_engine.backward(loss)
+model_engine.step()
+```
+
+\end{lstlisting}
+
+这看起来只是把 \texttt{loss.backward()} 换成 \texttt{model_engine.backward(loss)}，把 \texttt{optimizer.step()} 换成 \texttt{model_engine.step()}。但背后发生了大量事情：
+
+\begin{itemize}
+\item 按配置启用 ZeRO Stage；
+\item 管理参数、梯度、优化器状态分片；
+\item 处理 gradient accumulation；
+\item 执行 mixed precision；
+\item 管理通信 bucket；
+\item 在 backward hook 中触发 reduce-scatter；
+\item Stage 3 中进行参数 all-gather/prefetch/release；
+\item 管理 checkpoint 保存与加载；
+\item 与分布式 process group 协作。
+\end{itemize}
+
+DeepSpeed engine 的价值在于把这些复杂逻辑封装起来，让用户仍能以相对接近 PyTorch 的方式写训练代码。
+
+\subsection{配置文件}
+\label{subsec:deepspeed-config}
+
+DeepSpeed 的核心行为由 JSON 配置控制。下面是一个简化 ZeRO Stage 2 配置：
+
+\begin{lstlisting}[language=json,caption={DeepSpeed ZeRO Stage 2 配置示例},label={lst:deepspeed-zero2-config}]
+{
+"train_batch_size": 1024,
+"train_micro_batch_size_per_gpu": 1,
+"gradient_accumulation_steps": 128,
+
+"bf16": {
+"enabled": true
+},
+
+"optimizer": {
+"type": "AdamW",
+"params": {
+"lr": 3e-4,
+"betas": [0.9, 0.95],
+"eps": 1e-8,
+"weight_decay": 0.1
+}
+},
+
+"zero_optimization": {
+"stage": 2,
+"reduce_scatter": true,
+"allgather_partitions": true,
+"allgather_bucket_size": 500000000,
+"reduce_bucket_size": 500000000,
+"overlap_comm": true,
+"contiguous_gradients": true
+},
+
+"gradient_clipping": 1.0,
+"steps_per_print": 100
+}
+\end{lstlisting}
+
+几个字段需要特别理解：
+
+\begin{itemize}
+\item \texttt{train_batch_size}：全局 batch size；
+\item \texttt{train_micro_batch_size_per_gpu}：每 GPU micro-batch；
+\item \texttt{gradient_accumulation_steps}：梯度累积步数；
+\item \texttt{bf16.enabled}：使用 BF16 混合精度；
+\item \texttt{zero_optimization.stage}：ZeRO stage；
+\item \texttt{reduce_bucket_size}：reduce-scatter 或 all-reduce bucket 大小；
+\item \texttt{allgather_bucket_size}：all-gather bucket 大小；
+\item \texttt{overlap_comm}：尝试通信计算重叠；
+\item \texttt{contiguous_gradients}：将梯度放到连续 buffer，减少碎片和小通信。
+\end{itemize}
+
+DeepSpeed 配置不是越激进越好。Bucket 太大可能增加显存峰值和延迟；bucket 太小可能通信效率差。开启 overlap 后，也可能因通信和计算争抢 GPU/NIC 资源而收益不稳定。实际需要结合 profiler 调优。
+
+\subsection{ZeRO Offload}
+\label{subsec:zero-offload}
+
+ZeRO Offload 将部分训练状态从 GPU 显存 offload 到 CPU 内存，甚至 NVMe。它的动机是：GPU HBM 很快但容量有限；CPU 内存容量大但带宽和延迟较差；NVMe 容量更大但更慢。
+
+可以把存储层级粗略排序为：
+
+[
+\text{HBM}
+
+>
+
+\text{CPU DRAM}
+
+>
+
+\text{NVMe SSD}.
+]
+
+其中 $>$ 表示带宽更高、延迟更低。Offload 的目标是用更慢但更大的存储扩展可训练模型规模。
+
+ZeRO Offload 常见对象包括：
+
+\begin{itemize}
+\item optimizer states；
+\item gradients；
+\item parameters；
+\item temporary buffers。
+\end{itemize}
+
+一个简化 Stage 2 + optimizer offload 配置：
+
+\begin{lstlisting}[language=json,caption={DeepSpeed ZeRO Offload 配置示例},label={lst:deepspeed-zero-offload-config}]
+{
+"bf16": {
+"enabled": true
+},
+
+"zero_optimization": {
+"stage": 2,
+"offload_optimizer": {
+"device": "cpu",
+"pin_memory": true
+},
+"contiguous_gradients": true,
+"overlap_comm": true,
+"reduce_scatter": true
+},
+
+"optimizer": {
+"type": "AdamW",
+"params": {
+"lr": 3e-4,
+"betas": [0.9, 0.95],
+"eps": 1e-8,
+"weight_decay": 0.1
+}
+}
+}
+\end{lstlisting}
+
+Offload 的收益是降低 HBM 占用；代价是增加 PCIe/NVLink-C2C/CPU 内存通路的数据搬运。如果 offload 数据无法与计算重叠，训练会明显变慢。因此 Offload 更适合显存极其紧张、愿意用吞吐换可行性的场景。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+level/.style={draw, rounded corners=4pt, minimum width=3.2cm, minimum height=0.75cm, align=center},
+arrow/.style={-{Latex[length=2.2mm]}, thick}
+]
+
+```
+\node[font=\bfseries] at (0,3.3) {ZeRO Offload 的存储层级};
+
+\node[level, fill=blue!8] (hbm) at (0,2.05) {GPU HBM\\fast, small};
+\node[level, fill=green!10] (dram) at (0,0.85) {CPU DRAM\\larger, slower};
+\node[level, fill=orange!14] (nvme) at (0,-0.35) {NVMe SSD\\very large, much slower};
+
+\draw[arrow] (hbm) -- node[right] {offload / prefetch} (dram);
+\draw[arrow] (dram) -- node[right] {spill / load} (nvme);
+
+\node[align=left, text width=10.5cm] at (0,-1.95) {
+  Offload 使用更大但更慢的存储扩展可训练模型规模。
+  关键是预取、异步搬运和计算重叠，否则 PCIe/NVMe 会成为训练瓶颈。
+};
+```
+
+\end{tikzpicture}
+\caption{ZeRO Offload 中 GPU、CPU 与 NVMe 的层级关系}
+\label{fig:zero-offload-memory-hierarchy}
+\end{figure}
+
+\subsection{ZeRO-Infinity}
+\label{subsec:zero-infinity}
+
+ZeRO-Infinity 可以理解为 ZeRO-Offload 思想的进一步扩展：不仅使用 CPU 内存，也使用 NVMe 来支持更大模型训练。它需要更精细的内存调度，包括：
+
+\begin{itemize}
+\item 分层参数管理；
+\item CPU/NVMe 异步预取；
+\item 计算与数据搬运重叠；
+\item buffer 池管理；
+\item 带宽感知调度；
+\item 分片 checkpoint 与状态恢复。
+\end{itemize}
+
+从系统角度看，ZeRO-Infinity 把大模型训练从“GPU 显存管理”扩展为“分层存储系统调度”。如果数据在需要时还没有从 NVMe 加载到 CPU，再从 CPU 传到 GPU，GPU 就会空等。要让它高效，需要提前预测未来层需要哪些参数，并提前搬运。
+
+这种思想与操作系统中的 paging 有相似之处，但难度更高，因为深度学习训练对吞吐和同步非常敏感。一次 page miss 就可能拖慢整个 step。
+
+\subsection{配置调优项}
+\label{subsec:deepspeed-tuning-knobs}
+
+DeepSpeed ZeRO 常见调优项包括：
+
+\begin{itemize}
+\item \texttt{stage}：选择 ZeRO stage；
+\item \texttt{reduce_bucket_size}：梯度 reduce bucket；
+\item \texttt{allgather_bucket_size}：参数或状态 all-gather bucket；
+\item \texttt{overlap_comm}：是否重叠通信与计算；
+\item \texttt{contiguous_gradients}：是否使用连续梯度 buffer；
+\item \texttt{offload_optimizer.device}：optimizer offload 到 CPU 或 NVMe；
+\item \texttt{offload_param.device}：Stage 3 参数 offload；
+\item \texttt{prefetch_bucket_size}：Stage 3 参数预取大小；
+\item \texttt{param_persistence_threshold}：小参数是否持久保留；
+\item \texttt{max_live_parameters}：控制同时驻留参数数量；
+\item \texttt{max_reuse_distance}：控制参数复用距离。
+\end{itemize}
+
+这些参数本质上控制三个东西：
+
+[
+\text{显存峰值},
+\quad
+\text{通信效率},
+\quad
+\text{计算等待时间}.
+]
+
+例如增大 bucket size 通常提升通信带宽利用率，但也增加显存峰值和等待时间；减小 bucket size 可以更早发起通信，但小消息开销上升。参数持久化可以减少重复 all-gather，但会增加常驻显存。Offload 可以降低 HBM，但可能引入 PCIe/NVMe 瓶颈。
+
+因此 ZeRO 调优不是简单套模板，而是通过 profiler 观察瓶颈后做取舍。
+
+\section{ZeRO 与 3D 并行的组合}
+\label{sec:zero-with-3d-parallelism}
+
+ZeRO 经常与 TP、PP、DP 组合。理解组合方式非常关键，否则容易误以为 ZeRO 会在所有 GPU 之间切分状态。实际上，ZeRO 主要沿数据并行维度切分状态。
+
+\subsection{ZeRO 沿 DP 维切分}
+\label{subsec:zero-shards-along-dp}
+
+在 3D 并行中，一个全局 rank 有坐标：
+
+[
+(d,t,p).
+]
+
+ZeRO 的分片通常发生在相同 $(t,p)$、不同 $d$ 的 DP group 内。也就是说，rank：
+
+[
+(0,t,p),(1,t,p),\ldots,(P_{\mathrm{DP}}-1,t,p)
+]
+
+共同切分同一个 TP shard、同一个 PP stage 的训练状态。
+
+这是因为不同 TP rank 保存的是不同 tensor shard，不同 PP rank 保存的是不同 layers。只有 DP rank 之间才是同一模型 shard 的副本。ZeRO 消除的是这些 DP 副本之间的冗余。
+
+[
+\text{ZeRO group}
+=================
+
+\text{DP group for fixed }(t,p).
+]
+
+如果把 ZeRO 错误地跨 TP 或 PP 维度切分，就会破坏模型并行语义。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+rank/.style={draw, circle, minimum size=0.72cm, align=center, fill=blue!8},
+zline/.style={thick, green!60!black, dotted},
+tpbox/.style={draw, rounded corners=4pt, dashed, thick, fill=orange!5}
+]
+
+```
+\node[font=\bfseries] at (0,3.2) {ZeRO 在固定 TP/PP 坐标的 DP group 内切分};
+
+\foreach \d/\dx in {0/0,1/0.55} {
+  \foreach \p/\py in {0/0,1/0.9,2/1.8} {
+    \foreach \t/\tx in {0/0,1/1.15} {
+      \pgfmathsetmacro{\x}{-3.5+\tx+\dx*3.2}
+      \pgfmathsetmacro{\y}{-0.4+\py}
+      \node[rank] (r\d\t\p) at (\x,\y) {$d\d$};
+    }
+  }
+}
+
+\draw[zline] (r000) -- (r100);
+\draw[zline] (r010) -- (r110);
+\draw[zline] (r001) -- (r101);
+\draw[zline] (r011) -- (r111);
+\draw[zline] (r002) -- (r102);
+\draw[zline] (r012) -- (r112);
+
+\node[tpbox, fit=(r000)(r010), label={[font=\scriptsize]above:TP group at d0,p0}] {};
+\node[tpbox, fit=(r100)(r110), label={[font=\scriptsize]above:TP group at d1,p0}] {};
+
+\node[align=left, text width=10.5cm] at (0,-1.75) {
+  绿色点线表示 ZeRO/DP 分片 group：固定 TP rank 和 PP stage，只沿 DP replica 方向切分训练状态。
+  TP 和 PP 维度仍然保持各自的模型并行语义。
+};
+```
+
+\end{tikzpicture}
+\caption{3D 并行中 ZeRO 沿 DP 维切分状态}
+\label{fig:zero-along-dp-dimension}
+\end{figure}
+
+\subsection{与 Tensor Parallel 的关系}
+\label{subsec:zero-with-tensor-parallel}
+
+TP 已经把某个权重矩阵切成多个 tensor shards。例如 Column Parallel Linear 中：
+
+[
+\mat{W}
+=======
+
+[\mat{W}*0,\mat{W}*1,\ldots,\mat{W}*{P*{\mathrm{TP}}-1}].
+]
+
+TP rank $t$ 只保存 $\mat{W}_t$。如果再使用 ZeRO，则 $\mat{W}_t$ 的训练状态会在 DP ranks 之间切分。换句话说，ZeRO 不是切完整 $\mat{W}$，而是切 TP 后的本地 shard。
+
+因此每卡参数相关常驻状态可粗略写为：
+
+[
+M_{\mathrm{perGPU}}
+\approx
+\frac{M_{\mathrm{states}}}
+{P_{\mathrm{TP}}P_{\mathrm{PP}}q_{\mathrm{ZeRO}}},
+]
+
+其中 $q_{\mathrm{ZeRO}}$ 取决于 ZeRO stage 和被切分的状态：
+
+[
+q_{\mathrm{ZeRO}}
+=================
+
+\begin{cases}
+1, & \text{未被 ZeRO 切分的状态},\
+P_{\mathrm{DP}}, & \text{被 ZeRO 切分的状态}.
+\end{cases}
+]
+
+TP 和 ZeRO 都能降低单卡显存，但通信位置不同：
+
+\begin{itemize}
+\item TP 通信发生在层内，每层高频 collective；
+\item ZeRO 通信发生在 DP 状态同步、梯度 reduce-scatter、参数 all-gather 等位置；
+\item 两者可能同时占用 NCCL 和网络资源；
+\item 若 TP 和 ZeRO group 拓扑映射不佳，会出现通信竞争。
+\end{itemize}
+
+\subsection{与 Pipeline Parallel 的关系}
+\label{subsec:zero-with-pipeline-parallel}
+
+PP 将层分配到不同 stages。每个 stage 只保存自己负责的层。ZeRO 在每个 stage 内部的 DP replicas 之间切分该 stage 的状态。
+
+如果第 $p$ 个 stage 负责参数量为 $N_p$，ZeRO Stage 2 下该 stage 每个 rank 参数相关显存约为：
+
+[
+M_p
+===
+
+2N_p
++
+\frac{14N_p}{P_{\mathrm{DP}}}.
+]
+
+若 stage 切分不均，ZeRO 不能自动解决 stage 间负载不均。它只能在同一个 stage 的 DP replicas 之间分摊状态。若 Stage 0 因 embedding 很大而显存高，Stage 0 的 DP ranks 会同时面临高显存；其他 stages 不能帮助它保存这些状态，除非改变 PP layer partition 或使用更复杂的分片策略。
+
+因此 PP + ZeRO 配置中，仍然需要关注：
+
+\begin{itemize}
+\item 每个 stage 的参数量；
+\item 每个 stage 的激活显存；
+\item 首尾 stage 的 embedding/lm head；
+\item pipeline schedule 造成的 live micro-batches；
+\item ZeRO partition 是否在每个 stage 内均衡。
+\end{itemize}
+
+\subsection{与 FSDP 的概念对照}
+\label{subsec:zero-vs-fsdp}
+
+PyTorch FSDP，Fully Sharded Data Parallel，与 ZeRO Stage 3 在思想上非常接近：都在数据并行维度切分参数、梯度和优化器状态，并在计算需要时 all-gather 参数，用完释放。
+
+可以粗略对应：
+
+[
+\text{FSDP full shard}
+\approx
+\text{ZeRO Stage 3}.
+]
+
+但二者在工程实现、API、参数 flatten、wrap 策略、prefetch、checkpoint、生态集成和调优项上有所不同。
+
+FSDP 常通过 wrapping module 来决定分片粒度。例如一个 Transformer block 可以被 wrap 成一个 FSDP unit。Forward 进入该 block 前 all-gather 参数，退出后释放。Backward 时再次 all-gather 或复用参数，并 reduce-scatter 梯度。
+
+ZeRO Stage 3 通常由 DeepSpeed engine 管理参数生命周期和 bucket。两者共同的核心问题都是：
+
+\begin{itemize}
+\item 参数何时 all-gather；
+\item 参数何时释放；
+\item 梯度如何 reduce-scatter；
+\item 如何与 activation checkpointing 交互；
+\item 如何保存 sharded checkpoint；
+\item 如何避免频繁小通信；
+\item 如何控制显存峰值。
+\end{itemize}
+
+\begin{table}[H]
+\centering
+\small
+\caption{ZeRO 与 FSDP 的概念对照}
+\label{tab:zero-fsdp-comparison}
+\begin{tabular}{p{0.22\textwidth}p{0.33\textwidth}p{0.33\textwidth}}
+\toprule
+\textbf{维度} & \textbf{ZeRO / DeepSpeed} & \textbf{PyTorch FSDP} \
+\midrule
+核心思想
+& 按 ZeRO stage 切分 optimizer、gradient、parameter
+& 按 FSDP unit 全分片参数、梯度和优化器状态 \
+\midrule
+Stage 3 对应
+& 参数也分片，计算前 all-gather
+& Full shard 模式中参数计算前 all-gather \
+\midrule
+配置方式
+& JSON 配置 + DeepSpeed engine
+& PyTorch API + wrapping policy \
+\midrule
+参数粒度
+& bucket 和参数管理器控制
+& FSDP wrap unit 控制 \
+\midrule
+Checkpoint
+& DeepSpeed sharded checkpoint
+& full / sharded / local state dict 等模式 \
+\midrule
+调优重点
+& bucket、offload、prefetch、overlap
+& wrap 粒度、prefetch、reshard、state dict 策略 \
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{选择 ZeRO Stage 的工程决策}
+\label{sec:choosing-zero-stage}
+
+ZeRO Stage 的选择不是越高越好，而是根据显存、通信、模型规模和工程复杂度权衡。
+
+\subsection{Stage 选择的基本原则}
+\label{subsec:zero-stage-choice-principles}
+
+一个实用原则是：\textbf{选择满足显存要求的最低 ZeRO stage。}
+
+如果 DDP 能放下并且吞吐好，不一定需要 ZeRO。若 DDP 放不下或显存余量太小，可以先尝试 Stage 1。若梯度显存也成为问题，尝试 Stage 2。若参数本身也放不下，才使用 Stage 3。
+
+[
+\text{DDP}
+\rightarrow
+\text{ZeRO1}
+\rightarrow
+\text{ZeRO2}
+\rightarrow
+\text{ZeRO3}
+]
+
+这个顺序的原因是：stage 越高，显存越省，但通信和系统复杂度越高。
+
+\begin{table}[H]
+\centering
+\small
+\caption{ZeRO 各 Stage 的显存与通信取舍}
+\label{tab:zero-stage-tradeoffs}
+\begin{tabular}{p{0.16\textwidth}p{0.25\textwidth}p{0.25\textwidth}p{0.24\textwidth}}
+\toprule
+\textbf{模式} & \textbf{切分状态} & \textbf{显存收益} & \textbf{主要代价} \
+\midrule
+DDP
+& 无，完整复制
+& 最低
+& 显存冗余高，但简单稳定 \
+\midrule
+ZeRO-1
+& optimizer states
+& 中等到较高
+& optimizer step 后参数同步 \
+\midrule
+ZeRO-2
+& optimizer states + gradients
+& 更高
+& reduce-scatter 梯度，参数仍复制 \
+\midrule
+ZeRO-3
+& optimizer states + gradients + parameters
+& 最高
+& 参数 all-gather/prefetch/release，通信复杂 \
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{何时使用 Stage 1}
+\label{subsec:when-to-use-zero1}
+
+Stage 1 适合以下场景：
+
+\begin{itemize}
+\item 参数和梯度能放下，但 AdamW optimizer states 太大；
+\item 希望尽量保持接近 DDP 的训练行为；
+\item 通信网络不想承担 Stage 3 的频繁参数 all-gather；
+\item 模型规模中等，显存压力主要来自 optimizer；
+\item 需要相对简单的 checkpoint 和调试流程。
+\end{itemize}
+
+Stage 1 常常是一个性价比很高的选择。因为 AdamW 的优化器状态占比很大，切分 optimizer states 能带来明显显存收益，而不会像 Stage 3 那样改变 forward 中的参数可用性。
+
+\subsection{何时使用 Stage 2}
+\label{subsec:when-to-use-zero2}
+
+Stage 2 适合以下场景：
+
+\begin{itemize}
+\item Stage 1 后梯度仍占用过多显存；
+\item 参数本身仍能完整复制；
+\item 希望避免 Stage 3 的参数 all-gather；
+\item DP size 较大，梯度和 optimizer 分片收益明显；
+\item 通信库对 reduce-scatter 性能较好。
+\end{itemize}
+
+Stage 2 是许多训练任务中很常用的折中点。它显存比 Stage 1 更省，但 forward/backward 不需要像 Stage 3 那样频繁聚合参数，因此吞吐可能更好。
+
+\subsection{何时使用 Stage 3}
+\label{subsec:when-to-use-zero3}
+
+Stage 3 适合以下场景：
+
+\begin{itemize}
+\item 参数本身太大，无法在每个 DP rank 完整复制；
+\item Stage 2 仍然 OOM；
+\item DP size 足够大，可以有效分摊参数；
+\item 网络和实现足够好，可以承受参数 all-gather；
+\item 训练目标是尽可能扩展模型规模，而不是极致吞吐；
+\item 可以接受更复杂的 checkpoint 和调试。
+\end{itemize}
+
+Stage 3 的调优重点是：
+
+\begin{itemize}
+\item 参数 bucket 大小；
+\item prefetch 距离；
+\item 参数释放策略；
+\item 是否持久化小参数；
+\item 与 activation checkpointing 的交互；
+\item 是否 offload；
+\item sharded checkpoint 是否可靠。
+\end{itemize}
+
+\subsection{常见故障与排查}
+\label{subsec:zero-common-failures}
+
+ZeRO 训练中常见问题包括：
+
+\begin{itemize}
+\item \textbf{OOM}：bucket 太大、live parameters 太多、activation 未 checkpoint、offload 未生效；
+\item \textbf{吞吐很低}：参数 all-gather 暴露、offload 阻塞、bucket 太小、通信拓扑差；
+\item \textbf{hang}：某些 rank 未进入 collective、参数生命周期错误、数据 loader step 数不一致；
+\item \textbf{loss 异常}：梯度累积配置错误、global batch 不一致、参数更新同步错误；
+\item \textbf{checkpoint 无法恢复}：shard metadata 不匹配、并行配置变化未 reshard、optimizer state 丢失；
+\item \textbf{显存碎片}：大量小参数、小 bucket、频繁 gather/release 造成 allocator 压力。
+\end{itemize}
+
+排查顺序通常是：
+
+\begin{enumerate}
+\item 先用小模型、小 batch、小数据集验证逻辑；
+\item 关闭复杂优化，逐步开启 ZeRO stage、offload、overlap；
+\item 打印每个 rank 的并行坐标和 group；
+\item 检查 global batch 与 gradient accumulation；
+\item 使用 profiler 查看 all-gather/reduce-scatter 时间；
+\item 检查显存峰值与 bucket 配置；
+\item 验证 checkpoint 保存和恢复；
+\item 扩展到多节点前先做 NCCL tests。
+\end{enumerate}
+
+\section{本章小结}
+\label{sec:chapter11-summary}
+
+本章系统介绍了 ZeRO 优化器、DeepSpeed 实践以及 ZeRO 与 3D 并行的组合方式。
+
+\begin{itemize}
+\item \textbf{AdamW 训练状态膨胀} 是大模型显存压力的重要来源。BF16 参数、BF16 梯度、FP32 master weight、Adam 一阶矩和二阶矩合计常约为每参数 16 bytes。
+\item \textbf{普通 DDP 存在显存冗余}：每个 data parallel rank 都保存完整参数、完整梯度和完整优化器状态。
+\item \textbf{ZeRO 的核心思想} 是在数据并行 ranks 之间切分训练状态，消除 DP 维度上的冗余。
+\item \textbf{ZeRO Stage 1} 切分 optimizer states，参数和梯度仍完整复制，显存收益主要来自 Adam 状态分片。
+\item \textbf{ZeRO Stage 2} 进一步切分 gradients，通常使用 reduce-scatter 聚合梯度，每个 rank 只保存自己负责的梯度 shard。
+\item \textbf{ZeRO Stage 3} 切分 parameters、gradients 和 optimizer states，计算前临时 all-gather 参数，用完释放，显存最低但通信最复杂。
+\item \textbf{DeepSpeed engine} 封装了 ZeRO 分片、混合精度、梯度累积、通信 bucket、overlap、offload 和 checkpoint 等复杂逻辑。
+\item \textbf{ZeRO Offload} 将 optimizer states、parameters 或 gradients 移到 CPU/NVMe，以吞吐换显存容量。
+\item \textbf{ZeRO-Infinity} 将训练扩展为分层存储调度问题，需要 CPU/NVMe 预取、异步搬运和计算重叠。
+\item \textbf{ZeRO 与 3D 并行组合时，通常沿 DP 维切分状态}。固定 TP rank 和 PP stage 的 DP group 共同切分同一个模型 shard 的训练状态。
+\item \textbf{ZeRO 与 FSDP 在概念上相近}，尤其 FSDP full shard 与 ZeRO Stage 3 都采用参数分片、按需 all-gather 和梯度 reduce-scatter。
+\item \textbf{选择 ZeRO stage 的原则} 是使用满足显存要求的最低 stage。Stage 越高，显存越省，但通信和调试复杂度越高。
+\end{itemize}
+
+至此，第三篇完成了分布式训练架构的核心主线：DDP 解决数据并行，TP 解决层内矩阵切分，PP 解决模型层切分，3D 并行组合多维扩展，ZeRO/DeepSpeed 则进一步消除数据并行维度上的训练状态冗余。下一篇将进入推理架构：我们会从训练和推理的差异讲起，分析 prefill、decode、KV Cache、batching、attention kernel、调度器和 serving 系统如何共同决定 LLM 在线服务的吞吐、延迟和成本。

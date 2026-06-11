@@ -1,0 +1,1514 @@
+\chapter{张量并行 TP：Megatron-LM 的核心思想}
+\label{chap:tensor-parallelism}
+
+\section{为什么数据并行不够}
+\label{sec:why-data-parallel-not-enough}
+
+上一章讨论了数据并行。数据并行的核心假设是：每张 GPU 都能保存一份完整模型副本、梯度、优化器状态和前向激活。只要这个假设成立，DDP 就是一种简单、稳定、通用的扩展方式。
+
+但大模型训练很快会撞到这个假设的边界。对于几十亿、几百亿甚至更大规模的模型，单张 GPU 不再能容纳完整训练状态。此时仅仅增加数据并行副本并不能解决问题，因为每个副本仍然需要放下一整份模型。
+
+张量并行 Tensor Parallelism，简称 TP，解决的是另一个问题：\textbf{把单个算子的张量切分到多张 GPU 上，让多张 GPU 共同完成一个 Transformer block 内部的矩阵计算。}
+
+如果说数据并行是：
+[
+\text{复制模型，切分数据},
+]
+那么张量并行就是：
+[
+\text{切分模型内部张量，共同计算一个算子}.
+]
+
+\subsection{单卡显存放不下模型}
+\label{subsec:model-does-not-fit-single-gpu}
+
+训练显存主要由以下部分组成：
+
+[
+M_{\mathrm{train}}
+==================
+
+M_{\mathrm{params}}
++
+M_{\mathrm{grads}}
++
+M_{\mathrm{optimizer}}
++
+M_{\mathrm{activations}}
++
+M_{\mathrm{buffers}}.
+]
+
+对于 AdamW，若参数使用 BF16，梯度使用 BF16，优化器状态和 master weight 使用 FP32，则参数相关状态粗略为：
+[
+M_{\mathrm{param\ states}}\approx 16N\ \mathrm{bytes},
+]
+其中 $N$ 是参数量。
+
+如果 $N=70\mathrm{B}$，则仅参数、梯度和优化器相关状态就约为：
+[
+16\times 70\times 10^9
+======================
+
+1.12\times 10^{12}\ \mathrm{bytes}
+\approx 1.12\ \mathrm{TB}.
+]
+这远远超过单张 GPU 的 HBM 容量。
+
+数据并行无法降低每张 GPU 上的模型状态大小。使用 $P$ 张 GPU 做 DDP，每张 GPU 仍然保存完整模型：
+[
+M_{\mathrm{per\ GPU}}^{\mathrm{DDP}}
+\approx
+M_{\mathrm{train}}.
+]
+这意味着，如果单卡放不下模型，DDP 的 world size 再大也无济于事。
+
+张量并行则直接切分模型参数。若某个大矩阵参数被切到 $P_{\mathrm{TP}}$ 张 GPU 上，理想情况下该矩阵在每张 GPU 上的参数显存可下降为：
+[
+\frac{1}{P_{\mathrm{TP}}}.
+]
+当然，代价是前向和反向传播中需要引入额外通信。
+
+\subsection{参数、梯度、优化器状态}
+\label{subsec:param-grad-optimizer-states}
+
+大模型训练中，一个参数张量并不只是一个权重矩阵。以 AdamW 为例，一个参数 $\theta$ 通常关联：
+
+\begin{itemize}
+\item 参数本身 $\theta$；
+\item 梯度 $\nabla \theta$；
+\item FP32 master weight；
+\item 一阶矩 $m$；
+\item 二阶矩 $v$。
+\end{itemize}
+
+如果参数矩阵：
+[
+\mat{W}\in\mathbb{R}^{H\times 4H}
+]
+被切成 $P_{\mathrm{TP}}$ 份，则不仅 $\mat{W}$ 被切分，与之对应的梯度和优化器状态也会随同切分：
+
+[
+\mat{W}
+=======
+
+[\mat{W}*0,\mat{W}*1,\ldots,\mat{W}*{P*{\mathrm{TP}}-1}],
+]
+[
+\nabla\mat{W}
+=============
+
+[\nabla\mat{W}*0,\nabla\mat{W}*1,\ldots,\nabla\mat{W}*{P*{\mathrm{TP}}-1}].
+]
+
+每个 rank 只保存本地 shard：
+[
+\mat{W}_p,\quad
+\nabla\mat{W}_p,\quad
+m_p,\quad
+v_p.
+]
+
+这与 ZeRO/FSDP 的切分维度不同。ZeRO 在数据并行维度上切分 optimizer state、gradient 或 parameter；张量并行则通常在模型内部矩阵维度上切分参数，使多张 GPU 共同执行同一个层。
+
+\begin{table}[H]
+\centering
+\small
+\caption{DDP、ZeRO/FSDP 与 Tensor Parallelism 的切分对象对比}
+\label{tab:ddp-zero-tp-comparison}
+\begin{tabular}{p{0.2\textwidth}p{0.28\textwidth}p{0.42\textwidth}}
+\toprule
+\textbf{策略} & \textbf{切分对象} & \textbf{核心作用} \
+\midrule
+DDP
+& 数据 batch
+& 每卡完整模型副本，处理不同数据分片，同步梯度。 \
+\midrule
+ZeRO / FSDP
+& 参数、梯度、优化器状态
+& 在数据并行 rank 之间切分训练状态，降低每卡显存。 \
+\midrule
+Tensor Parallelism
+& 层内矩阵或 attention heads
+& 把单个算子拆到多张 GPU 上共同计算，使单层模型参数可扩展。 \
+\midrule
+Pipeline Parallelism
+& 模型层
+& 把不同层放到不同 GPU 上，解决整体层堆叠过深、模型太大的问题。 \
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{模型并行的必要性}
+\label{subsec:necessity-of-model-parallelism}
+
+当模型规模继续增大，仅依靠 DDP 不够；仅依靠 ZeRO/FSDP 也不一定够。原因包括：
+
+\begin{itemize}
+\item 单个 Linear 层的权重矩阵可能很大；
+\item 单层 GEMM 的计算量巨大，单卡执行时间过长；
+\item attention heads 数量多，可以天然切分；
+\item FFN 中间维度大，适合按 hidden 维切分；
+\item 训练吞吐需要更多 GPU 共同参与单个样本或单个 micro-batch 的计算。
+\end{itemize}
+
+模型并行可以粗略分为两类：
+
+\begin{itemize}
+\item \textbf{层内并行}：切分单层算子，例如 tensor parallelism；
+\item \textbf{层间并行}：切分模型层，例如 pipeline parallelism。
+\end{itemize}
+
+张量并行属于层内并行。它最适合 Transformer，因为 Transformer 中绝大部分计算都集中在规则的矩阵乘法上：
+
+[
+\mat{Y}=\mat{X}\mat{W}.
+]
+
+只要能合理切分 $\mat{W}$ 或 $\mat{X}$，并在必要位置插入通信，就可以让多张 GPU 协作完成一个 Linear 层。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+gpu/.style={draw, rounded corners=3pt, minimum width=1.55cm, minimum height=0.75cm, align=center, fill=blue!6},
+tensor/.style={draw, rounded corners=2pt, minimum width=1.2cm, minimum height=0.55cm, align=center, fill=orange!14},
+arrow/.style={-{Latex[length=2.2mm]}, thick}
+]
+
+```
+\node[font=\bfseries] at (0,3.2) {数据并行与张量并行的直观区别};
+
+% Data parallel
+\node[font=\bfseries] at (-3.8,2.5) {Data Parallel};
+\foreach \i/\y in {0/1.5,1/0.55,2/-0.4} {
+  \node[tensor] (d\i) at (-5.3,\y) {data \i};
+  \node[gpu] (dp\i) at (-3.5,\y) {Full\\Model};
+  \draw[arrow] (d\i) -- (dp\i);
+}
+\node[align=center, text width=3.7cm] at (-4.3,-1.35) {
+  每张 GPU 有完整模型\\
+  只切分 batch
+};
+
+% Tensor parallel
+\node[font=\bfseries] at (3.3,2.5) {Tensor Parallel};
+\node[tensor] (x) at (1.0,0.6) {same input};
+\foreach \i/\y in {0/1.55,1/0.55,2/-0.45} {
+  \node[gpu] (tp\i) at (3.2,\y) {Weight\\Shard \i};
+  \draw[arrow] (x) -- (tp\i);
+}
+\node[tensor, fill=green!10] (combine) at (5.4,0.55) {combine};
+\foreach \i in {0,1,2} {
+  \draw[arrow] (tp\i) -- (combine);
+}
+
+\node[align=center, text width=3.8cm] at (3.5,-1.35) {
+  多张 GPU 共同计算\\
+  同一个层或算子
+};
+
+\draw[dashed, thick] (0,-1.9) -- (0,2.7);
+```
+
+\end{tikzpicture}
+\caption{数据并行复制模型，张量并行切分模型内部张量}
+\label{fig:dp-vs-tp}
+\end{figure}
+
+\section{张量并行基本原理}
+\label{sec:tensor-parallel-basics}
+
+张量并行的核心是对 Linear 层进行切分。因为 Transformer 的 attention projection、output projection、FFN up projection、down projection 和 lm head 都可以视作 Linear 层，理解 Linear 的切分就能理解大部分 TP 设计。
+
+考虑线性层：
+[
+\mat{Y}=\mat{X}\mat{W},
+]
+其中：
+[
+\mat{X}\in\mathbb{R}^{B S\times H_{\mathrm{in}}},
+\quad
+\mat{W}\in\mathbb{R}^{H_{\mathrm{in}}\times H_{\mathrm{out}}},
+\quad
+\mat{Y}\in\mathbb{R}^{B S\times H_{\mathrm{out}}}.
+]
+
+为了简化记号，我们把 batch 和 sequence 合并成 token 维：
+[
+N_{\mathrm{tok}}=B S.
+]
+则：
+[
+\mat{X}\in\mathbb{R}^{N_{\mathrm{tok}}\times H_{\mathrm{in}}}.
+]
+
+张量并行常见切法有两种：
+
+\begin{itemize}
+\item \textbf{Column Parallel Linear}：按输出维切分 $\mat{W}$；
+\item \textbf{Row Parallel Linear}：按输入维切分 $\mat{W}$。
+\end{itemize}
+
+这两个切法在 Megatron-LM 中非常关键。一个 Transformer block 的 attention 和 FFN 会交替使用这两种并行线性层，使通信次数尽可能少。
+
+\subsection{按列切分 Linear Layer}
+\label{subsec:column-parallel-linear}
+
+Column Parallel Linear 按输出维切分权重矩阵。将：
+[
+\mat{W}\in\mathbb{R}^{H_{\mathrm{in}}\times H_{\mathrm{out}}}
+]
+按列切成 $P$ 份：
+[
+\mat{W}
+=======
+
+[\mat{W}*0,\mat{W}*1,\ldots,\mat{W}*{P-1}],
+]
+其中：
+[
+\mat{W}*p\in
+\mathbb{R}^{H*{\mathrm{in}}\times \frac{H*{\mathrm{out}}}{P}}.
+]
+
+每个 TP rank 持有一份 $\mat{W}_p$，输入 $\mat{X}$ 在所有 rank 上相同。每个 rank 本地计算：
+[
+\mat{Y}_p=\mat{X}\mat{W}_p.
+]
+最终完整输出为：
+[
+\mat{Y}
+=======
+
+[\mat{Y}_0,\mat{Y}*1,\ldots,\mat{Y}*{P-1}].
+]
+
+如果后续算子可以直接消费分片输出，则不需要立刻 all-gather。若后续算子需要完整 $\mat{Y}$，则需要在输出维上 all-gather。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+matrix/.style={draw, rounded corners=2pt, minimum width=1.6cm, minimum height=1.15cm, align=center},
+shard/.style={draw, rounded corners=2pt, minimum width=0.9cm, minimum height=1.15cm, align=center},
+gpu/.style={draw, rounded corners=3pt, minimum width=1.35cm, minimum height=0.58cm, align=center, fill=blue!6},
+arrow/.style={-{Latex[length=2.2mm]}, thick}
+]
+
+```
+\node[font=\bfseries] at (0,3.25) {Column Parallel Linear：按输出维切分权重};
+
+\node[matrix, fill=orange!12] (x) at (-5.2,0.8) {$X$\\$N,H_{in}$};
+
+\foreach \i/\xpos/\col in {0/-2.4/red!12,1/-1.35/green!12,2/-0.3/purple!12,3/0.75/yellow!18} {
+  \node[shard, fill=\col] (w\i) at (\xpos,0.8) {$W_\i$};
+  \node[gpu] (g\i) at (\xpos,-0.55) {rank \i};
+  \draw[dashed] (w\i) -- (g\i);
+  \draw[arrow] (x.east) -- (w\i.west);
+}
+
+\foreach \i/\xpos/\col in {0/2.1/red!12,1/3.05/green!12,2/4.0/purple!12,3/4.95/yellow!18} {
+  \node[shard, fill=\col, minimum height=0.95cm] (y\i) at (\xpos,0.8) {$Y_\i$};
+  \draw[arrow] (w\i.east) -- (y\i.west);
+}
+
+\draw[decorate,decoration={brace,amplitude=5pt},thick]
+  (1.65,1.55) -- (5.4,1.55)
+  node[midway,above=7pt] {$Y=[Y_0,Y_1,Y_2,Y_3]$};
+
+\node[align=left, text width=10.5cm] at (0,-2.0) {
+  Column Parallel Linear 让每个 rank 计算一部分输出通道。
+  如果下一步能继续使用 sharded output，可以避免立即 all-gather。
+};
+```
+
+\end{tikzpicture}
+\caption{Column Parallel Linear 的张量切分方式}
+\label{fig:column-parallel-linear}
+\end{figure}
+
+Column Parallel Linear 的本地参数量为：
+[
+\frac{H_{\mathrm{in}}H_{\mathrm{out}}}{P}.
+]
+本地计算量为：
+[
+2N_{\mathrm{tok}}H_{\mathrm{in}}\frac{H_{\mathrm{out}}}{P}.
+]
+因此参数和计算都按 TP size 近似缩小 $P$ 倍。
+
+反向传播中，设上游梯度分片为：
+[
+\mat{G}_{Y,p}
+=============
+
+\frac{\partial \mathcal{L}}{\partial \mat{Y}_p}.
+]
+本地权重梯度：
+[
+\frac{\partial \mathcal{L}}{\partial \mat{W}_p}
+===============================================
+
+\mat{X}^{\mathsf{T}}\mat{G}*{Y,p}.
+]
+输入梯度的本地贡献为：
+[
+\mat{G}*{X,p}
+=============
+
+\mat{G}_{Y,p}\mat{W}_p^{\mathsf{T}}.
+]
+完整输入梯度为所有 rank 的求和：
+[
+\mat{G}_X
+=========
+
+\sum_{p=0}^{P-1}
+\mat{G}_{X,p}.
+]
+因此 Column Parallel Linear 在 backward 中通常需要对输入梯度做 all-reduce，除非上游/下游结构可以把这个通信延后或与其他通信融合。
+
+\subsection{按行切分 Linear Layer}
+\label{subsec:row-parallel-linear}
+
+Row Parallel Linear 按输入维切分权重矩阵。将：
+[
+\mat{W}\in\mathbb{R}^{H_{\mathrm{in}}\times H_{\mathrm{out}}}
+]
+按行切成 $P$ 份：
+[
+\mat{W}
+=======
+
+\begin{bmatrix}
+\mat{W}*0\
+\mat{W}*1\
+\vdots\
+\mat{W}*{P-1}
+\end{bmatrix},
+]
+其中：
+[
+\mat{W}*p\in
+\mathbb{R}^{\frac{H*{\mathrm{in}}}{P}\times H*{\mathrm{out}}}.
+]
+
+相应地，输入也按 hidden 维切分：
+[
+\mat{X}
+=======
+
+[\mat{X}*0,\mat{X}*1,\ldots,\mat{X}*{P-1}],
+]
+其中：
+[
+\mat{X}*p\in
+\mathbb{R}^{N*{\mathrm{tok}}\times \frac{H*{\mathrm{in}}}{P}}.
+]
+
+每个 rank 本地计算：
+[
+\mat{Y}_p=\mat{X}_p\mat{W}_p.
+]
+完整输出为：
+[
+\mat{Y}
+=======
+
+\sum_{p=0}^{P-1}
+\mat{Y}_p.
+]
+因此 Row Parallel Linear 在 forward 中通常需要 all-reduce 求和。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+shard/.style={draw, rounded corners=2pt, minimum width=1.1cm, minimum height=0.52cm, align=center},
+mat/.style={draw, rounded corners=2pt, minimum width=1.45cm, minimum height=1.45cm, align=center},
+gpu/.style={draw, rounded corners=3pt, minimum width=1.2cm, minimum height=0.5cm, align=center, fill=blue!6},
+arrow/.style={-{Latex[length=2.1mm]}, thick}
+]
+
+```
+\node[font=\bfseries] at (0,3.25) {Row Parallel Linear：按输入维切分权重};
+
+\foreach \i/\y/\col in {0/1.55/red!12,1/0.9/green!12,2/0.25/purple!12,3/-0.4/yellow!18} {
+  \node[shard, fill=\col] (x\i) at (-4.8,\y) {$X_\i$};
+  \node[shard, fill=\col, minimum width=1.35cm] (w\i) at (-2.4,\y) {$W_\i$};
+  \node[gpu] (g\i) at (-0.55,\y) {rank \i};
+  \node[shard, fill=\col, minimum width=1.25cm] (yp\i) at (1.25,\y) {$Y_\i$};
+  \draw[arrow] (x\i) -- (w\i);
+  \draw[arrow] (w\i) -- (g\i);
+  \draw[arrow] (g\i) -- (yp\i);
+}
+
+\node[mat, fill=orange!10] (sum) at (3.65,0.58) {$Y=\sum_pY_p$};
+\foreach \i in {0,1,2,3} {
+  \draw[arrow] (yp\i) -- (sum);
+}
+
+\node[align=left, text width=10.5cm] at (0,-2.0) {
+  Row Parallel Linear 要对各 rank 的局部输出求和，因此 forward 中通常需要 all-reduce。
+  它常接在 Column Parallel Linear 后面，用来消费按 hidden 维切分的中间激活。
+};
+```
+
+\end{tikzpicture}
+\caption{Row Parallel Linear 的张量切分与输出求和}
+\label{fig:row-parallel-linear}
+\end{figure}
+
+Row Parallel Linear 的反向传播中，设完整输出梯度为：
+[
+\mat{G}_Y
+=========
+
+\frac{\partial \mathcal{L}}{\partial \mat{Y}}.
+]
+由于：
+[
+\mat{Y}=\sum_p \mat{X}_p\mat{W}_p,
+]
+每个 rank 本地计算：
+[
+\frac{\partial \mathcal{L}}{\partial \mat{W}_p}
+===============================================
+
+\mat{X}_p^{\mathsf{T}}\mat{G}_Y,
+]
+[
+\frac{\partial \mathcal{L}}{\partial \mat{X}_p}
+===============================================
+
+\mat{G}_Y\mat{W}_p^{\mathsf{T}}.
+]
+此时每个 rank 得到的是输入梯度的一个 shard，不需要在 backward 中对 $\mat{G}_X$ 做 all-reduce，除非后续结构要求完整输入梯度。
+
+\subsection{前向传播中的通信}
+\label{subsec:tp-forward-communication}
+
+Column Parallel Linear 和 Row Parallel Linear 的通信位置不同。
+
+对于 Column Parallel Linear：
+
+[
+\mat{Y}_p=\mat{X}\mat{W}_p.
+]
+
+如果输出保持分片：
+[
+\mat{Y}=[\mat{Y}*0,\ldots,\mat{Y}*{P-1}],
+]
+则 forward 不需要通信。如果需要完整输出，则需要 all-gather：
+
+[
+\operatorname{AllGather}(\mat{Y}_p)\rightarrow \mat{Y}.
+]
+
+对于 Row Parallel Linear：
+
+[
+\mat{Y}_p=\mat{X}_p\mat{W}_p,
+]
+[
+\mat{Y}=\sum_p\mat{Y}_p.
+]
+因此 forward 需要 all-reduce：
+
+[
+\operatorname{AllReduceSum}(\mat{Y}_p)\rightarrow \mat{Y}.
+]
+
+Megatron-LM 的关键设计之一，就是把 Column Parallel Linear 和 Row Parallel Linear 成对安排。例如 FFN 中：
+
+[
+\mat{H}=\phi(\mat{X}\mat{W}_1),
+]
+[
+\mat{Y}=\mat{H}\mat{W}_2.
+]
+
+将 $\mat{W}_1$ 做 Column Parallel，得到分片 $\mat{H}_p$；然后将 $\mat{W}_2$ 做 Row Parallel，直接消费 $\mat{H}_p$。这样中间激活 $\mat{H}$ 不需要 all-gather，只在第二个线性层输出处做一次 all-reduce。
+
+[
+\mat{H}*p=\phi(\mat{X}\mat{W}*{1,p}),
+]
+[
+\mat{Y}=
+\sum_p
+\mat{H}*p\mat{W}*{2,p}.
+]
+
+这个组合非常优雅，因为它把两个大矩阵乘法之间的中间通信消掉了。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+box/.style={draw, rounded corners=3pt, minimum width=1.75cm, minimum height=0.68cm, align=center},
+shard/.style={draw, rounded corners=2pt, minimum width=1.0cm, minimum height=0.5cm, align=center},
+arrow/.style={-{Latex[length=2.2mm]}, thick}
+]
+
+```
+\node[font=\bfseries] at (0,3.15) {Column Parallel + Row Parallel：避免中间 all-gather};
+
+\node[box, fill=blue!6] (x) at (-5.2,0.8) {$X$\\replicated};
+\node[box, fill=orange!12] (col) at (-2.9,0.8) {Column\\Parallel};
+\node[shard, fill=green!10] (h0) at (-0.7,1.45) {$H_0$};
+\node[shard, fill=green!10] (h1) at (-0.7,0.75) {$H_1$};
+\node[shard, fill=green!10] (h2) at (-0.7,0.05) {$H_2$};
+
+\node[box, fill=purple!10] (row) at (1.6,0.8) {Row\\Parallel};
+\node[box, fill=yellow!16] (ar) at (3.8,0.8) {AllReduce\\sum};
+\node[box, fill=blue!6] (y) at (5.8,0.8) {$Y$\\replicated};
+
+\draw[arrow] (x) -- (col);
+\draw[arrow] (col) -- (h0);
+\draw[arrow] (col) -- (h1);
+\draw[arrow] (col) -- (h2);
+\draw[arrow] (h0) -- (row);
+\draw[arrow] (h1) -- (row);
+\draw[arrow] (h2) -- (row);
+\draw[arrow] (row) -- (ar);
+\draw[arrow] (ar) -- (y);
+
+\node[align=left, text width=10.4cm] at (0,-1.4) {
+  第一个线性层按列切分，输出保持 sharded；第二个线性层按行切分，直接消费 sharded hidden。
+  最终只需要一次 all-reduce 得到完整输出。
+};
+```
+
+\end{tikzpicture}
+\caption{Column Parallel 与 Row Parallel 组合减少中间通信}
+\label{fig:column-row-parallel-pair}
+\end{figure}
+
+\subsection{反向传播中的通信}
+\label{subsec:tp-backward-communication}
+
+张量并行的 backward 通信与 forward 通信互为镜像。理解这一点有助于判断通信是否可被隐藏。
+
+对于 Column Parallel Linear：
+
+[
+\mat{Y}*p=\mat{X}\mat{W}*p.
+]
+forward 如果不 all-gather，则每个 rank 只持有 $\mat{Y}*p$。Backward 中，每个 rank 根据 $\mat{G}*{Y,p}$ 计算本地 $\mat{G}*{X,p}$：
+[
+\mat{G}*{X,p}
+=============
+
+\mat{G}_{Y,p}\mat{W}_p^{\mathsf{T}}.
+]
+如果上一层需要完整 $\mat{G}_X$，则：
+[
+\mat{G}*X=\sum_p\mat{G}*{X,p}.
+]
+这需要 all-reduce。
+
+对于 Row Parallel Linear：
+
+[
+\mat{Y}=\sum_p \mat{X}_p\mat{W}_p.
+]
+forward 已经通过 all-reduce 得到完整 $\mat{Y}$。Backward 中，$\mat{G}*Y$ 在所有 rank 上相同，每个 rank 计算自己的 $\mat{G}*{X,p}$ 和 $\nabla \mat{W}*p$。因此 backward 不需要对 $\mat{G}*{X,p}$ 求和。
+
+这种互补性让 Megatron-LM 能够通过特定的通信算子安排，控制每个 Transformer block 中的通信次数。
+
+\begin{table}[H]
+\centering
+\small
+\caption{Column Parallel 与 Row Parallel Linear 的通信位置}
+\label{tab:column-row-parallel-communication}
+\begin{tabular}{p{0.24\textwidth}p{0.32\textwidth}p{0.32\textwidth}}
+\toprule
+\textbf{并行线性层} & \textbf{Forward 通信} & \textbf{Backward 通信} \
+\midrule
+Column Parallel
+& 若输出保持 sharded，无需通信；若需要完整输出，all-gather
+& 输入梯度通常需要 all-reduce 求和。 \
+\midrule
+Row Parallel
+& 局部输出需要 all-reduce 求和
+& 输入梯度天然是 sharded，通常无需 all-reduce。 \
+\bottomrule
+\end{tabular}
+\end{table}
+
+下面给出教学版的 Column Parallel Linear 和 Row Parallel Linear。代码用于说明通信语义，不是生产级高性能实现。
+
+\begin{lstlisting}[language=Python,caption={教学版 Column Parallel Linear 与 Row Parallel Linear},label={lst:column-row-parallel-linear}]
+import torch
+import torch.nn as nn
+import torch.distributed as dist
+
+class ColumnParallelLinear(nn.Module):
+def **init**(self, in_features, out_features, tp_group, gather_output=False):
+super().**init**()
+self.tp_group = tp_group
+self.tp_size = dist.get_world_size(tp_group)
+self.gather_output = gather_output
+
+```
+    assert out_features % self.tp_size == 0
+    self.out_per_rank = out_features // self.tp_size
+
+    self.weight = nn.Parameter(
+        torch.empty(in_features, self.out_per_rank)
+    )
+    nn.init.xavier_normal_(self.weight)
+
+def forward(self, x):
+    # x: [tokens, in_features], replicated across TP ranks
+    y_local = x @ self.weight  # [tokens, out_per_rank]
+
+    if not self.gather_output:
+        return y_local
+
+    # Gather output shards along hidden dimension.
+    y_parts = [torch.empty_like(y_local) for _ in range(self.tp_size)]
+    dist.all_gather(y_parts, y_local, group=self.tp_group)
+    y = torch.cat(y_parts, dim=-1)
+    return y
+```
+
+class RowParallelLinear(nn.Module):
+def **init**(self, in_features, out_features, tp_group):
+super().**init**()
+self.tp_group = tp_group
+self.tp_size = dist.get_world_size(tp_group)
+
+```
+    assert in_features % self.tp_size == 0
+    self.in_per_rank = in_features // self.tp_size
+
+    self.weight = nn.Parameter(
+        torch.empty(self.in_per_rank, out_features)
+    )
+    nn.init.xavier_normal_(self.weight)
+
+def forward(self, x_local):
+    # x_local: [tokens, in_per_rank], sharded across TP ranks
+    y_local = x_local @ self.weight  # [tokens, out_features]
+
+    # Sum partial outputs across TP ranks.
+    dist.all_reduce(y_local, op=dist.ReduceOp.SUM, group=self.tp_group)
+    return y_local
+```
+
+\end{lstlisting}
+
+生产系统会进一步优化：
+
+\begin{itemize}
+\item 使用 fused bias、activation 和 GEMM epilogue；
+\item 避免不必要的 all-gather；
+\item 使用 reduce-scatter 替代 all-reduce 的一部分；
+\item 与 sequence parallel 结合降低激活显存；
+\item 使用自定义 autograd function 精确控制 forward/backward 通信。
+\end{itemize}
+
+\section{Transformer 中的 TP}
+\label{sec:tp-in-transformer}
+
+Transformer 之所以适合张量并行，是因为它的大部分参数和计算都来自 Linear 层。一个 Decoder Block 主要包括：
+
+\begin{itemize}
+\item Attention QKV projection；
+\item Attention output projection；
+\item FFN up/gate projection；
+\item FFN down projection；
+\item Norm 和 residual 等小算子。
+\end{itemize}
+
+张量并行的设计目标是：在尽量少通信的前提下，把这些大矩阵乘法切到多个 TP rank 上。
+
+\subsection{Attention QKV projection 切分}
+\label{subsec:tp-attention-qkv-projection}
+
+输入：
+[
+\mat{X}\in\mathbb{R}^{N_{\mathrm{tok}}\times H}.
+]
+QKV projection 通常写作：
+[
+[\mat{Q},\mat{K},\mat{V}]
+=========================
+
+\mat{X}\mat{W}*{QKV},
+]
+其中：
+[
+\mat{W}*{QKV}\in\mathbb{R}^{H\times 3H}.
+]
+
+Megatron 风格 TP 通常对 QKV projection 使用 Column Parallel Linear。也就是说，按输出维切分：
+[
+\mat{W}_{QKV}
+=============
+
+[
+\mat{W}*{QKV,0},
+\mat{W}*{QKV,1},
+\ldots,
+\mat{W}_{QKV,P-1}
+].
+]
+每个 rank 计算一部分 Q/K/V heads。
+
+如果模型有 $n_h$ 个 attention heads，TP size 为 $P$，则每个 rank 持有：
+[
+\frac{n_h}{P}
+]
+个 heads。每个 rank 本地计算这些 heads 的 attention，不需要与其他 rank 交换 attention score。原因是每个 head 的 attention 是独立的：
+
+[
+\operatorname{head}_i
+=====================
+
+\Attention(\mat{Q}_i,\mat{K}_i,\mat{V}_i).
+]
+
+只要每个 head 的 Q、K、V 都在同一个 rank 上，attention 计算就是本地的。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+box/.style={draw, rounded corners=3pt, minimum width=1.7cm, minimum height=0.68cm, align=center},
+head/.style={draw, rounded corners=2pt, minimum width=1.05cm, minimum height=0.5cm, align=center},
+arrow/.style={-{Latex[length=2.1mm]}, thick}
+]
+
+```
+\node[font=\bfseries] at (0,3.2) {Attention QKV Projection 的 Head 维切分};
+
+\node[box, fill=blue!6] (x) at (-5.1,0.8) {$X$\\replicated};
+\node[box, fill=orange!12] (qkv) at (-2.9,0.8) {Column Parallel\\QKV Projection};
+
+\foreach \i/\xpos/\col in {0/-0.8/red!12,1/0.55/green!12,2/1.9/purple!12,3/3.25/yellow!18} {
+  \node[head, fill=\col] (h\i) at (\xpos,1.25) {heads\\rank \i};
+  \node[box, fill=\col, minimum width=1.2cm, minimum height=0.58cm] (attn\i) at (\xpos,0.25) {Attn};
+  \draw[arrow] (h\i) -- (attn\i);
+}
+
+\node[box, fill=purple!8, minimum width=2.0cm] (out) at (5.2,0.75) {sharded\\attention out};
+
+\draw[arrow] (x) -- (qkv);
+\draw[arrow] (qkv) -- (h0);
+\draw[arrow] (qkv) -- (h1);
+\draw[arrow] (qkv) -- (h2);
+\draw[arrow] (qkv) -- (h3);
+
+\foreach \i in {0,1,2,3} {
+  \draw[arrow] (attn\i) -- (out);
+}
+
+\node[align=left, text width=10.4cm] at (0,-1.6) {
+  QKV projection 按 head 切分后，每个 rank 只计算自己负责的 heads。
+  Attention score 与 softmax 都在本地完成，无需跨 TP rank 同步 attention matrix。
+};
+```
+
+\end{tikzpicture}
+\caption{Transformer Attention 中 QKV projection 的张量并行切分}
+\label{fig:tp-qkv-head-split}
+\end{figure}
+
+对于 GQA/MQA，切分会稍微复杂，因为 query heads 和 kv heads 数量不同。要求 TP size 与 $n_q$、$n_{kv}$ 的整除关系合理，否则需要更复杂的 head mapping 或跨 rank 共享 K/V。实际训练框架通常会限制或自动处理这些约束。
+
+\subsection{Attention output projection 切分}
+\label{subsec:tp-attention-output-projection}
+
+Attention 计算后，每个 rank 得到自己负责 heads 的输出：
+[
+\mat{O}*p\in
+\mathbb{R}^{N*{\mathrm{tok}}\times \frac{H}{P}}.
+]
+Multi-Head Attention 的 output projection 为：
+[
+\mat{Y}=\mat{O}\mat{W}_O,
+]
+其中：
+[
+\mat{W}_O\in\mathbb{R}^{H\times H}.
+]
+
+因为 $\mat{O}$ 已经按 hidden/head 维切分，最自然的做法是对 $\mat{W}*O$ 做 Row Parallel Linear：
+[
+\mat{W}*O=
+\begin{bmatrix}
+\mat{W}*{O,0}\
+\mat{W}*{O,1}\
+\vdots\
+\mat{W}_{O,P-1}
+\end{bmatrix}.
+]
+每个 rank 计算：
+[
+\mat{Y}_p=\mat{O}*p\mat{W}*{O,p}.
+]
+最终：
+[
+\mat{Y}=\sum_p\mat{Y}_p.
+]
+这需要一次 all-reduce。
+
+也就是说，attention 子层的典型通信模式是：
+
+[
+\text{QKV Column Parallel}
+\rightarrow
+\text{local attention}
+\rightarrow
+\text{Output Row Parallel}
+\rightarrow
+\text{AllReduce}.
+]
+
+这个 all-reduce 发生在 attention output projection 后，用于恢复 replicated residual stream。
+
+\subsection{FFN up projection 与 down projection 切分}
+\label{subsec:tp-ffn-projection-split}
+
+FFN 的结构与 attention 类似，也可以使用 Column Parallel + Row Parallel 的组合。以标准 MLP 为例：
+
+[
+\mat{H}=\phi(\mat{X}\mat{W}_1),
+]
+[
+\mat{Y}=\mat{H}\mat{W}_2.
+]
+
+其中：
+[
+\mat{W}*1\in\mathbb{R}^{H\times H*{\mathrm{ffn}}},
+\quad
+\mat{W}*2\in\mathbb{R}^{H*{\mathrm{ffn}}\times H}.
+]
+
+对 $\mat{W}*1$ 使用 Column Parallel：
+[
+\mat{W}*1=[\mat{W}*{1,0},\ldots,\mat{W}*{1,P-1}],
+]
+每个 rank 得到：
+[
+\mat{H}*p=\phi(\mat{X}\mat{W}*{1,p}).
+]
+
+再对 $\mat{W}*2$ 使用 Row Parallel：
+[
+\mat{W}*2=
+\begin{bmatrix}
+\mat{W}*{2,0}\
+\vdots\
+\mat{W}*{2,P-1}
+\end{bmatrix}.
+]
+每个 rank 计算：
+[
+\mat{Y}_p=\mat{H}*p\mat{W}*{2,p},
+]
+然后 all-reduce：
+[
+\mat{Y}=\sum_p\mat{Y}_p.
+]
+
+对于 SwiGLU：
+
+[
+\operatorname{FFN}(\mat{X})
+===========================
+
+[\operatorname{SiLU}(\mat{X}\mat{W}_g)\odot(\mat{X}\mat{W}_u)]\mat{W}_d.
+]
+
+通常 $\mat{W}_g$ 和 $\mat{W}_u$ 都做 Column Parallel，且使用相同切分方式。每个 rank 本地拥有 gate 和 up 的对应 shard：
+
+[
+\mat{G}*p=\mat{X}\mat{W}*{g,p},
+]
+[
+\mat{U}*p=\mat{X}\mat{W}*{u,p},
+]
+[
+\mat{H}_p=\operatorname{SiLU}(\mat{G}_p)\odot \mat{U}_p.
+]
+
+然后 down projection 使用 Row Parallel：
+
+[
+\mat{Y}=\sum_p \mat{H}*p\mat{W}*{d,p}.
+]
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+box/.style={draw, rounded corners=3pt, minimum width=1.7cm, minimum height=0.65cm, align=center},
+shard/.style={draw, rounded corners=2pt, minimum width=1.1cm, minimum height=0.5cm, align=center},
+arrow/.style={-{Latex[length=2.1mm]}, thick}
+]
+
+```
+\node[font=\bfseries] at (0,3.25) {FFN 中的 Tensor Parallel：Up/Gate Column Parallel，Down Row Parallel};
+
+\node[box, fill=blue!6] (x) at (-5.2,1.0) {$X$};
+
+\node[box, fill=orange!12] (gateup) at (-3.0,1.0) {Gate/Up\\Column Parallel};
+
+\foreach \i/\y/\col in {0/1.75/red!12,1/1.0/green!12,2/0.25/purple!12} {
+  \node[shard, fill=\col] (h\i) at (-0.9,\y) {$H_\i$};
+}
+
+\node[box, fill=purple!10] (down) at (1.3,1.0) {Down\\Row Parallel};
+\node[box, fill=yellow!16] (ar) at (3.4,1.0) {AllReduce};
+\node[box, fill=blue!6] (y) at (5.3,1.0) {$Y$};
+
+\draw[arrow] (x) -- (gateup);
+\draw[arrow] (gateup) -- (h0);
+\draw[arrow] (gateup) -- (h1);
+\draw[arrow] (gateup) -- (h2);
+\draw[arrow] (h0) -- (down);
+\draw[arrow] (h1) -- (down);
+\draw[arrow] (h2) -- (down);
+\draw[arrow] (down) -- (ar);
+\draw[arrow] (ar) -- (y);
+
+\node[align=left, text width=10.4cm] at (0,-1.25) {
+  FFN 中间维度通常很大，天然适合按 hidden 维切分。
+  Column Parallel 产生 sharded intermediate，Row Parallel 直接消费该分片，只在输出处 all-reduce。
+};
+```
+
+\end{tikzpicture}
+\caption{Transformer FFN 中的张量并行切分}
+\label{fig:tp-ffn-split}
+\end{figure}
+
+\subsection{TP 中的 all-gather 与 reduce-scatter}
+\label{subsec:tp-allgather-reducescatter}
+
+基础 TP 常使用 all-reduce 恢复 replicated hidden state。但 all-reduce 可以分解为：
+
+[
+\operatorname{AllReduce}
+========================
+
+\operatorname{ReduceScatter}
++
+\operatorname{AllGather}.
+]
+
+在 sequence parallel 中，系统会利用这一点，把某些激活沿 sequence 维切分，让每个 rank 只保存部分 token 的激活。这样可以降低 activation memory。
+
+例如，在普通 TP 中，attention output projection 后做 all-reduce，所有 rank 得到完整：
+[
+\mat{Y}\in\mathbb{R}^{B\times S\times H}.
+]
+
+在 sequence parallel 中，可以改为 reduce-scatter，让每个 rank 只得到 sequence 维的一部分：
+[
+\mat{Y}_p\in
+\mathbb{R}^{B\times \frac{S}{P}\times H}.
+]
+
+在后续需要完整 sequence 的位置，再使用 all-gather 恢复。这样通信总量可能类似，但激活显存下降，并且一些 norm、dropout、residual 等操作可以在 sequence shard 上本地执行。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+box/.style={draw, rounded corners=3pt, minimum width=2.0cm, minimum height=0.68cm, align=center},
+shard/.style={draw, rounded corners=2pt, minimum width=0.9cm, minimum height=0.5cm, align=center},
+arrow/.style={-{Latex[length=2.1mm]}, thick}
+]
+
+```
+\node[font=\bfseries] at (0,3.2) {AllReduce 与 ReduceScatter + AllGather};
+
+\node[box, fill=blue!6] (local) at (-5.1,1.0) {partial\\outputs};
+\node[box, fill=orange!12] (ar) at (-2.9,1.0) {AllReduce};
+\node[box, fill=green!10] (full) at (-0.6,1.0) {replicated\\full tensor};
+
+\draw[arrow] (local) -- (ar);
+\draw[arrow] (ar) -- (full);
+
+\node[box, fill=blue!6] (local2) at (-5.1,-0.65) {partial\\outputs};
+\node[box, fill=orange!12] (rs) at (-2.9,-0.65) {ReduceScatter};
+\node[shard, fill=green!10] (s0) at (-0.9,-0.25) {seq 0};
+\node[shard, fill=green!10] (s1) at (-0.9,-0.95) {seq 1};
+\node[box, fill=purple!10] (ag) at (1.4,-0.65) {AllGather\\when needed};
+\node[box, fill=green!10] (full2) at (3.8,-0.65) {full tensor};
+
+\draw[arrow] (local2) -- (rs);
+\draw[arrow] (rs) -- (s0);
+\draw[arrow] (rs) -- (s1);
+\draw[arrow] (s0) -- (ag);
+\draw[arrow] (s1) -- (ag);
+\draw[arrow] (ag) -- (full2);
+
+\node[align=left, text width=10.5cm] at (0,-2.2) {
+  Sequence Parallel 利用 reduce-scatter 保持 sequence 维 sharded，降低激活显存。
+  后续在需要完整输入的算子前，再通过 all-gather 恢复。
+};
+```
+
+\end{tikzpicture}
+\caption{AllReduce 与 ReduceScatter/AllGather 的关系}
+\label{fig:allreduce-reducescatter-allgather}
+\end{figure}
+
+张量并行中的通信选择不是纯数学问题，而是系统设计问题。需要综合考虑：
+
+\begin{itemize}
+\item 通信量；
+\item 激活显存；
+\item kernel 是否支持 sharded 输入；
+\item 是否能与计算重叠；
+\item NCCL collective 的性能；
+\item rank mapping 与物理拓扑。
+\end{itemize}
+
+\section{Megatron-LM 并行设计}
+\label{sec:megatron-lm-parallel-design}
+
+Megatron-LM 的核心贡献之一，是系统化地把 Transformer 内部的 Linear 层按列/行切分，并组织 tensor model parallel group，使多张 GPU 共同训练一个大 Transformer 模型。
+
+在 Megatron 风格设计中，一个训练作业通常包含多种并行维度：
+
+\begin{itemize}
+\item tensor model parallel；
+\item pipeline model parallel；
+\item data parallel；
+\item sequence parallel；
+\item context parallel 或 expert parallel 等扩展维度。
+\end{itemize}
+
+本章重点关注 tensor model parallel。
+
+\subsection{tensor model parallel group}
+\label{subsec:tensor-model-parallel-group}
+
+Tensor model parallel group 是参与同一个层内张量切分的一组 rank。假设总 GPU 数为：
+[
+W
+]
+即 world size。TP size 为：
+[
+P_{\mathrm{TP}}.
+]
+数据并行 size 为：
+[
+P_{\mathrm{DP}}.
+]
+如果暂不考虑 pipeline parallel，则：
+[
+W=P_{\mathrm{TP}}\cdot P_{\mathrm{DP}}.
+]
+
+例如 $W=8$，$P_{\mathrm{TP}}=2$，则 $P_{\mathrm{DP}}=4$。可以组织为：
+
+[
+\text{TP groups}:
+(0,1),(2,3),(4,5),(6,7),
+]
+[
+\text{DP groups}:
+(0,2,4,6),(1,3,5,7).
+]
+
+同一个 TP group 内的 rank 共同保存一个模型副本的不同 tensor shards；不同 DP group 之间保存不同 replica，并在数据并行维度同步梯度。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+rank/.style={draw, circle, minimum size=0.72cm, align=center, fill=blue!8},
+tpbox/.style={draw, rounded corners=4pt, dashed, thick, fill=orange!5},
+dpbox/.style={draw, rounded corners=4pt, dotted, thick, fill=green!5},
+arrow/.style={-{Latex[length=2.0mm]}, thick}
+]
+
+```
+\node[font=\bfseries] at (0,3.2) {TP Group 与 DP Group 的正交关系};
+
+\foreach \r/\x/\y in {
+  0/-4.2/1.4,1/-3.1/1.4,
+  2/-4.2/0.2,3/-3.1/0.2,
+  4/0.6/1.4,5/1.7/1.4,
+  6/0.6/0.2,7/1.7/0.2
+} {
+  \node[rank] (r\r) at (\x,\y) {\r};
+}
+
+\node[tpbox, fit=(r0)(r1), label={[font=\scriptsize]above:TP group 0}] {};
+\node[tpbox, fit=(r2)(r3), label={[font=\scriptsize]below:TP group 1}] {};
+\node[tpbox, fit=(r4)(r5), label={[font=\scriptsize]above:TP group 2}] {};
+\node[tpbox, fit=(r6)(r7), label={[font=\scriptsize]below:TP group 3}] {};
+
+\draw[green!60!black, thick, dotted] (r0) -- (r2) -- (r6) -- (r4) -- (r0);
+\draw[green!60!black, thick, dotted] (r1) -- (r3) -- (r7) -- (r5) -- (r1);
+
+\node[align=left, text width=10.2cm] at (0,-1.55) {
+  横向虚线框表示 TP group：组内 rank 共同切分同一个模型副本。
+  绿色点线表示 DP group：组内 rank 对应相同 tensor shard 的不同数据并行副本，需要同步梯度。
+};
+```
+
+\end{tikzpicture}
+\caption{Tensor Parallel Group 与 Data Parallel Group 的组织方式}
+\label{fig:tp-dp-groups}
+\end{figure}
+
+这种 group 组织方式非常关键。若 rank mapping 不合理，TP 通信可能跨节点发生，性能会很差。通常希望 TP group 尽量放在同一节点内，利用 NVLink/NVSwitch；DP group 可以跨节点，因为数据并行梯度同步通信量较大但频率和模式更规则，可以利用 RDMA 网络。
+
+\subsection{vocabulary parallel embedding}
+\label{subsec:vocabulary-parallel-embedding}
+
+LLM 的 embedding 和 lm head 与词表大小 $V$ 成正比。当 $V$ 很大时，embedding table 和 output projection 会很大：
+
+[
+\mat{E}\in\mathbb{R}^{V\times H},
+]
+[
+\mat{W}_{\mathrm{lm}}\in\mathbb{R}^{H\times V}.
+]
+
+Vocabulary parallelism 将词表维切分到 TP ranks 上。假设 TP size 为 $P$，每个 rank 保存一段词表：
+
+[
+V_p=\frac{V}{P}.
+]
+Embedding table 被切为：
+[
+\mat{E}
+=======
+
+\begin{bmatrix}
+\mat{E}_0\
+\mat{E}*1\
+\vdots\
+\mat{E}*{P-1}
+\end{bmatrix},
+]
+其中：
+[
+\mat{E}_p\in\mathbb{R}^{V_p\times H}.
+]
+
+对于输入 token id，每个 rank 只处理属于自己词表范围的 token，其余位置输出零向量。然后对所有 rank 的 embedding 输出做 all-reduce sum，得到完整 embedding。
+
+输出 lm head 也可以按词表维切分。每个 rank 计算一部分 logits：
+[
+\mat{Z}*p=\mat{H}\mat{W}*{\mathrm{lm},p},
+]
+其中：
+[
+\mat{Z}*p\in\mathbb{R}^{N*{\mathrm{tok}}\times V_p}.
+]
+训练 cross entropy 时，可以使用 vocabulary parallel cross entropy，避免显式 all-gather 完整 logits。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+vocab/.style={draw, rounded corners=3pt, minimum width=1.15cm, minimum height=1.0cm, align=center},
+box/.style={draw, rounded corners=3pt, minimum width=1.8cm, minimum height=0.65cm, align=center},
+arrow/.style={-{Latex[length=2.0mm]}, thick}
+]
+
+```
+\node[font=\bfseries] at (0,3.1) {Vocabulary Parallel Embedding / LM Head};
+
+\foreach \i/\x/\col in {0/-3.3/red!12,1/-2.1/green!12,2/-0.9/purple!12,3/0.3/yellow!18} {
+  \node[vocab, fill=\col] (v\i) at (\x,1.1) {$V_\i$\\rank \i};
+}
+
+\draw[decorate,decoration={brace,amplitude=5pt},thick]
+  (-3.9,1.85) -- (0.9,1.85)
+  node[midway,above=7pt] {vocabulary dimension split};
+
+\node[box, fill=blue!6] (embed) at (3.0,1.1) {Embedding\\AllReduce sum};
+\foreach \i in {0,1,2,3} {
+  \draw[arrow] (v\i) -- (embed);
+}
+
+\node[box, fill=orange!12] (hidden) at (-2.0,-0.75) {Hidden\\$N,H$};
+\node[box, fill=green!10] (logits) at (1.0,-0.75) {Local logits\\$N,V/P$};
+\node[box, fill=purple!10] (loss) at (4.0,-0.75) {Vocab Parallel\\Cross Entropy};
+
+\draw[arrow] (hidden) -- (logits);
+\draw[arrow] (logits) -- (loss);
+
+\node[align=left, text width=10.2cm] at (0,-2.15) {
+  词表并行避免每个 rank 保存完整 embedding/lm head。
+  对大词表模型，vocabulary parallel cross entropy 还能避免物化完整 logits。
+};
+```
+
+\end{tikzpicture}
+\caption{词表维度上的张量并行}
+\label{fig:vocabulary-parallelism}
+\end{figure}
+
+词表并行对训练大词表模型非常重要。否则 lm head logits：
+[
+B\times S\times V
+]
+可能成为显存峰值和通信瓶颈。
+
+\subsection{sequence parallelism}
+\label{subsec:sequence-parallelism}
+
+Tensor Parallelism 通常切分 hidden 维，但某些操作不适合 hidden 维切分，例如 LayerNorm、RMSNorm、Dropout、Residual Add 等。它们通常需要完整 hidden 向量，但可以沿 sequence 维切分。
+
+Sequence Parallelism 的思想是：在 TP group 内，将激活沿 sequence 维分片，使每个 rank 只保存部分 token 的完整 hidden：
+
+[
+\tensor{X}\in\mathbb{R}^{B\times S\times H}
+\rightarrow
+\tensor{X}_p\in
+\mathbb{R}^{B\times \frac{S}{P}\times H}.
+]
+
+这样，LayerNorm/RMSNorm 可以在本地执行，因为每个 token 的 hidden 维是完整的。相比所有 rank 都保存完整 sequence，激活显存降低约 $P$ 倍。
+
+但是，当进入需要 hidden 维切分的 Column Parallel Linear 时，需要 all-gather sequence shards，让每个 rank 获得完整 sequence 的输入；当 Row Parallel Linear 输出后，可以用 reduce-scatter 再回到 sequence-sharded 状态。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+tensor/.style={draw, rounded corners=3pt, minimum width=2.0cm, minimum height=0.75cm, align=center},
+shard/.style={draw, rounded corners=2pt, minimum width=1.25cm, minimum height=0.5cm, align=center},
+arrow/.style={-{Latex[length=2.1mm]}, thick}
+]
+
+```
+\node[font=\bfseries] at (0,3.25) {Sequence Parallelism：沿序列维切分激活};
+
+\node[tensor, fill=blue!6] (full) at (-5.0,1.1) {$X$\\$B,S,H$};
+\node[tensor, fill=orange!12] (rs) at (-2.7,1.1) {ReduceScatter\\sequence dim};
+
+\foreach \i/\y/\col in {0/1.8/red!12,1/1.1/green!12,2/0.4/purple!12} {
+  \node[shard, fill=\col] (s\i) at (-0.55,\y) {$B,S/P,H$};
+}
+
+\node[tensor, fill=green!10] (norm) at (1.9,1.1) {Norm / Dropout\\local};
+\node[tensor, fill=purple!10] (ag) at (4.5,1.1) {AllGather\\when needed};
+
+\draw[arrow] (full) -- (rs);
+\draw[arrow] (rs) -- (s0);
+\draw[arrow] (rs) -- (s1);
+\draw[arrow] (rs) -- (s2);
+\draw[arrow] (s0) -- (norm);
+\draw[arrow] (s1) -- (norm);
+\draw[arrow] (s2) -- (norm);
+\draw[arrow] (norm) -- (ag);
+
+\node[align=left, text width=10.4cm] at (0,-1.45) {
+  Sequence Parallel 将非 TP 线性层之间的激活按 sequence 维切分。
+  这样 LayerNorm/RMSNorm 等需要完整 hidden 的操作仍可本地执行，同时降低激活显存。
+};
+```
+
+\end{tikzpicture}
+\caption{Sequence Parallelism 的激活切分方式}
+\label{fig:sequence-parallelism}
+\end{figure}
+
+Sequence Parallelism 的收益主要体现在训练显存，尤其是长序列、大 hidden 和大 TP size 场景。但它也引入更多 all-gather/reduce-scatter，对通信实现提出更高要求。
+
+\subsection{activation memory 优化}
+\label{subsec:activation-memory-optimization-in-tp}
+
+张量并行降低了参数和部分激活的显存，但训练中的 activation memory 仍可能很大。常见优化包括：
+
+\begin{itemize}
+\item \textbf{Activation Checkpointing}：少存激活，backward 时重算；
+\item \textbf{Sequence Parallelism}：沿 sequence 维切分非 tensor-parallel 区间的激活；
+\item \textbf{Selective Recomputation}：只重算 attention softmax、MLP activation 等高显存中间结果；
+\item \textbf{FlashAttention}：避免物化完整 attention matrix；
+\item \textbf{Fused Kernels}：减少中间张量写回；
+\item \textbf{Mixed Precision}：使用 BF16/FP16/FP8 降低激活字节数。
+\end{itemize}
+
+一个 Transformer block 的训练显存与 TP 的关系并不是简单的 $1/P$。参数和部分线性层激活会随 TP 切分下降，但 residual stream、norm 输入、dropout mask、attention 中间结果和临时 buffer 不一定都按 TP size 下降。因此工程上需要 profiler 或显存估算工具逐项分析。
+
+可以把 TP 后的每卡显存粗略写为：
+[
+M_{\mathrm{per\ GPU}}
+\approx
+\frac{M_{\mathrm{tp\ shardable}}}{P_{\mathrm{TP}}}
++
+M_{\mathrm{replicated}}
++
+M_{\mathrm{comm\ buffers}}.
+]
+其中：
+
+\begin{itemize}
+\item $M_{\mathrm{tp\ shardable}}$ 是可随 TP 切分的参数、梯度、优化器状态和部分激活；
+\item $M_{\mathrm{replicated}}$ 是仍然复制的状态；
+\item $M_{\mathrm{comm\ buffers}}$ 是 all-gather、all-reduce、reduce-scatter 等通信需要的临时 buffer。
+\end{itemize}
+
+TP size 不是越大越好。随着 TP size 增大：
+
+\begin{itemize}
+\item 每卡参数和计算下降；
+\item 通信频率和相对开销上升；
+\item GEMM 变小，Tensor Core 利用率可能下降；
+\item rank mapping 更依赖高速互联；
+\item 某些 head 数、hidden size、intermediate size 必须能整除 TP size。
+\end{itemize}
+
+\section{张量并行的性能权衡}
+\label{sec:tensor-parallel-performance-tradeoff}
+
+\subsection{计算量下降与通信量上升}
+\label{subsec:compute-down-communication-up}
+
+张量并行将一个大 GEMM 切到 $P$ 个 rank 上。理想情况下，每个 rank 的 GEMM 计算量约下降为：
+[
+\frac{1}{P}.
+]
+但每个 Transformer block 通常会引入若干次 TP collective communication。例如在基础 Megatron 风格中，每层 attention output projection 后有一次 all-reduce，FFN down projection 后有一次 all-reduce。因此每层至少有两次 TP 通信。
+
+如果单层计算时间为：
+[
+T_{\mathrm{compute}}(P)
+\approx
+\frac{T_{\mathrm{compute}}(1)}{P\eta_{\mathrm{gemm}}(P)},
+]
+通信时间为：
+[
+T_{\mathrm{comm}}(P),
+]
+则 TP 后单层时间近似为：
+[
+T_{\mathrm{layer}}(P)
+\approx
+T_{\mathrm{compute}}(P)+T_{\mathrm{comm}}(P).
+]
+
+当 $P$ 较小时，计算下降带来收益；当 $P$ 过大时，GEMM 变小、通信占比上升，收益可能下降甚至反转。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+axis/.style={-{Latex[length=2.2mm]}, thick},
+curve/.style={thick}
+]
+
+```
+\node[font=\bfseries] at (0,3.0) {TP Size 增大时计算与通信的权衡};
+
+\draw[axis] (-5.3,-1.2) -- (5.3,-1.2) node[right] {TP size};
+\draw[axis] (-5.3,-1.2) -- (-5.3,2.2) node[above] {relative time};
+
+\draw[curve, blue!75]
+  plot[smooth] coordinates {
+    (-4.8,1.8) (-3.2,1.05) (-1.6,0.55) (0,0.25) (1.6,0.12) (3.2,0.08) (4.8,0.06)
+  };
+\node[blue!75] at (3.2,0.45) {compute per rank};
+
+\draw[curve, orange!90!black]
+  plot[smooth] coordinates {
+    (-4.8,-0.75) (-3.2,-0.6) (-1.6,-0.35) (0,0.05) (1.6,0.55) (3.2,1.15) (4.8,1.9)
+  };
+\node[orange!90!black] at (3.2,1.6) {communication overhead};
+
+\draw[curve, purple!80]
+  plot[smooth] coordinates {
+    (-4.8,1.2) (-3.2,0.55) (-1.6,0.18) (0,0.0) (1.6,0.18) (3.2,0.7) (4.8,1.45)
+  };
+\node[purple!80] at (0.9,-0.35) {total layer time};
+
+\node[align=left, text width=10.2cm] at (0,-2.35) {
+  TP size 过小无法解决显存和计算瓶颈；TP size 过大则通信和小 GEMM 开销上升。
+  合适的 TP size 通常受节点内高速互联、head 数、hidden size 和模型规模共同约束。
+};
+```
+
+\end{tikzpicture}
+\caption{张量并行中计算收益与通信开销的权衡}
+\label{fig:tp-compute-communication-tradeoff}
+\end{figure}
+
+\subsection{节点内优先原则}
+\label{subsec:intra-node-first-principle}
+
+TP 通信发生在每个 Transformer block 内部，频率很高。因此 TP group 通常应尽量放在同一节点内，利用 NVLink/NVSwitch 等高速互联。
+
+常见经验是：
+
+\begin{itemize}
+\item 单节点 8 GPU 且有 NVSwitch 时，TP size 可选 2、4 或 8；
+\item 尽量避免 TP group 跨低带宽 PCIe 或跨节点网络；
+\item 跨节点通信更适合 DP 或 PP 维度；
+\item rank mapping 应与物理拓扑对齐；
+\item 使用 NCCL tests 验证实际 all-reduce、all-gather、reduce-scatter 带宽。
+\end{itemize}
+
+如果 TP group 跨节点，层内通信会频繁走 RDMA 网络，step time 可能显著上升。除非模型极大、单节点 TP 不够，否则通常优先保持 TP 在节点内。
+
+\subsection{TP 与 batch size}
+\label{subsec:tp-and-batch-size}
+
+TP 切分模型后，每个 rank 的 GEMM 维度会变小。如果 micro-batch 或 sequence length 也较小，GEMM 可能无法充分利用 Tensor Core。矩阵乘法形状大致为：
+[
+(B S)\times H
+\quad
+\text{乘}
+\quad
+H\times \frac{H_{\mathrm{out}}}{P}.
+]
+当 $B S$ 很小或 $H_{\mathrm{out}}/P$ 太小，GEMM 变成小矩阵，吞吐下降。
+
+因此 TP 配置要与 micro-batch、sequence length、hidden size 和 FFN intermediate size 一起考虑。不能只看显存是否足够，还要看 GEMM shape 是否高效。
+
+\subsection{TP 与数值一致性}
+\label{subsec:tp-numerical-consistency}
+
+张量并行改变了规约顺序。浮点数加法不满足严格结合律：
+[
+(a+b)+c \ne a+(b+c)
+]
+在有限精度下可能产生微小差异。因此 TP size 不同、all-reduce 算法不同、rank 数不同，训练结果可能不完全 bitwise identical。
+
+通常这类差异很小，不影响模型收敛。但在调试时需要注意：
+
+\begin{itemize}
+\item 不同 TP size 下 loss 曲线可能有微小差异；
+\item mixed precision 和不同规约顺序会放大数值差异；
+\item checkpoint 在不同 TP size 之间转换需要正确重组权重；
+\item 单元测试应使用合理 tolerance，而不是强制逐 bit 相等。
+\end{itemize}
+
+\section{本章小结}
+\label{sec:chapter08-summary}
+
+本章系统介绍了张量并行的动机、基本原理、Transformer 内部切分方式以及 Megatron-LM 风格的并行设计。
+
+\begin{itemize}
+\item \textbf{数据并行的边界} 是每张 GPU 必须保存完整模型副本；当模型状态单卡放不下时，需要模型并行。
+\item \textbf{张量并行} 将单个 Linear 层或 attention heads 切分到多个 GPU 上，让多张 GPU 共同计算一个 Transformer block。
+\item \textbf{Column Parallel Linear} 按输出维切分权重，forward 可输出 sharded tensor，backward 通常需要对输入梯度 all-reduce。
+\item \textbf{Row Parallel Linear} 按输入维切分权重，forward 需要对局部输出 all-reduce 求和，backward 通常自然得到 sharded 输入梯度。
+\item \textbf{Column + Row 的组合} 可以避免中间 all-gather，只在输出处通信，是 Megatron-LM 张量并行的核心模式。
+\item \textbf{Attention 中的 QKV projection} 通常按 head 做 Column Parallel，每个 rank 本地计算自己负责的 heads。
+\item \textbf{Attention output projection} 通常做 Row Parallel，并在输出处 all-reduce 恢复 replicated residual stream。
+\item \textbf{FFN 中的 up/gate projection} 通常做 Column Parallel，down projection 做 Row Parallel，适合大中间维度的 Transformer MLP。
+\item \textbf{Tensor model parallel group} 定义了哪些 rank 共同切分一个模型副本；它与 data parallel group 正交。
+\item \textbf{Vocabulary parallelism} 将词表维切分到 TP ranks 上，降低 embedding/lm head 显存，并可配合 parallel cross entropy。
+\item \textbf{Sequence Parallelism} 沿 sequence 维切分激活，降低 LayerNorm、Dropout、Residual 等区间的 activation memory。
+\item \textbf{TP size 不是越大越好}：计算量下降的同时通信开销上升，GEMM shape 变小，拓扑和 rank mapping 更关键。
+\end{itemize}
+
+下一章将进入流水线并行 Pipeline Parallelism。我们会分析为什么仅靠张量并行仍无法解决所有问题，如何把模型按层切成多个 pipeline stages，GPipe、1F1B 和 interleaved schedule 如何减少 pipeline bubble，以及 micro-batch 数量如何影响吞吐、显存和调度复杂度。

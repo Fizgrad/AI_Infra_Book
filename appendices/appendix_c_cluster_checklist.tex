@@ -1,0 +1,336 @@
+
+% appendices/appendix_c_cluster_checklist.tex
+
+\chapter{AI 集群上线检查清单}
+
+AI 集群上线不是把 GPU 服务器接入网络、安装驱动、部署 Kubernetes 就结束。对于大模型训练和推理来说，任何一个薄弱环节都会被放大：一块 GPU ECC 异常可能导致训练中断，一条链路带宽不足可能拖垮 AllReduce，一组错误的节点标签可能导致拓扑感知调度失效，一个过慢的共享存储可能让数百张 GPU 等待数据。
+
+本附录给出一份面向生产环境的 AI 集群上线检查清单。读者可以将其改造成内部 Runbook、验收表或故障排查流程。
+
+\section{GPU 健康检查}
+
+\subsection{基础状态}
+
+每台 GPU 节点上线前，应至少检查：
+
+\begin{itemize}
+\item GPU 是否全部可见。
+\item Driver 版本是否符合集群标准。
+\item GPU 型号、显存容量是否与资产记录一致。
+\item 是否存在 Xid 错误。
+\item 是否存在 ECC 错误。
+\item 温度、功耗、风扇状态是否正常。
+\item Persistence Mode 是否按需开启。
+\end{itemize}
+
+基础命令：
+
+\begin{lstlisting}[language=bash,caption={GPU 基础健康检查},label={lst:gpu-health-basic}]
+nvidia-smi
+nvidia-smi -q
+nvidia-smi -L
+\end{lstlisting}
+
+如果集群中存在 MIG，应额外检查 MIG 切分状态：
+
+\begin{lstlisting}[language=bash,caption={MIG 状态检查},label={lst:mig-check}]
+nvidia-smi mig -lgi
+nvidia-smi mig -lci
+\end{lstlisting}
+
+\subsection{错误与告警}
+
+重点关注如下问题：
+
+\begin{itemize}
+\item \textbf{Xid Error}：通常表示 GPU driver、硬件、PCIe 或应用异常。
+\item \textbf{ECC Error}：可能表示显存可靠性问题。
+\item \textbf{GPU Fallen Off Bus}：常见于硬件连接、PCIe、供电或驱动异常。
+\item \textbf{Thermal Throttling}：散热不足会导致性能波动。
+\item \textbf{Power Limit Throttling}：功耗限制可能使 GPU 无法达到预期频率。
+\end{itemize}
+
+生产集群中，不建议让存在持续 Xid 或 ECC 异常的节点进入训练资源池。可以先将节点标记为不可调度，完成硬件诊断后再恢复。
+
+\section{网络连通性检查}
+
+\subsection{基础网络}
+
+多节点训练对网络极其敏感。上线前应检查：
+
+\begin{itemize}
+\item 节点之间 hostname 是否可解析。
+\item 管理网络、存储网络、训练网络是否按设计隔离。
+\item MTU 是否一致。
+\item 多网卡路由是否正确。
+\item 防火墙、安全组、ACL 是否允许训练通信端口。
+\item RDMA / RoCE / InfiniBand 设备是否可见。
+\end{itemize}
+
+基础命令：
+
+\begin{lstlisting}[language=bash,caption={网络基础检查},label={lst:network-basic-check}]
+hostname
+ip addr
+ip route
+ping <peer-node>
+ssh <peer-node>
+\end{lstlisting}
+
+检查 MTU：
+
+\begin{lstlisting}[language=bash,caption={MTU 检查},label={lst:mtu-check}]
+ip link show
+\end{lstlisting}
+
+\subsection{RDMA / InfiniBand / RoCE 检查}
+
+若集群使用 RDMA 网络，应检查 HCA 状态：
+
+\begin{lstlisting}[language=bash,caption={RDMA 设备检查},label={lst:rdma-device-check}]
+ibv_devices
+ibv_devinfo
+rdma link
+\end{lstlisting}
+
+对于 InfiniBand 网络，还可以检查：
+
+\begin{lstlisting}[language=bash,caption={InfiniBand 状态检查},label={lst:ib-check}]
+ibstat
+ibstatus
+\end{lstlisting}
+
+对于 RoCE 网络，应额外关注：
+
+\begin{itemize}
+\item PFC 是否按优先级正确启用。
+\item ECN 标记与拥塞控制是否配置。
+\item 交换机 buffer 与队列策略是否符合设计。
+\item lossless Ethernet 配置是否在所有链路上保持一致。
+\end{itemize}
+
+\section{NCCL 性能检查}
+
+\subsection{单机多卡通信}
+
+单机多卡应先检查 GPU 拓扑：
+
+\begin{lstlisting}[language=bash,caption={单机 GPU 拓扑检查},label={lst:single-node-topo-check}]
+nvidia-smi topo -m
+\end{lstlisting}
+
+然后运行 NCCL Tests：
+
+\begin{lstlisting}[language=bash,caption={单机 NCCL all_reduce 测试},label={lst:single-node-nccl-test}]
+./build/all_reduce_perf -b 8 -e 4G -f 2 -g 8
+\end{lstlisting}
+
+检查重点：
+
+\begin{itemize}
+\item 是否使用预期的 NVLink / NVSwitch / PCIe 路径。
+\item 带宽是否与同型号机器 baseline 接近。
+\item 不同 GPU 组合之间是否存在明显性能差异。
+\end{itemize}
+
+\subsection{多节点通信}
+
+多节点测试应从小规模开始：
+
+\begin{enumerate}
+\item 2 节点，每节点 1 GPU。
+\item 2 节点，每节点 8 GPU。
+\item 多节点完整规模。
+\end{enumerate}
+
+这样可以逐步区分问题来自单机拓扑、跨节点网络还是大规模集合通信。
+
+多节点性能验收指标包括：
+
+\begin{itemize}
+\item AllReduce 带宽。
+\item AllGather 带宽。
+\item ReduceScatter 带宽。
+\item 小消息延迟。
+\item 大消息稳定吞吐。
+\item 长时间压测中的错误率。
+\end{itemize}
+
+\section{存储吞吐检查}
+
+\subsection{训练数据读取}
+
+大模型训练通常需要持续读取大量 tokenized dataset。存储瓶颈会导致 GPU 空转。上线前应验证：
+
+\begin{itemize}
+\item 本地 NVMe 读取吞吐。
+\item 共享文件系统读取吞吐。
+\item 对象存储下载吞吐。
+\item 多节点并发读取下的吞吐。
+\item 小文件场景下的 metadata 性能。
+\end{itemize}
+
+示例命令：
+
+\begin{lstlisting}[language=bash,caption={简单顺序读取测试},label={lst:storage-read-test}]
+dd if=/path/to/large_file of=/dev/null bs=1G count=16 iflag=direct
+\end{lstlisting}
+
+更严谨的测试应使用 \texttt{fio}：
+
+\begin{lstlisting}[language=bash,caption={fio 顺序读取测试示例},label={lst:fio-read-test}]
+fio --name=readtest 
+--filename=/path/to/testfile 
+--rw=read 
+--bs=1M 
+--size=64G 
+--numjobs=4 
+--iodepth=16 
+--direct=1
+\end{lstlisting}
+
+\subsection{Checkpoint 写入}
+
+训练任务不仅读取数据，也会周期性写入 checkpoint。Checkpoint 写入慢会造成训练 step 抖动，甚至导致大规模任务同时阻塞。
+
+应检查：
+
+\begin{itemize}
+\item 单节点写入吞吐。
+\item 多节点并发写入吞吐。
+\item checkpoint 文件数量对 metadata 服务的压力。
+\item 是否支持异步 checkpoint。
+\item checkpoint 保留策略是否明确。
+\end{itemize}
+
+\section{K8s 节点标签与污点检查}
+
+\subsection{节点标签}
+
+AI 集群通常依赖 Kubernetes label 描述节点能力，例如 GPU 型号、GPU 数量、网络能力、拓扑域、存储类型等。上线前应检查标签是否完整且一致。
+
+示例：
+
+\begin{lstlisting}[language=bash,caption={查看 Kubernetes 节点标签},label={lst:k8s-node-labels}]
+kubectl get nodes --show-labels
+kubectl describe node <node-name>
+\end{lstlisting}
+
+常见标签类型包括：
+
+\begin{itemize}
+\item GPU 型号：如 A100、H100、L40S 等。
+\item GPU 数量：如 8-GPU 节点、4-GPU 节点。
+\item 网络类型：如 IB、RoCE、Ethernet。
+\item 拓扑域：如 rack、pod、zone。
+\item 存储能力：如 local-nvme、shared-fs。
+\item 用途分组：如 training、serving、eval。
+\end{itemize}
+
+\subsection{污点与容忍}
+
+为了避免普通 Pod 被调度到 GPU 节点，生产集群中常使用 taint：
+
+\begin{lstlisting}[language=bash,caption={查看节点污点},label={lst:k8s-taints}]
+kubectl describe node <node-name> | grep -i taints
+\end{lstlisting}
+
+常见策略是：
+
+\begin{itemize}
+\item GPU 节点默认添加 taint。
+\item 只有声明 toleration 的训练或推理 Pod 可以调度。
+\item 特殊高性能节点单独划分资源池。
+\item 故障节点添加维护 taint 或直接 cordon。
+\end{itemize}
+
+\section{监控与告警检查}
+
+\subsection{核心监控指标}
+
+AI 集群至少应覆盖以下指标：
+
+\begin{longtable}{p{0.3\textwidth}p{0.6\textwidth}}
+\toprule
+类别 & 指标 \
+\midrule
+GPU & utilization、memory used、temperature、power、ECC、Xid。 \
+CPU & utilization、load average、NUMA、context switch。 \
+Memory & used、available、page cache、OOM。 \
+Network & throughput、packet drop、retransmission、RDMA error、PFC pause。 \
+Storage & read/write throughput、IOPS、latency、metadata ops。 \
+Kubernetes & pending pods、failed pods、node not ready、evictions。 \
+Training & step time、tokens/s、loss、gradient norm、checkpoint time。 \
+Serving & QPS、TTFT、TPOT、batch size、KV Cache usage、request error rate。 \
+\bottomrule
+\end{longtable}
+
+\subsection{告警原则}
+
+告警不应只覆盖“机器挂了”，还应覆盖“性能正在异常下降”。例如：
+
+\begin{itemize}
+\item GPU 利用率长期低于阈值但任务仍在运行。
+\item 某节点网络吞吐明显低于同组节点。
+\item checkpoint 写入耗时持续升高。
+\item 推理服务 TTFT 或 TPOT 超过 SLA。
+\item Pending GPU Pod 数量持续增长。
+\item 某类 GPU 错误在短时间内频繁出现。
+\end{itemize}
+
+\section{作业失败排查流程}
+
+\subsection{训练任务失败}
+
+训练任务失败时，建议按以下顺序排查：
+
+\begin{enumerate}
+\item 查看调度系统事件：任务是否成功分配资源。
+\item 查看 Pod / Job 状态：是否 OOM、Evicted、ImagePullBackOff。
+\item 查看 rank 0 日志：是否有模型、数据或 checkpoint 错误。
+\item 查看所有 rank 日志：是否只有部分 rank 失败。
+\item 查看 NCCL 日志：是否通信初始化或集合通信失败。
+\item 查看节点日志：是否出现 GPU Xid、网络错误或磁盘错误。
+\item 复现小规模任务：判断是否与规模相关。
+\end{enumerate}
+
+\subsection{推理服务异常}
+
+推理服务异常时，建议关注：
+
+\begin{itemize}
+\item 请求是否进入队列但长时间未调度。
+\item prefill 是否成为瓶颈。
+\item decode 阶段 TPOT 是否异常。
+\item KV Cache 是否耗尽。
+\item batch size 是否长期过小或过大。
+\item 是否存在热点模型或热点租户。
+\item autoscaling 是否滞后。
+\end{itemize}
+
+\section{上线验收表}
+
+下面是一份简化版上线验收表，可作为集群交付前的检查模板：
+
+\begin{longtable}{p{0.28\textwidth}p{0.42\textwidth}p{0.18\textwidth}}
+\toprule
+检查项 & 验收标准 & 状态 \
+\midrule
+GPU 可见性 & 所有节点 GPU 数量、型号与资产记录一致 & 待确认 \
+Driver 版本 & 所有 GPU 节点版本一致或符合兼容矩阵 & 待确认 \
+GPU 健康 & 无持续 Xid / ECC / 掉卡异常 & 待确认 \
+单机 NCCL & 单机 AllReduce 带宽达到 baseline & 待确认 \
+跨节点 NCCL & 多节点 AllReduce 带宽达到 baseline & 待确认 \
+RDMA 状态 & HCA 正常，端口 active，错误计数正常 & 待确认 \
+存储读取 & 数据读取吞吐满足训练需求 & 待确认 \
+Checkpoint 写入 & 并发写入不阻塞训练 & 待确认 \
+K8s 标签 & GPU 型号、网络、拓扑、用途标签完整 & 待确认 \
+K8s 污点 & GPU 节点隔离策略生效 & 待确认 \
+监控指标 & GPU、网络、存储、训练、推理指标可见 & 待确认 \
+告警规则 & 故障与性能退化均有告警 & 待确认 \
+\bottomrule
+\end{longtable}
+
+\section{附录 C 小结}
+
+AI 集群的上线验收，本质上是一次端到端系统验证：硬件是否健康，网络是否达到预期，存储是否能支撑数据流，调度系统是否正确理解资源，监控是否能及时暴露问题。只有当这些基础能力稳定后，训练框架、推理引擎和上层平台才能发挥真正价值。

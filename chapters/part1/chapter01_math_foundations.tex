@@ -1,0 +1,1084 @@
+\chapter{线性代数与微积分回顾}
+\label{chap:math-foundations}
+
+\section{为什么 AI Infra 工程师仍然需要数学}
+\label{sec:why-math-for-ai-infra}
+
+很多工程师第一次接触 AI Infrastructure 时，会误以为这里的核心能力只是“会部署 GPU 集群”“会调 NCCL 环境变量”“会把模型用 vLLM 跑起来”。这些能力当然重要，但它们只是表层现象。真正决定一个工程师能否从“调参执行者”成长为“系统架构师”的，是他能否在如下三个层面之间自由切换：
+
+\begin{itemize}
+  \item \textbf{数学层面}：模型的计算究竟是什么？矩阵乘法、归一化、注意力、损失函数和梯度传播在公式上如何定义？
+  \item \textbf{系统层面}：这些数学操作如何变成张量算子、计算图、kernel launch、通信 collective 和调度策略？
+  \item \textbf{硬件层面}：这些算子最终如何落到 GPU 的 register、shared memory、HBM、NVLink、RDMA 网络与存储系统之上？
+\end{itemize}
+
+如果只看系统而不看数学，我们会知道某个训练任务 ``OOM''，却不知道到底是参数、梯度、优化器状态还是激活占用了显存。如果只看数学而不看系统，我们可以写出漂亮的 Transformer 公式，却无法解释为什么同样的模型在不同 batch size、sequence length、tensor parallel size 下吞吐差异巨大。如果只看硬件而不看模型结构，我们会知道 HBM 带宽很贵，却难以判断一个 attention kernel 为什么是 memory-bound，而一个 GEMM kernel 为什么更可能是 compute-bound。
+
+\textbf{AI Infra 的很多问题，本质上是数学对象在工程系统中的生命周期管理问题。}例如：
+
+\begin{itemize}
+  \item 一个参数矩阵 $\mat{W}\in\mathbb{R}^{d_{\mathrm{in}}\times d_{\mathrm{out}}}$ 在训练中不只是一个矩阵，它还伴随梯度 $\nabla \mat{W}$、优化器状态 $\mat{m},\mat{v}$、混合精度 master weight、checkpoint 分片与通信 buffer。
+  \item 一个隐藏状态张量 $\tensor{X}\in\mathbb{R}^{B\times S\times H}$ 在公式中只是 batch、sequence、hidden 三个维度，但在工程中它有具体的 stride、memory layout、是否 contiguous、是否被切分到多个 GPU。
+  \item 一个 softmax 公式看起来简单，但在长上下文 attention 中，若直接物化 $S\times S$ 的 attention matrix，会带来巨大的 HBM 读写压力，这正是 FlashAttention 这类算法诞生的根源。
+\end{itemize}
+
+本章不是为了把线性代数、微积分和概率论重新讲成一门数学课，而是从 AI Infrastructure 的视角重新组织这些知识。我们关心的不是“会不会证明定理”，而是：
+
+\begin{itemize}
+  \item 如何从 shape 推导显存占用；
+  \item 如何从矩阵乘法推导计算量和通信量；
+  \item 如何从链式法则理解反向传播与激活保存；
+  \item 如何从 softmax 和交叉熵理解语言模型训练的数值稳定性；
+  \item 如何从张量 layout 判断算子是否容易被 GPU 高效执行。
+\end{itemize}
+
+\section{向量、矩阵与张量}
+\label{sec:vectors-matrices-tensors}
+
+\subsection{向量空间与基}
+\label{subsec:vector-space-basis}
+
+向量可以被看作一组有序数字，也可以被看作空间中的一个点或方向。在深度学习中，我们更常使用前一种视角：一个 token embedding 是一个向量，一个神经网络隐藏状态是一个向量，一行权重也是一个向量。
+
+设 $\vect{x}\in\mathbb{R}^{d}$，我们通常写作：
+\[
+  \vect{x}
+  =
+  \begin{bmatrix}
+    x_1 & x_2 & \cdots & x_d
+  \end{bmatrix}^{\mathsf{T}}.
+\]
+如果给定一组基向量 $\{\vect{e}_1,\vect{e}_2,\ldots,\vect{e}_d\}$，则任意向量都可以表示为：
+\[
+  \vect{x}=\sum_{i=1}^{d}x_i\vect{e}_i.
+\]
+
+在语言模型中，一个 token 被 tokenizer 映射为离散 id，然后通过 embedding table 查表得到一个连续向量。若词表大小为 $V$，隐藏维度为 $H$，embedding table 可写为：
+\[
+  \mat{E}\in\mathbb{R}^{V\times H}.
+\]
+当 token id 为 $t$ 时，对应 embedding 为：
+\[
+  \vect{x}=\mat{E}_{t,:}\in\mathbb{R}^{H}.
+\]
+
+这个查表操作看似不是矩阵乘法，但也可以等价地看作 one-hot 向量与 embedding matrix 相乘。令 $\vect{o}_t\in\mathbb{R}^{V}$ 是第 $t$ 个位置为 $1$ 的 one-hot 向量，则：
+\[
+  \vect{x}=\vect{o}_t^{\mathsf{T}}\mat{E}.
+\]
+工程上不会真的构造 one-hot 向量，因为那会浪费大量内存与计算；框架通常用 gather 操作直接读取 $\mat{E}$ 的第 $t$ 行。这是本书反复出现的一个主题：\textbf{数学表达强调统一性，工程实现强调避免无效计算和无效访存。}
+
+\subsection{矩阵乘法的几何意义}
+\label{subsec:matrix-multiplication-geometry}
+
+矩阵乘法是深度学习中最重要的计算模式。一个线性层可以写为：
+\[
+  \mat{Y}=\mat{X}\mat{W}+\vect{b},
+\]
+其中：
+\[
+  \mat{X}\in\mathbb{R}^{B\times d_{\mathrm{in}}},
+  \quad
+  \mat{W}\in\mathbb{R}^{d_{\mathrm{in}}\times d_{\mathrm{out}}},
+  \quad
+  \mat{Y}\in\mathbb{R}^{B\times d_{\mathrm{out}}}.
+\]
+
+从几何上看，矩阵 $\mat{W}$ 将输入空间中的向量映射到输出空间；从工程上看，矩阵乘法是一个高度规则的三重循环：
+\[
+  Y_{ij}=\sum_{k=1}^{d_{\mathrm{in}}}X_{ik}W_{kj}.
+\]
+其乘加操作数量近似为：
+\[
+  \mathrm{FLOPs}\approx 2B\,d_{\mathrm{in}}\,d_{\mathrm{out}},
+\]
+这里乘法和加法各算一次浮点操作。
+
+在 GPU 上，矩阵乘法之所以高效，是因为它具有三个重要特征：
+
+\begin{itemize}
+  \item \textbf{规则访存}：输入和权重以规则块状方式读取，适合 coalesced memory access。
+  \item \textbf{高算术强度}：同一块数据可以被多次复用，单位字节访存对应较多计算。
+  \item \textbf{易于分块}：可以将大矩阵切分成 tile，映射到 CUDA block、warp 和 Tensor Core。
+\end{itemize}
+
+然而，大模型系统里并不是所有操作都像 GEMM 一样幸运。LayerNorm、softmax、embedding lookup、KV Cache 读取等操作往往具有较低算术强度，容易受内存带宽限制。理解矩阵乘法的规律，有助于我们在后续章节中区分 \textbf{compute-bound} 与 \textbf{memory-bound} 算子。
+
+\begin{table}[H]
+  \centering
+  \small
+  \caption{常见深度学习张量操作的数学视角与系统视角}
+  \label{tab:math-vs-system-view}
+  \begin{tabular}{p{0.20\textwidth}p{0.34\textwidth}p{0.34\textwidth}}
+    \toprule
+    \textbf{操作} & \textbf{数学视角} & \textbf{系统视角} \\
+    \midrule
+    Linear / GEMM
+    & 矩阵乘法 $\mat{Y}=\mat{X}\mat{W}$
+    & 高吞吐 dense compute，适合 Tensor Core，通常追求高 occupancy 和高数据复用。 \\
+    \midrule
+    LayerNorm
+    & 对 hidden 维求均值和方差
+    & reduction + elementwise，访存密集，kernel fusion 很重要。 \\
+    \midrule
+    Softmax
+    & 指数归一化 $\exp(x_i)/\sum_j\exp(x_j)$
+    & 需要 max 和 sum reduction，数值稳定性与访存模式都关键。 \\
+    \midrule
+    Attention
+    & $\softmax(\mat{Q}\mat{K}^{\mathsf{T}}/\sqrt{d_k})\mat{V}$
+    & 若直接物化 attention matrix，会产生巨大中间张量和 HBM IO。 \\
+    \midrule
+    Embedding
+    & one-hot 乘 embedding matrix
+    & 实际为 gather，随机访问较多，缓存局部性差异明显。 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\subsection{张量的 shape、stride 与 memory layout}
+\label{subsec:tensor-shape-stride-layout}
+
+张量是向量和矩阵的推广。一个三维张量可以写为：
+\[
+  \tensor{X}\in\mathbb{R}^{B\times S\times H},
+\]
+其中 $B$ 是 batch size，$S$ 是 sequence length，$H$ 是 hidden size。对于 Decoder-only LLM，这样的张量通常表示一批 token 序列在某一层 Transformer block 中的隐藏状态。
+
+\textbf{shape} 描述张量每个维度的大小；\textbf{stride} 描述沿某个维度移动一个单位时，底层存储地址需要跳过多少个元素。设一个三维张量采用 row-major 连续布局，即最后一个维度连续，则：
+\[
+  \mathrm{shape}=(B,S,H),
+\]
+对应 stride 为：
+\[
+  \mathrm{stride}=(S\cdot H,\;H,\;1).
+\]
+元素 $X_{b,s,h}$ 的线性偏移量为：
+\[
+  \mathrm{offset}(b,s,h)=b\cdot S H+s\cdot H+h.
+\]
+
+这条公式看似基础，却是理解 GPU 性能的入口。因为 GPU 访存效率高度依赖相邻线程是否访问相邻地址。如果一个 kernel 让同一个 warp 中的线程沿 hidden 维访问连续元素，就更容易形成合并访存；如果沿 batch 维访问，则相邻线程之间可能相隔 $S\cdot H$ 个元素，访存效率会显著下降。
+
+\begin{figure}[H]
+  \centering
+  \begin{tikzpicture}[
+      font=\small,
+      tensor/.style={draw, rounded corners=2pt, minimum width=2.2cm, minimum height=0.8cm, align=center, fill=blue!6},
+      cell/.style={draw, minimum width=0.42cm, minimum height=0.42cm},
+      arrow/.style={-{Latex[length=2.5mm]}, thick}
+    ]
+
+    \node[align=center] at (0,3.0) {\textbf{逻辑张量视图}\\$\tensor{X}\in\mathbb{R}^{B\times S\times H}$};
+
+    \foreach \b/\xshift in {0/0,1/0.45} {
+      \begin{scope}[xshift=\xshift cm,yshift=-\xshift cm]
+        \draw[fill=blue!4,draw=blue!60] (-2,0) rectangle (1.2,1.8);
+        \foreach \i in {0,...,3} {
+          \draw[blue!45] (-2,{0.45*\i}) -- (1.2,{0.45*\i});
+        }
+        \foreach \j in {0,...,7} {
+          \draw[blue!45] ({-2+0.4*\j},0) -- ({-2+0.4*\j},1.8);
+        }
+      \end{scope}
+    }
+
+    \node at (-2.35,1.9) {$B$};
+    \node at (-2.25,-0.25) {$S$};
+    \node at (1.45,0.75) {$H$};
+
+    \node[tensor] (shape) at (4.2,1.4) {shape\\$(B,S,H)$};
+    \node[tensor] (stride) at (4.2,0.2) {stride\\$(SH,H,1)$};
+    \draw[arrow] (1.4,1.0) -- (shape.west);
+    \draw[arrow] (1.4,0.4) -- (stride.west);
+
+    \node[align=center] at (0,-1.2) {\textbf{连续物理存储：最后一维 $H$ 相邻}};
+    \foreach \i in {0,...,15} {
+      \node[cell, fill=green!6] (c\i) at ({-3.4+0.42*\i},-2.0) {};
+    }
+    \node[font=\scriptsize] at (-3.4,-2.55) {$X_{0,0,0}$};
+    \node[font=\scriptsize] at (-2.14,-2.55) {$X_{0,0,3}$};
+    \node[font=\scriptsize] at (-0.04,-2.55) {$X_{0,1,0}$};
+    \node[font=\scriptsize] at (2.06,-2.55) {$\cdots$};
+
+    \draw[decorate,decoration={brace,amplitude=4pt},thick]
+      (-3.6,-1.65) -- (-2.0,-1.65)
+      node[midway,above=6pt,font=\scriptsize] {同一 token 的 hidden 维连续};
+
+    \node[align=left, text width=4.8cm] at (4.8,-1.8) {
+      \textbf{工程含义：}\\
+      沿 $H$ 维访问通常更友好；\\
+      transpose、view、slice 可能改变 stride；\\
+      non-contiguous tensor 可能触发额外 copy。
+    };
+  \end{tikzpicture}
+  \caption{张量 shape、stride 与连续内存布局示意图}
+  \label{fig:tensor-shape-stride-layout}
+\end{figure}
+
+在 PyTorch 中，很多操作并不立即复制数据，而是改变张量的 metadata。例如 \texttt{view}、\texttt{transpose}、\texttt{permute} 可能改变 shape 或 stride。一个常见性能陷阱是：模型代码中反复对张量做转置，然后传给需要连续内存的 kernel，框架不得不隐式调用 \texttt{contiguous()}，导致额外 HBM 读写。
+
+\begin{lstlisting}[language=Python,caption={观察 PyTorch 张量的 shape、stride 与 contiguous 状态},label={lst:pytorch-shape-stride}]
+import torch
+
+B, S, H = 2, 4, 8
+x = torch.randn(B, S, H, device="cuda")
+
+print("x.shape      =", x.shape)
+print("x.stride     =", x.stride())
+print("x.contiguous =", x.is_contiguous())
+
+# Transpose sequence and hidden dimensions.
+# This usually changes the stride metadata but does not copy data immediately.
+y = x.transpose(1, 2)
+
+print("y.shape      =", y.shape)
+print("y.stride     =", y.stride())
+print("y.contiguous =", y.is_contiguous())
+
+# Some kernels require contiguous inputs.
+# contiguous() creates a new physical layout if needed.
+z = y.contiguous()
+
+print("z.shape      =", z.shape)
+print("z.stride     =", z.stride())
+print("z.contiguous =", z.is_contiguous())
+\end{lstlisting}
+
+上面的代码在训练框架中非常常见。对于小模型，它带来的额外 copy 可能不明显；但在长上下文 LLM 中，一个形如 $(B,S,H)$ 的激活张量可能有数百 MB，隐式 \texttt{contiguous()} 会成为不可忽视的开销。
+
+\subsection{batch 维度与广播机制}
+\label{subsec:batch-broadcasting}
+
+广播机制允许不同 shape 的张量在不显式复制数据的情况下进行逐元素运算。例如：
+\[
+  \tensor{X}\in\mathbb{R}^{B\times S\times H},
+  \quad
+  \vect{b}\in\mathbb{R}^{H},
+\]
+则：
+\[
+  Y_{b,s,h}=X_{b,s,h}+b_h.
+\]
+在逻辑上，$\vect{b}$ 被扩展到 $(B,S,H)$；在工程实现中，理想情况下并不会真的复制 $B\cdot S$ 份 bias，而是在 kernel 中通过索引复用同一段内存。
+
+\begin{figure}[H]
+  \centering
+  \begin{tikzpicture}[
+      font=\small,
+      box/.style={draw, rounded corners=2pt, align=center, minimum height=0.9cm},
+      arrow/.style={-{Latex[length=2.5mm]}, thick},
+      smallcell/.style={draw, minimum width=0.48cm, minimum height=0.42cm}
+    ]
+
+    \node[box, fill=blue!6, minimum width=3.0cm] (x) at (-4.4,1.4)
+      {$\tensor{X}$\\$(B,S,H)$};
+    \node[box, fill=orange!10, minimum width=2.3cm] (b) at (-4.4,-0.1)
+      {$\vect{b}$\\$(H)$};
+
+    \node[box, fill=green!8, minimum width=3.2cm] (y) at (3.9,0.65)
+      {$\tensor{Y}=\tensor{X}+\vect{b}$\\$(B,S,H)$};
+
+    \draw[arrow] (x.east) -- node[above] {elementwise add} (y.west);
+    \draw[arrow] (b.east) -- node[below] {broadcast on $B,S$} (y.west);
+
+    \node[align=center] at (-0.25,2.6) {\textbf{广播不是复制，而是索引规则}};
+    \foreach \i in {0,...,5} {
+      \node[smallcell, fill=orange!10] (bias\i) at ({-1.5+0.5*\i},1.5) {};
+    }
+    \node[font=\scriptsize] at (-1.5,1.0) {$b_0$};
+    \node[font=\scriptsize] at (1.0,1.0) {$b_{H-1}$};
+
+    \foreach \row/\yy in {0/0.25,1/-0.25,2/-0.75} {
+      \foreach \i in {0,...,5} {
+        \node[smallcell, fill=blue!5] at ({-1.5+0.5*\i},\yy) {};
+      }
+    }
+
+    \draw[decorate,decoration={brace,amplitude=4pt},thick]
+      (-1.75,0.55) -- (1.25,0.55)
+      node[midway,above=6pt,font=\scriptsize] {同一 bias 向量被多个 $(b,s)$ 位置复用};
+
+    \node[align=left, text width=5.2cm] at (0.0,-2.0) {
+      在 LayerNorm、RMSNorm、bias add、residual add 中，广播非常常见。\\
+      好的 kernel 会把广播、激活函数、归一化等 elementwise 操作融合，减少 HBM 往返。
+    };
+  \end{tikzpicture}
+  \caption{batch 维度与广播机制示意图}
+  \label{fig:tensor-broadcasting}
+\end{figure}
+
+广播虽然方便，但也可能隐藏开销。若某个操作不支持 stride 为 $0$ 或不规则 stride 的广播输入，框架可能会先把广播结果 materialize 成完整张量。对于大模型而言，这类“看不见的张量”经常是性能问题的根源。
+
+\section{矩阵分解与深度学习中的低秩思想}
+\label{sec:matrix-factorization-low-rank}
+
+\subsection{特征值与特征向量}
+\label{subsec:eigenvalue-eigenvector}
+
+对于方阵 $\mat{A}\in\mathbb{R}^{n\times n}$，如果存在非零向量 $\vect{v}$ 和标量 $\lambda$，使得：
+\[
+  \mat{A}\vect{v}=\lambda\vect{v},
+\]
+则称 $\lambda$ 是 $\mat{A}$ 的特征值，$\vect{v}$ 是对应的特征向量。
+
+直观地说，特征向量是在矩阵变换下方向不变的向量，特征值表示该方向被拉伸或压缩的比例。虽然现代大模型工程中很少直接对巨大的权重矩阵做完整特征分解，但这个概念仍然帮助我们理解很多问题：
+
+\begin{itemize}
+  \item 优化中的 Hessian 特征值分布影响训练稳定性；
+  \item 梯度下降在不同曲率方向上的收敛速度不同；
+  \item 模型压缩和低秩近似依赖“主要方向”与“次要方向”的区分；
+  \item LoRA 等参数高效微调方法假设任务增量可以落在较低维子空间中。
+\end{itemize}
+
+\subsection{SVD 分解}
+\label{subsec:svd}
+
+对于任意矩阵 $\mat{A}\in\mathbb{R}^{m\times n}$，奇异值分解写作：
+\[
+  \mat{A}=\mat{U}\mat{\Sigma}\mat{V}^{\mathsf{T}},
+\]
+其中：
+\[
+  \mat{U}\in\mathbb{R}^{m\times m},\quad
+  \mat{\Sigma}\in\mathbb{R}^{m\times n},\quad
+  \mat{V}\in\mathbb{R}^{n\times n}.
+\]
+矩阵 $\mat{\Sigma}$ 的对角线元素 $\sigma_1,\sigma_2,\ldots$ 称为奇异值，通常按从大到小排列：
+\[
+  \sigma_1\geq\sigma_2\geq\cdots\geq 0.
+\]
+
+如果只保留最大的 $r$ 个奇异值，可以得到 rank-$r$ 近似：
+\[
+  \mat{A}\approx \mat{U}_r\mat{\Sigma}_r\mat{V}_r^{\mathsf{T}}.
+\]
+这个近似在 Frobenius 范数意义下是最优的：
+\[
+  \mat{A}_r
+  =
+  \arg\min_{\operatorname{rank}(\mat{B})\le r}
+  \|\mat{A}-\mat{B}\|_F.
+\]
+
+工程上，完整 SVD 对大模型权重通常过于昂贵，但“低秩结构”的思想非常重要。它告诉我们：如果一个矩阵的有效信息主要集中在少数方向上，就可能用更少的参数表达它。
+
+\subsection{低秩近似与 LoRA 的直觉}
+\label{subsec:low-rank-lora}
+
+设线性层权重为：
+\[
+  \mat{W}\in\mathbb{R}^{d_{\mathrm{in}}\times d_{\mathrm{out}}}.
+\]
+一次完整微调会直接更新 $\mat{W}$：
+\[
+  \mat{W}'=\mat{W}+\Delta\mat{W}.
+\]
+LoRA 的核心思想是：不直接学习完整的 $\Delta\mat{W}$，而是假设它可以由两个低秩矩阵相乘近似：
+\[
+  \Delta\mat{W}=\mat{B}\mat{A},
+\]
+其中：
+\[
+  \mat{A}\in\mathbb{R}^{r\times d_{\mathrm{out}}},
+  \quad
+  \mat{B}\in\mathbb{R}^{d_{\mathrm{in}}\times r},
+  \quad
+  r\ll \min(d_{\mathrm{in}},d_{\mathrm{out}}).
+\]
+参数量从：
+\[
+  d_{\mathrm{in}}d_{\mathrm{out}}
+\]
+下降为：
+\[
+  r(d_{\mathrm{in}}+d_{\mathrm{out}}).
+\]
+
+当 $d_{\mathrm{in}}=d_{\mathrm{out}}=4096$ 且 $r=8$ 时，完整矩阵参数量为：
+\[
+  4096^2=16,777,216,
+\]
+而低秩增量参数量为：
+\[
+  8(4096+4096)=65,536.
+\]
+两者相差 $256$ 倍。这也是 LoRA 在微调系统中极具工程价值的原因：它不仅减少可训练参数，还减少优化器状态、梯度通信和 checkpoint 大小。
+
+\begin{figure}[H]
+  \centering
+  \begin{tikzpicture}[
+      font=\small,
+      matbox/.style={draw, rounded corners=2pt, align=center, fill=blue!6},
+      lowrank/.style={draw, rounded corners=2pt, align=center, fill=orange!12},
+      arrow/.style={-{Latex[length=2.5mm]}, thick}
+    ]
+
+    \node[matbox, minimum width=2.8cm, minimum height=3.0cm] (A) at (-4.2,0)
+      {$\Delta\mat{W}$\\[2mm]$d_{\mathrm{in}}\times d_{\mathrm{out}}$\\[2mm]\textbf{完整更新}};
+    \node at (-1.75,0) {$\approx$};
+
+    \node[lowrank, minimum width=1.0cm, minimum height=3.0cm] (B) at (-0.4,0)
+      {$\mat{B}$\\[2mm]$d_{\mathrm{in}}\times r$};
+    \node at (0.65,0) {$\times$};
+    \node[lowrank, minimum width=3.0cm, minimum height=1.0cm] (C) at (2.55,0)
+      {$\mat{A}$\\[2mm]$r\times d_{\mathrm{out}}$};
+
+    \draw[decorate,decoration={brace,amplitude=5pt},thick]
+      (-0.95,-1.75) -- (4.1,-1.75)
+      node[midway,below=7pt] {低秩瓶颈 $r\ll d$};
+
+    \node[align=left, text width=4.4cm] at (2.3,2.0) {
+      \textbf{Infra 视角：}\\
+      可训练参数减少；\\
+      Adam 状态减少；\\
+      梯度同步减少；\\
+      checkpoint 与加载成本减少。
+    };
+
+    \draw[arrow] (-4.2,-2.15) -- node[below] {从大矩阵更新转为低秩增量学习} (2.55,-2.15);
+  \end{tikzpicture}
+  \caption{低秩矩阵分解与 LoRA 增量权重的直觉}
+  \label{fig:low-rank-lora}
+\end{figure}
+
+\subsection{从矩阵分解理解模型压缩}
+\label{subsec:model-compression-low-rank}
+
+低秩近似可以用于模型压缩。设某个线性层权重为 $\mat{W}\in\mathbb{R}^{m\times n}$，如果我们用：
+\[
+  \mat{W}\approx \mat{U}\mat{V},
+  \quad
+  \mat{U}\in\mathbb{R}^{m\times r},
+  \quad
+  \mat{V}\in\mathbb{R}^{r\times n},
+\]
+代替原矩阵，那么原来的前向传播：
+\[
+  \vect{y}=\vect{x}\mat{W}
+\]
+可以变为：
+\[
+  \vect{y}=(\vect{x}\mat{U})\mat{V}.
+\]
+
+参数量由 $mn$ 变为 $r(m+n)$。计算量也类似下降。但这并不意味着低秩分解总是让推理更快，原因包括：
+
+\begin{itemize}
+  \item 两个小 GEMM 未必比一个大 GEMM 更容易充分利用 Tensor Core；
+  \item rank 太小时精度损失明显，rank 太大时压缩收益不足；
+  \item 额外 kernel launch、内存读写和中间激活可能抵消部分收益；
+  \item 在 tensor parallel 场景中，低秩分解可能改变通信路径。
+\end{itemize}
+
+因此，AI Infra 工程师不能只看参数量，还要看 \textbf{实际 kernel 形状、硬件吞吐、访存模式与通信代价}。一个数学上更小的模型，在系统上不一定更快。
+
+\section{微积分与自动微分}
+\label{sec:calculus-autodiff}
+
+\subsection{导数、偏导与梯度}
+\label{subsec:derivative-gradient}
+
+训练神经网络的核心是最小化损失函数。设参数为 $\vect{\theta}$，训练目标可以写为：
+\[
+  \min_{\vect{\theta}}\; \mathcal{L}(\vect{\theta}).
+\]
+梯度下降更新为：
+\[
+  \vect{\theta}_{t+1}
+  =
+  \vect{\theta}_t-\eta\nabla_{\vect{\theta}}\mathcal{L}(\vect{\theta}_t),
+\]
+其中 $\eta$ 是学习率，$\nabla_{\vect{\theta}}\mathcal{L}$ 是损失对参数的梯度。
+
+对于多元函数 $f:\mathbb{R}^{n}\rightarrow\mathbb{R}$，梯度定义为：
+\[
+  \nabla_{\vect{x}}f
+  =
+  \begin{bmatrix}
+    \frac{\partial f}{\partial x_1}&
+    \frac{\partial f}{\partial x_2}&
+    \cdots&
+    \frac{\partial f}{\partial x_n}
+  \end{bmatrix}^{\mathsf{T}}.
+\]
+梯度方向是函数增长最快的方向，负梯度方向是局部下降最快的方向。
+
+对 AI Infra 而言，梯度不仅是数学对象，也是系统对象。每个参数张量通常都有对应梯度张量；在数据并行训练中，多个 GPU 上的梯度需要通过 all-reduce 或 reduce-scatter 同步；在 ZeRO 中，梯度可能被切分保存；在混合精度训练中，梯度可能还要经历 loss scaling、unscale、overflow check 等步骤。
+
+\subsection{链式法则}
+\label{subsec:chain-rule}
+
+反向传播的数学核心是链式法则。若：
+\[
+  y=f(u),\quad u=g(x),
+\]
+则：
+\[
+  \frac{dy}{dx}
+  =
+  \frac{dy}{du}
+  \frac{du}{dx}.
+\]
+
+对于向量函数，链式法则表现为 Jacobian 的乘法。设：
+\[
+  \vect{y}=f(\vect{u}),\quad \vect{u}=g(\vect{x}),
+\]
+则：
+\[
+  \frac{\partial \vect{y}}{\partial \vect{x}}
+  =
+  \frac{\partial \vect{y}}{\partial \vect{u}}
+  \frac{\partial \vect{u}}{\partial \vect{x}}.
+\]
+
+在神经网络中，计算图由许多局部操作组成。反向传播并不会显式构造完整 Jacobian，而是从输出损失开始，逐个节点传播 \textbf{vector-Jacobian product}。这也是反向模式自动微分高效的原因：当输出是标量 loss，而参数数量巨大时，反向模式只需一次 backward 就能得到所有参数的梯度。
+
+考虑一个两层 MLP：
+\[
+  \mat{H}=\operatorname{ReLU}(\mat{X}\mat{W}_1+\vect{b}_1),
+\]
+\[
+  \mat{Y}=\mat{H}\mat{W}_2+\vect{b}_2,
+\]
+\[
+  \mathcal{L}=\ell(\mat{Y},\mat{T}).
+\]
+反向传播会依次计算：
+\[
+  \frac{\partial \mathcal{L}}{\partial \mat{W}_2},
+  \quad
+  \frac{\partial \mathcal{L}}{\partial \mat{H}},
+  \quad
+  \frac{\partial \mathcal{L}}{\partial \mat{W}_1}.
+\]
+为了计算这些梯度，前向传播中的某些中间结果必须被保存，例如 $\mat{X}$、$\mat{H}$、ReLU mask 等。这就是激活显存的来源。
+
+\begin{figure}[H]
+  \centering
+  \begin{tikzpicture}[
+      font=\small,
+      op/.style={draw, rounded corners=2pt, minimum width=1.55cm, minimum height=0.8cm, align=center, fill=blue!6},
+      data/.style={draw, rounded corners=2pt, minimum width=1.35cm, minimum height=0.7cm, align=center, fill=green!7},
+      grad/.style={-{Latex[length=2.5mm]}, thick, red!70},
+      fwd/.style={-{Latex[length=2.5mm]}, thick, blue!70},
+      save/.style={draw, dashed, rounded corners=2pt, fill=yellow!10, inner sep=5pt}
+    ]
+
+    \node[data] (x) at (-5.4,0) {$\mat{X}$};
+    \node[op] (linear1) at (-3.6,0) {Linear\\$\mat{W}_1$};
+    \node[op] (relu) at (-1.7,0) {ReLU};
+    \node[data] (h) at (0.0,0) {$\mat{H}$};
+    \node[op] (linear2) at (1.8,0) {Linear\\$\mat{W}_2$};
+    \node[op] (loss) at (3.8,0) {Loss\\$\mathcal{L}$};
+
+    \draw[fwd] (x) -- (linear1);
+    \draw[fwd] (linear1) -- (relu);
+    \draw[fwd] (relu) -- (h);
+    \draw[fwd] (h) -- (linear2);
+    \draw[fwd] (linear2) -- (loss);
+
+    \draw[grad] (loss.south) .. controls (3.0,-1.4) and (2.1,-1.4) .. (linear2.south);
+    \draw[grad] (linear2.south) .. controls (1.0,-1.8) and (0.2,-1.8) .. (h.south);
+    \draw[grad] (h.south) .. controls (-0.9,-1.8) and (-1.5,-1.8) .. (relu.south);
+    \draw[grad] (relu.south) .. controls (-2.4,-1.4) and (-3.0,-1.4) .. (linear1.south);
+
+    \node[save, fit=(x)(h)] (saved) {};
+    \node[font=\scriptsize, align=center] at (-2.6,0.95) {前向保存的激活\\用于 backward};
+
+    \node[align=left, text width=5.8cm] at (0,-2.75) {
+      蓝色箭头表示前向计算，红色箭头表示梯度反传。\\
+      反向传播不是免费的：它需要前向激活、额外 kernel、梯度张量和通信同步。
+    };
+  \end{tikzpicture}
+  \caption{计算图中的前向路径、激活保存与反向传播路径}
+  \label{fig:autograd-computation-graph}
+\end{figure}
+
+\subsection{Jacobian 与 Hessian 的工程意义}
+\label{subsec:jacobian-hessian}
+
+Jacobian 描述向量输出对向量输入的一阶导数。若 $f:\mathbb{R}^{n}\rightarrow\mathbb{R}^{m}$，则：
+\[
+  \mat{J}_{ij}
+  =
+  \frac{\partial f_i}{\partial x_j},
+  \quad
+  \mat{J}\in\mathbb{R}^{m\times n}.
+\]
+Hessian 描述标量函数对向量输入的二阶导数：
+\[
+  \mat{H}_{ij}
+  =
+  \frac{\partial^2 f}{\partial x_i\partial x_j},
+  \quad
+  \mat{H}\in\mathbb{R}^{n\times n}.
+\]
+
+对于拥有数十亿参数的 LLM，显式构造 Hessian 几乎不现实，因为它需要 $O(n^2)$ 存储。但 Hessian 的思想仍然广泛存在：
+
+\begin{itemize}
+  \item Adam 使用一阶梯度的二阶矩估计，虽然不是 Hessian，但体现了不同参数方向尺度不同的事实；
+  \item 二阶量化方法会使用 Hessian 或其近似来估计量化误差对 loss 的影响；
+  \item 训练稳定性分析经常关心曲率、sharpness、梯度爆炸与梯度消失；
+  \item 一些优化器使用 Hessian-vector product，而不是显式 Hessian。
+\end{itemize}
+
+Hessian-vector product 可以写为：
+\[
+  \mat{H}\vect{v}
+  =
+  \nabla_{\vect{x}}
+  \left(
+    \nabla_{\vect{x}}f(\vect{x})^{\mathsf{T}}\vect{v}
+  \right).
+\]
+这个公式说明：通过自动微分，我们可以在不显式构造 Hessian 的情况下计算它与向量的乘积。这种“避免物化大矩阵”的思想，与后续 FlashAttention 避免物化 attention matrix 的系统思想非常相似。
+
+\subsection{前向模式与反向模式自动微分}
+\label{subsec:forward-reverse-autodiff}
+
+自动微分主要有两种模式：
+
+\begin{itemize}
+  \item \textbf{前向模式}：从输入出发，随着计算图向前传播导数，适合输入维度少、输出维度多的情况。
+  \item \textbf{反向模式}：从输出出发，沿计算图反向传播梯度，适合输出维度少、输入维度多的情况。
+\end{itemize}
+
+深度学习训练通常最小化一个标量 loss，而参数数量巨大，因此反向模式更合适。
+
+设计算图中某个节点为：
+\[
+  v_i=f_i(v_{p_1},v_{p_2},\ldots).
+\]
+反向模式维护 adjoint：
+\[
+  \bar{v}_i=\frac{\partial \mathcal{L}}{\partial v_i}.
+\]
+若 $v_i$ 是 $v_j$ 的输入，则反向传播根据局部导数累加：
+\[
+  \bar{v}_i
+  \leftarrow
+  \bar{v}_i+
+  \bar{v}_j
+  \frac{\partial v_j}{\partial v_i}.
+\]
+
+\begin{lstlisting}[language=Python,caption={极简反向模式自动微分核心逻辑},label={lst:tiny-reverse-mode-autodiff}]
+class Node:
+    def __init__(self, value, parents=(), backward_fn=None):
+        self.value = value
+        self.parents = parents
+        self.grad = 0.0
+        self.backward_fn = backward_fn
+
+def add(a, b):
+    out = Node(a.value + b.value, parents=(a, b))
+
+    def backward():
+        # d(a + b) / da = 1
+        # d(a + b) / db = 1
+        a.grad += out.grad
+        b.grad += out.grad
+
+    out.backward_fn = backward
+    return out
+
+def mul(a, b):
+    out = Node(a.value * b.value, parents=(a, b))
+
+    def backward():
+        # d(a * b) / da = b
+        # d(a * b) / db = a
+        a.grad += out.grad * b.value
+        b.grad += out.grad * a.value
+
+    out.backward_fn = backward
+    return out
+
+def backward(loss, topo_order):
+    # Seed gradient: dL / dL = 1.
+    loss.grad = 1.0
+
+    # Reverse topological traversal.
+    # Each node pushes its gradient to its parents.
+    for node in reversed(topo_order):
+        if node.backward_fn is not None:
+            node.backward_fn()
+\end{lstlisting}
+
+真实框架当然远比这段代码复杂：它需要处理张量 shape、广播梯度归约、in-place 操作、混合精度、分布式通信、动态图生命周期、activation checkpointing、CUDA stream 等问题。但反向模式的核心思想仍然如此：\textbf{前向构图，反向沿图传播梯度。}
+
+\subsection{激活保存、重计算与显存权衡}
+\label{subsec:activation-recompute-memory}
+
+在训练中，显存主要由以下部分组成：
+
+\begin{itemize}
+  \item 参数 parameters；
+  \item 梯度 gradients；
+  \item 优化器状态 optimizer states；
+  \item 前向激活 activations；
+  \item 临时 buffer，例如通信 buffer、workspace、attention 中间结果。
+\end{itemize}
+
+对于很深的模型，激活显存可能非常可观。若每层保存一个形如 $(B,S,H)$ 的激活，层数为 $L$，数据类型为 FP16，则仅这一项粗略为：
+\[
+  M_{\mathrm{act}}
+  \approx
+  L\cdot B\cdot S\cdot H\cdot 2\ \mathrm{bytes}.
+\]
+实际情况还要乘上若干常数，因为 attention、MLP、norm、dropout 等都会保存不同中间结果。
+
+Gradient Checkpointing 的思想是：前向时只保存部分节点，反向时重新计算缺失的中间激活，以计算换显存。它体现了 AI Infra 中非常典型的 trade-off：
+\[
+  \text{显存下降}
+  \quad\Longleftrightarrow\quad
+  \text{额外计算上升}.
+\]
+在 GPU 集群中，这种 trade-off 还会进一步影响 pipeline bubble、通信重叠和吞吐稳定性。
+
+\section{概率、熵与交叉熵}
+\label{sec:probability-entropy-crossentropy}
+
+\subsection{概率分布与采样}
+\label{subsec:distribution-sampling}
+
+语言模型的输出不是一个确定的 token，而是下一个 token 的概率分布。设词表大小为 $V$，模型在位置 $t$ 输出 logits：
+\[
+  \vect{z}_t\in\mathbb{R}^{V}.
+\]
+通过 softmax 得到概率：
+\[
+  p(x_{t+1}=i\mid x_{\le t})
+  =
+  \frac{\exp(z_{t,i})}{\sum_{j=1}^{V}\exp(z_{t,j})}.
+\]
+
+训练时，我们通常最大化真实下一个 token 的概率；推理时，我们可以从该分布中采样，也可以选择概率最大的 token。不同采样策略包括：
+
+\begin{itemize}
+  \item \textbf{greedy decoding}：总是选择概率最大的 token；
+  \item \textbf{temperature sampling}：用温度调节分布尖锐程度；
+  \item \textbf{top-k sampling}：只在概率最高的 $k$ 个 token 中采样；
+  \item \textbf{top-p sampling}：只在累计概率达到 $p$ 的最小 token 集合中采样。
+\end{itemize}
+
+从 Infra 视角看，训练中的 softmax 通常是大 batch、大矩阵上的密集操作；推理 decode 阶段的 softmax 则可能变成许多小 batch、逐 token 的操作。两者对 kernel fusion 和调度系统的要求不同。
+
+\subsection{信息熵、交叉熵与 KL 散度}
+\label{subsec:entropy-crossentropy-kl}
+
+离散分布 $p$ 的信息熵定义为：
+\[
+  H(p)=-\sum_{i}p_i\log p_i.
+\]
+熵可以理解为不确定性的度量。分布越均匀，熵越大；分布越集中，熵越小。
+
+给定真实分布 $p$ 与模型分布 $q$，交叉熵定义为：
+\[
+  H(p,q)=-\sum_i p_i\log q_i.
+\]
+KL 散度定义为：
+\[
+  D_{\mathrm{KL}}(p\|q)
+  =
+  \sum_i p_i\log\frac{p_i}{q_i}.
+\]
+三者关系为：
+\[
+  H(p,q)=H(p)+D_{\mathrm{KL}}(p\|q).
+\]
+当真实分布 $p$ 固定时，最小化交叉熵等价于最小化 KL 散度。
+
+在 next-token prediction 中，真实标签通常是 one-hot。若真实 token id 为 $y$，则：
+\[
+  p_i=
+  \begin{cases}
+    1, & i=y,\\
+    0, & i\ne y.
+  \end{cases}
+\]
+于是交叉熵变为：
+\[
+  \mathcal{L}
+  =
+  -\log q_y.
+\]
+也就是说，语言模型训练的基本目标就是让真实下一个 token 的概率尽可能高。
+
+\subsection{Softmax 与温度参数}
+\label{subsec:softmax-temperature}
+
+带温度参数 $T$ 的 softmax 定义为：
+\[
+  \softmax(\vect{z}/T)_i
+  =
+  \frac{\exp(z_i/T)}{\sum_j\exp(z_j/T)}.
+\]
+当 $T<1$ 时，分布更尖锐，高概率 token 更突出；当 $T>1$ 时，分布更平滑，采样更随机。
+
+直接计算 softmax 可能出现数值溢出。若某个 $z_i$ 很大，则 $\exp(z_i)$ 可能超过浮点数范围。稳定做法是减去最大值：
+\[
+  m=\max_j z_j,
+\]
+\[
+  \softmax(\vect{z})_i
+  =
+  \frac{\exp(z_i-m)}{\sum_j\exp(z_j-m)}.
+\]
+因为 softmax 对整体平移不变：
+\[
+  \frac{\exp(z_i-c)}{\sum_j\exp(z_j-c)}
+  =
+  \frac{\exp(z_i)\exp(-c)}{\sum_j\exp(z_j)\exp(-c)}
+  =
+  \frac{\exp(z_i)}{\sum_j\exp(z_j)}.
+\]
+
+交叉熵也常通过 log-sum-exp 稳定计算：
+\[
+  \log\sum_j\exp(z_j)
+  =
+  m+\log\sum_j\exp(z_j-m).
+\]
+若真实类别为 $y$，则：
+\[
+  \mathcal{L}
+  =
+  -z_y+\log\sum_j\exp(z_j).
+\]
+
+\begin{lstlisting}[language=Python,caption={数值稳定的 softmax 与 cross entropy},label={lst:stable-softmax-cross-entropy}]
+import torch
+
+def stable_softmax(logits, dim=-1):
+    # Subtracting max does not change softmax results.
+    # It prevents exp(logits) from overflowing.
+    max_value = torch.max(logits, dim=dim, keepdim=True).values
+    shifted = logits - max_value
+    exp_value = torch.exp(shifted)
+    return exp_value / torch.sum(exp_value, dim=dim, keepdim=True)
+
+def stable_cross_entropy(logits, target):
+    # logits: [batch, vocab]
+    # target: [batch], each entry is the correct token id.
+    max_value = torch.max(logits, dim=-1, keepdim=True).values
+    shifted = logits - max_value
+
+    # logsumexp(logits) = max + log(sum(exp(logits - max)))
+    logsumexp = max_value.squeeze(-1) + torch.log(torch.sum(torch.exp(shifted), dim=-1))
+
+    # Gather z_y for each sample.
+    zy = logits.gather(dim=-1, index=target[:, None]).squeeze(-1)
+
+    # Cross entropy for one-hot target: -z_y + logsumexp(z)
+    loss = -zy + logsumexp
+    return loss.mean()
+\end{lstlisting}
+
+在实际训练中，框架通常会使用 fused cross entropy kernel，将 max reduction、sum reduction、log、gather、loss 计算融合，减少中间张量写回 HBM 的次数。对于词表很大的 LLM，logits 张量形如 $(B,S,V)$，其中 $V$ 可能达到数万甚至更多。此时，cross entropy 的实现效率会影响端到端训练吞吐。
+
+\subsection{语言模型中的 next-token prediction}
+\label{subsec:next-token-prediction}
+
+给定 token 序列：
+\[
+  x_1,x_2,\ldots,x_T,
+\]
+自回归语言模型将联合概率分解为：
+\[
+  p(x_1,x_2,\ldots,x_T)
+  =
+  \prod_{t=1}^{T}p(x_t\mid x_{<t}).
+\]
+训练目标通常是最小化负对数似然：
+\[
+  \mathcal{L}
+  =
+  -\sum_{t=1}^{T}\log p(x_t\mid x_{<t}).
+\]
+在 batch 训练中，若 batch size 为 $B$、序列长度为 $S$，则平均 loss 可以写为：
+\[
+  \mathcal{L}
+  =
+  -\frac{1}{BS}
+  \sum_{b=1}^{B}
+  \sum_{s=1}^{S}
+  \log p(x_{b,s}\mid x_{b,<s}).
+\]
+
+\begin{figure}[H]
+  \centering
+  \begin{tikzpicture}[
+      font=\small,
+      token/.style={draw, rounded corners=2pt, minimum width=0.95cm, minimum height=0.55cm, fill=blue!6},
+      bar/.style={draw, fill=orange!25},
+      arrow/.style={-{Latex[length=2.4mm]}, thick}
+    ]
+
+    \node[token] (t1) at (-4.8,1.5) {从};
+    \node[token] (t2) at (-3.7,1.5) {基础};
+    \node[token] (t3) at (-2.6,1.5) {到};
+    \node[token] (t4) at (-1.5,1.5) {深渊};
+
+    \draw[arrow] (t1) -- (t2);
+    \draw[arrow] (t2) -- (t3);
+    \draw[arrow] (t3) -- (t4);
+
+    \node[draw, rounded corners=2pt, fill=green!8, minimum width=2.5cm, minimum height=0.9cm, align=center] (model) at (0.8,1.5)
+      {Decoder-only\\LLM};
+    \draw[arrow] (t4) -- (model);
+
+    \node[align=center] at (4.0,2.25) {\textbf{下一个 token 概率分布}};
+    \draw[->] (2.4,0.2) -- (6.1,0.2) node[right] {token};
+    \draw[->] (2.4,0.2) -- (2.4,2.0) node[above] {prob};
+
+    \foreach \x/\h/\name in {2.8/0.55/指南,3.4/1.45/架构,4.0/0.75/训练,4.6/0.35/推理,5.2/0.25/GPU} {
+      \draw[bar] (\x,0.2) rectangle ({\x+0.35},{0.2+\h});
+      \node[font=\scriptsize, rotate=45, anchor=west] at (\x,0.0) {\name};
+    }
+
+    \draw[arrow] (model.east) -- (2.4,1.5);
+
+    \node[align=left, text width=5.8cm] at (0.4,-1.0) {
+      训练时：真实下一个 token 给出监督信号。\\
+      推理时：根据概率分布采样或选择 token，并把生成 token 追加到上下文。
+    };
+  \end{tikzpicture}
+  \caption{语言模型 next-token prediction 与 token 概率分布}
+  \label{fig:next-token-distribution}
+\end{figure}
+
+next-token prediction 的形式非常简单，但它对系统提出了巨大挑战：
+
+\begin{itemize}
+  \item 训练时，需要对所有位置并行计算 logits 和 loss；
+  \item 推理时，decode 阶段必须逐 token 生成，难以像训练那样完全并行；
+  \item 长上下文会使 attention 和 KV Cache 的显存需求快速上升；
+  \item 大词表会让 logits 与 cross entropy 占用显著带宽；
+  \item 多用户在线请求会引入动态 batch、不同长度序列和复杂调度。
+\end{itemize}
+
+\section{从数学公式到系统成本}
+\label{sec:from-formula-to-system-cost}
+
+本章最后，我们把前面的数学对象和 AI Infra 中最关心的几个系统指标联系起来：显存、计算量、通信量与数值稳定性。
+
+\subsection{显存估算的基本套路}
+\label{subsec:memory-estimation-basics}
+
+假设一个张量 shape 为：
+\[
+  (d_1,d_2,\ldots,d_k),
+\]
+元素类型占用 $s$ bytes，则张量显存为：
+\[
+  M=\left(\prod_{i=1}^{k}d_i\right)s.
+\]
+例如，隐藏状态：
+\[
+  \tensor{X}\in\mathbb{R}^{B\times S\times H}
+\]
+使用 FP16 时显存为：
+\[
+  M_X=B S H \cdot 2\ \mathrm{bytes}.
+\]
+
+对于参数量为 $N$ 的模型，若使用混合精度 Adam 训练，一个粗略估算是：
+
+\begin{itemize}
+  \item FP16/BF16 参数：$2N$ bytes；
+  \item FP16/BF16 梯度：$2N$ bytes；
+  \item FP32 master weight：$4N$ bytes；
+  \item Adam 一阶矩和二阶矩：$8N$ bytes。
+\end{itemize}
+
+仅参数相关部分就可能达到：
+\[
+  M_{\mathrm{param+grad+optim}}
+  \approx
+  16N\ \mathrm{bytes}.
+\]
+对于 $N=70\mathrm{B}$ 的模型，这个数字约为：
+\[
+  16\times 70\times 10^9
+  =
+  1.12\times 10^{12}\ \mathrm{bytes}
+  \approx
+  1.12\ \mathrm{TB}.
+\]
+这还没有包括激活、临时 buffer、通信 buffer 和碎片。因此，分布式训练不是“可选优化”，而是大模型训练的必要条件。
+
+\subsection{计算量估算的基本套路}
+\label{subsec:flops-estimation-basics}
+
+线性层 $\mat{Y}=\mat{X}\mat{W}$ 的 FLOPs 约为：
+\[
+  2B d_{\mathrm{in}}d_{\mathrm{out}}.
+\]
+对于 Transformer，粗略估算训练 FLOPs 时，经常使用参数量、token 数和常数因子进行估算：
+\[
+  \mathrm{FLOPs}
+  \approx
+  c\cdot N\cdot T,
+\]
+其中 $N$ 是参数量，$T$ 是训练 token 数，$c$ 是与前向、反向和模型结构相关的常数。这个公式不是精确 kernel 级模型，但足以帮助架构师判断训练任务需要多少 GPU-days。
+
+当我们进入后续章节，会进一步把 FLOPs 分解到 attention、MLP、embedding、norm 等模块，并分析它们在不同 sequence length 下的主导项。
+
+\subsection{通信量估算的基本套路}
+\label{subsec:communication-estimation-basics}
+
+数据并行训练中，每张卡有完整模型副本，每次 backward 后需要同步梯度。若参数量为 $N$，梯度使用 FP16/BF16，则每步需要同步的数据量量级为：
+\[
+  2N\ \mathrm{bytes}.
+\]
+Ring AllReduce 的每个 rank 通信量近似为：
+\[
+  2\frac{P-1}{P}M,
+\]
+其中 $P$ 是数据并行进程数，$M$ 是待同步消息大小。当 $P$ 很大时，通信量接近 $2M$。
+
+张量并行、流水线并行和 ZeRO 会改变通信模式：有些策略减少显存但增加通信，有些策略减少单卡参数但引入更多 all-gather 或 reduce-scatter。后续分布式训练章节会详细分析这些 trade-off。
+
+\subsection{数值稳定性不是细节}
+\label{subsec:numerical-stability-is-not-detail}
+
+AI Infra 工程师经常要处理训练发散、loss spike、NaN、overflow、underflow 等问题。这些问题并不总是模型算法本身的问题，也可能来自系统实现：
+
+\begin{itemize}
+  \item FP16 指数范围较小，容易 overflow 或 underflow；
+  \item 梯度累积时，如果 loss scaling 不当，可能导致溢出；
+  \item softmax 如果不减最大值，可能产生 inf；
+  \item reduce 操作的顺序不同，会带来浮点舍入差异；
+  \item 分布式训练中，不同 rank 上的数值异常可能通过 collective 扩散。
+\end{itemize}
+
+因此，数值稳定性不是“数学洁癖”，而是生产系统可靠性的基础。一个成熟的训练系统通常需要监控：
+
+\begin{itemize}
+  \item loss 是否出现 spike；
+  \item gradient norm 是否异常；
+  \item 是否出现 NaN 或 inf；
+  \item loss scaler 是否频繁回退；
+  \item 不同 rank 的统计量是否一致；
+  \item checkpoint 恢复后 loss 曲线是否连续。
+\end{itemize}
+
+\section{本章小结}
+\label{sec:chapter01-summary}
+
+本章从 AI Infrastructure 的角度回顾了线性代数、微积分和概率论中最重要的概念。我们没有停留在抽象公式，而是反复追问：这些数学对象在 GPU、训练框架和分布式系统中会变成什么成本。
+
+\begin{itemize}
+  \item \textbf{向量、矩阵与张量} 是模型计算的基本对象。shape 决定逻辑结构，stride 和 memory layout 决定实际访存模式。
+  \item \textbf{矩阵乘法} 是深度学习吞吐的核心来源。它规则、密集、易分块，因此适合 GPU 和 Tensor Core。
+  \item \textbf{低秩思想} 连接了矩阵分解、模型压缩和参数高效微调。LoRA 的工程价值来自参数、梯度、优化器状态和 checkpoint 的系统性减少。
+  \item \textbf{链式法则与反向模式自动微分} 是训练的数学基础。反向传播不仅产生梯度，也带来激活保存、重计算和显存压力。
+  \item \textbf{softmax、交叉熵和 next-token prediction} 构成语言模型训练目标，但它们在大词表和长序列场景下也会形成显著系统开销。
+  \item \textbf{显存、计算量、通信量与数值稳定性} 是 AI Infra 工程师理解模型训练和推理系统的四个基本坐标。
+\end{itemize}
+
+从下一章开始，我们将进入 CUDA C++ 基础。届时，本章中的张量、矩阵乘法、stride、访存和并行计算会落到更具体的 GPU 编程模型中：grid、block、thread、warp、shared memory、register 和 global memory。换句话说，从下一章开始，我们将把数学对象真正放到硬件上运行。

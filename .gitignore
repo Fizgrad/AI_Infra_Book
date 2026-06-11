@@ -1,0 +1,90 @@
+# LaTeX compilation outputs
+*.aux
+*.log
+*.out
+*.toc
+*.lof
+*.lot
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+*.synctex(busy)
+*.pdf
+*.dvi
+*.ps
+*.bbl
+*.blg
+*.bcf
+*.run.xml
+*.idx
+*.ilg
+*.ind
+*.ist
+*.nav
+*.snm
+*.vrb
+
+# LaTeX temporary files
+*.latexmain
+*.latexmkrc
+*.auxlock
+*.md5
+*.sav
+*.xref
+
+# Bibliography
+*.bib.bak
+*.bib.sav
+
+# Figure conversion
+*.eps-converted-to.*
+*.pdf-converted-to.*
+
+# Xindy
+*.xdy
+
+# Hyperref
+*.brf
+
+# Makeindex
+*.maf
+*.mlf
+*.mtc
+*.mtc1
+
+# TikZ externalization
+tikz/*.pdf
+tikz/*.log
+tikz/*.aux
+tikz/*.md5
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# Editor / IDE
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Python (for any scripts or tools)
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Backup files
+*.bak
+*.backup
+*.orig

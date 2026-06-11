@@ -1,0 +1,1688 @@
+\chapter{Transformer 架构深度剖析}
+\label{chap:transformer}
+
+\section{从 RNN 到 Attention}
+\label{sec:from-rnn-to-attention}
+
+前一篇我们已经建立了三条基础线索：第一，神经网络本质上是张量运算图；第二，GPU 更擅长规则、密集、可并行的矩阵计算；第三，训练系统的成本主要来自参数、激活、梯度、优化器状态与通信。本章开始，我们进入现代大语言模型最核心的架构：\textbf{Transformer}。
+
+Transformer 之所以重要，不只是因为它在自然语言处理任务上表现出色，更因为它天然适配现代硬件。传统 RNN 按时间步串行递推，而 Transformer 把序列中所有 token 的交互组织为大规模矩阵乘法和归一化操作。这一结构上的差异，直接决定了它能否被 GPU、TPU 和分布式训练系统高效扩展。
+
+\subsection{RNN 的序列瓶颈}
+\label{subsec:rnn-sequential-bottleneck}
+
+循环神经网络 RNN 的基本形式可以写为：
+[
+\vect{h}*t=f(\vect{h}*{t-1},\vect{x}_t),
+]
+其中 $\vect{x}_t$ 是第 $t$ 个 token 的输入表示，$\vect{h}_t$ 是第 $t$ 个位置的隐藏状态。展开后：
+[
+\vect{h}_1=f(\vect{h}_0,\vect{x}_1),
+]
+[
+\vect{h}_2=f(\vect{h}_1,\vect{x}_2),
+]
+[
+\cdots
+]
+[
+\vect{h}*T=f(\vect{h}*{T-1},\vect{x}_T).
+]
+
+这个递推结构有一个根本问题：\textbf{第 $t$ 步必须等待第 $t-1$ 步完成}。即使每一步内部可以使用矩阵乘法，时间维度本身仍然串行。这对 GPU 很不友好，因为 GPU 需要大量并行工作来隐藏访存延迟和提高吞吐。
+
+从系统角度看，RNN 的瓶颈可以总结为：
+
+\begin{itemize}
+\item \textbf{时间步串行依赖}：无法把整个 sequence 的所有位置完全并行计算。
+\item \textbf{长距离依赖难以传播}：梯度需要穿过许多时间步，容易出现梯度消失或梯度爆炸。
+\item \textbf{硬件利用率受限}：每个时间步的计算规模相对有限，难以形成超大 GEMM。
+\item \textbf{分布式扩展困难}：沿序列维切分会遇到强依赖，流水线化收益有限。
+\end{itemize}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+token/.style={draw, rounded corners=2pt, minimum width=0.85cm, minimum height=0.55cm, fill=blue!6, align=center},
+state/.style={draw, circle, minimum size=0.72cm, fill=orange!14},
+block/.style={draw, rounded corners=3pt, minimum width=1.2cm, minimum height=0.75cm, fill=green!8, align=center},
+arrow/.style={-{Latex[length=2.3mm]}, thick},
+faintarrow/.style={-{Latex[length=2.0mm]}, thick, gray!60}
+]
+
+```
+\node[font=\bfseries] at (0,3.0) {RNN 串行计算 vs Attention 并行计算};
+
+% RNN part
+\node[font=\bfseries] at (-3.7,2.35) {RNN：时间步递推};
+\foreach \i/\x in {1/-5.6,2/-4.6,3/-3.6,4/-2.6,5/-1.6} {
+  \node[token] (rx\i) at (\x,1.45) {$x_\i$};
+  \node[state] (rh\i) at (\x,0.35) {$h_\i$};
+  \draw[arrow] (rx\i) -- (rh\i);
+}
+\foreach \i/\j in {1/2,2/3,3/4,4/5} {
+  \draw[arrow] (rh\i) -- (rh\j);
+}
+\node[align=center, text width=4.6cm] at (-3.6,-0.75) {
+  后一个 hidden state 依赖前一个，\\
+  序列维度难以完全并行。
+};
+
+% Attention part
+\node[font=\bfseries] at (3.7,2.35) {Self-Attention：全位置并行};
+\foreach \i/\x in {1/1.4,2/2.4,3/3.4,4/4.4,5/5.4} {
+  \node[token] (ax\i) at (\x,1.45) {$x_\i$};
+  \node[block] (ay\i) at (\x,0.0) {$y_\i$};
+  \draw[arrow] (ax\i) -- (ay\i);
+}
+
+\foreach \i in {1,...,5} {
+  \foreach \j in {1,...,5} {
+    \draw[faintarrow] (ax\i.south) .. controls ({(1.4+\i*0.2)},0.95) and ({(1.4+\j*0.2)},0.55) .. (ay\j.north);
+  }
+}
+
+\node[align=center, text width=4.8cm] at (3.5,-0.75) {
+  所有 token 之间的相关性可组织成矩阵乘法，\\
+  更适合 GPU 并行执行。
+};
+```
+
+\end{tikzpicture}
+\caption{RNN 的串行依赖与 Self-Attention 的并行结构对比}
+\label{fig:rnn-vs-attention-parallelism}
+\end{figure}
+
+RNN 的问题并不意味着它没有价值。在语音、时间序列、小模型或流式低延迟场景中，RNN 仍有其位置。但大模型时代的核心工作负载是海量 token、巨大模型和分布式训练，架构必须最大化矩阵乘法比例，并尽量减少不可并行的依赖。Transformer 正是在这个方向上取得突破。
+
+\subsection{Seq2Seq 与 Encoder-Decoder}
+\label{subsec:seq2seq-encoder-decoder}
+
+在 Transformer 出现之前，机器翻译等序列到序列任务常使用 Seq2Seq 架构。它由 encoder 和 decoder 组成：
+
+[
+\text{Encoder}: (x_1,x_2,\ldots,x_S)\rightarrow \vect{c},
+]
+[
+\text{Decoder}: \vect{c}\rightarrow (y_1,y_2,\ldots,y_T).
+]
+
+早期 Seq2Seq 常把整个输入序列压缩成一个固定长度上下文向量 $\vect{c}$。这会造成信息瓶颈：长句子的全部语义必须塞进一个向量中，decoder 在生成每个输出 token 时都只能依赖同一个压缩表示。
+
+Attention 机制最早的重要动机之一，就是让 decoder 在每个生成位置动态查看 encoder 的不同位置，而不是依赖单个固定向量。也就是说，decoder 不再只看一个 $\vect{c}$，而是根据当前状态对 encoder 所有隐藏状态加权求和。
+
+若 encoder 输出为：
+[
+\mat{H}=
+\begin{bmatrix}
+\vect{h}_1^{\mathsf{T}}\
+\vect{h}_2^{\mathsf{T}}\
+\cdots\
+\vect{h}_S^{\mathsf{T}}
+\end{bmatrix}
+\in\mathbb{R}^{S\times d},
+]
+decoder 某一步的查询向量为 $\vect{q}$，则可以计算权重：
+[
+\alpha_i=
+\frac{\exp(\operatorname{score}(\vect{q},\vect{h}*i))}
+{\sum*{j=1}^{S}\exp(\operatorname{score}(\vect{q},\vect{h}*j))},
+]
+再得到上下文向量：
+[
+\vect{c}=\sum*{i=1}^{S}\alpha_i\vect{h}_i.
+]
+
+这个思想非常朴素：\textbf{不同输出位置应该关注输入序列中不同位置的信息。}后来的 Self-Attention 则进一步把这个机制用于同一个序列内部，使每个 token 都可以关注其他 token。
+
+\subsection{Attention 的核心思想}
+\label{subsec:attention-core-idea}
+
+Attention 可以用一句话概括：\textbf{根据相似度对一组 value 加权求和。}
+
+给定一个 query $\vect{q}$、一组 key ${\vect{k}_i}$ 和对应 value ${\vect{v}_i}$，attention 的输出为：
+[
+\operatorname{Attention}(\vect{q},\mat{K},\mat{V})
+==================================================
+
+\sum_i \alpha_i\vect{v}_i,
+]
+其中权重：
+[
+\alpha_i=
+\softmax_i(\operatorname{score}(\vect{q},\vect{k}_i)).
+]
+
+在深度学习中，最常见的 score 函数是点积：
+[
+\operatorname{score}(\vect{q},\vect{k}_i)=\vect{q}^{\mathsf{T}}\vect{k}_i.
+]
+
+点积越大，说明 query 与 key 越相似，对应 value 权重越高。这个机制可以被理解为一种可微的内容寻址：query 是查询条件，key 是地址，value 是内容。
+
+从系统角度看，attention 的高效之处在于它可以批量化成矩阵运算。对于多个 query 组成的矩阵：
+[
+\mat{Q}\in\mathbb{R}^{S_q\times d_k},
+]
+key 矩阵：
+[
+\mat{K}\in\mathbb{R}^{S_k\times d_k},
+]
+value 矩阵：
+[
+\mat{V}\in\mathbb{R}^{S_k\times d_v},
+]
+attention 可以写为：
+[
+\Attention(\mat{Q},\mat{K},\mat{V})
+===================================
+
+\softmax
+\left(
+\frac{\mat{Q}\mat{K}^{\mathsf{T}}}{\sqrt{d_k}}
+\right)
+\mat{V}.
+]
+
+这条公式是 Transformer 的核心。它由两个主要矩阵乘法构成：
+
+\begin{itemize}
+\item $\mat{Q}\mat{K}^{\mathsf{T}}$：计算所有 query 与所有 key 的相似度；
+\item $\mat{P}\mat{V}$：用 attention probability 对 value 加权求和。
+\end{itemize}
+
+其中 $\mat{P}$ 表示 softmax 后的 attention probability：
+[
+\mat{P}=
+\softmax
+\left(
+\frac{\mat{Q}\mat{K}^{\mathsf{T}}}{\sqrt{d_k}}
+\right).
+]
+
+\subsection{Self-Attention 的并行优势}
+\label{subsec:self-attention-parallel-advantage}
+
+Self-Attention 指 query、key、value 都来自同一个输入序列。给定输入：
+[
+\mat{X}\in\mathbb{R}^{S\times H},
+]
+通过三个线性投影得到：
+[
+\mat{Q}=\mat{X}\mat{W}_Q,\quad
+\mat{K}=\mat{X}\mat{W}_K,\quad
+\mat{V}=\mat{X}\mat{W}_V.
+]
+随后：
+[
+\mat{O}
+=======
+
+\softmax
+\left(
+\frac{\mat{Q}\mat{K}^{\mathsf{T}}}{\sqrt{d_k}}
+\right)\mat{V}.
+]
+
+Self-Attention 的并行优势在于：所有 token 的 $\mat{Q},\mat{K},\mat{V}$ 可以一次性通过 GEMM 得到；所有 token 两两之间的相似度也可以通过一次 batched GEMM 或专门 attention kernel 计算。这与 RNN 的时间步递推形成鲜明对比。
+
+当然，Self-Attention 也带来代价。标准 attention 的 score matrix shape 为：
+[
+S\times S.
+]
+当序列长度 $S$ 增大时，计算量和显存都按 $O(S^2)$ 增长。这也是长上下文模型、FlashAttention、PagedAttention 和各种稀疏 attention 研究的重要动机。
+
+\begin{table}[H]
+\centering
+\small
+\caption{RNN 与 Self-Attention 的系统视角对比}
+\label{tab:rnn-self-attention-system-view}
+\begin{tabular}{p{0.22\textwidth}p{0.34\textwidth}p{0.34\textwidth}}
+\toprule
+\textbf{维度} & \textbf{RNN} & \textbf{Self-Attention} \
+\midrule
+序列依赖
+& 时间步递推，强串行依赖
+& 所有位置可并行计算相关性 \
+\midrule
+长距离建模
+& 依赖 hidden state 逐步传递
+& 任意两个位置可直接交互 \
+\midrule
+GPU 友好性
+& 时间维难以完全并行，GEMM 尺寸较受限
+& 大量 GEMM 和 batched matrix multiply，适合 GPU \
+\midrule
+复杂度
+& 通常随序列长度线性递推
+& 标准 attention 随序列长度二次增长 \
+\midrule
+大模型扩展
+& 扩展性受串行依赖制约
+& 更适合大规模训练，但需要解决 $S^2$ attention 代价 \
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Scaled Dot-Product Attention}
+\label{sec:scaled-dot-product-attention}
+
+Scaled Dot-Product Attention 是 Transformer 中最核心的算子。它的形式非常简洁：
+[
+\Attention(\mat{Q},\mat{K},\mat{V})
+===================================
+
+\softmax
+\left(
+\frac{\mat{Q}\mat{K}^{\mathsf{T}}}{\sqrt{d_k}}
+\right)
+\mat{V}.
+]
+但这条公式背后包含许多工程细节：矩阵 shape、mask、softmax 数值稳定性、中间张量显存、kernel fusion、训练与推理差异。我们逐一展开。
+
+\subsection{Query、Key、Value}
+\label{subsec:qkv}
+
+在 attention 中，Query、Key、Value 分别承担不同角色：
+
+\begin{itemize}
+\item \textbf{Query}：当前位置想要寻找什么信息；
+\item \textbf{Key}：每个位置提供什么索引或匹配特征；
+\item \textbf{Value}：真正被加权汇聚的信息内容。
+\end{itemize}
+
+对于输入：
+[
+\mat{X}\in\mathbb{R}^{B\times S\times H},
+]
+通常通过线性层得到：
+[
+\mat{Q}=\mat{X}\mat{W}_Q,
+\quad
+\mat{K}=\mat{X}\mat{W}_K,
+\quad
+\mat{V}=\mat{X}\mat{W}_V.
+]
+其中：
+[
+\mat{W}_Q,\mat{W}_K,\mat{W}*V\in\mathbb{R}^{H\times H}
+]
+是最常见的写法。多头注意力中会把 $H$ 拆成多个 head，每个 head 的维度为：
+[
+d_h=\frac{H}{n*{\mathrm{heads}}}.
+]
+
+在工程实现中，QKV projection 常常被合并成一个大线性层：
+[
+[\mat{Q},\mat{K},\mat{V}]
+=========================
+
+\mat{X}\mat{W}*{QKV},
+]
+其中：
+[
+\mat{W}*{QKV}\in\mathbb{R}^{H\times 3H}.
+]
+这样可以把三次 GEMM 合并成一次更大的 GEMM，提高 GPU 利用率，并减少 kernel launch 和读取输入 $\mat{X}$ 的次数。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+tensor/.style={draw, rounded corners=3pt, minimum width=1.5cm, minimum height=0.75cm, align=center, fill=blue!6},
+proj/.style={draw, rounded corners=3pt, minimum width=1.25cm, minimum height=0.65cm, align=center, fill=orange!12},
+mat/.style={draw, rounded corners=3pt, minimum width=1.25cm, minimum height=0.65cm, align=center, fill=green!10},
+arrow/.style={-{Latex[length=2.3mm]}, thick}
+]
+
+```
+\node[tensor] (x) at (-5.2,0) {$\mat{X}$\\$B,S,H$};
+
+\node[proj] (wq) at (-3.3,1.35) {$W_Q$};
+\node[proj] (wk) at (-3.3,0) {$W_K$};
+\node[proj] (wv) at (-3.3,-1.35) {$W_V$};
+
+\node[mat] (q) at (-1.5,1.35) {$Q$};
+\node[mat] (k) at (-1.5,0) {$K$};
+\node[mat] (v) at (-1.5,-1.35) {$V$};
+
+\draw[arrow] (x) -- (wq);
+\draw[arrow] (x) -- (wk);
+\draw[arrow] (x) -- (wv);
+\draw[arrow] (wq) -- (q);
+\draw[arrow] (wk) -- (k);
+\draw[arrow] (wv) -- (v);
+
+\node[mat, minimum width=2.3cm, minimum height=0.9cm, fill=red!10] (score) at (1.4,0.7)
+  {$QK^{\mathsf{T}}/\sqrt{d_k}$};
+\node[mat, minimum width=1.65cm, fill=yellow!15] (softmax) at (3.7,0.7)
+  {Softmax};
+\node[mat, minimum width=1.65cm, fill=purple!10] (out) at (5.8,0)
+  {$O=PV$};
+
+\draw[arrow] (q) -- (score);
+\draw[arrow] (k) -- (score);
+\draw[arrow] (score) -- (softmax);
+\draw[arrow] (softmax) -- (out);
+\draw[arrow] (v.east) .. controls (2.2,-1.4) and (4.4,-1.25) .. (out.south);
+
+\node[align=left, text width=9.8cm] at (0,-2.55) {
+  Q、K、V 可以来自三个独立线性层，也常被合并为一个 QKV projection。
+  后者能形成更大的 GEMM，是训练和推理实现中的常见优化。
+};
+```
+
+\end{tikzpicture}
+\caption{Q/K/V 投影与 Scaled Dot-Product Attention 数据流}
+\label{fig:qkv-attention-dataflow}
+\end{figure}
+
+\subsection{$QK^{\mathsf{T}}$ 的语义}
+\label{subsec:qk-dot-product-semantics}
+
+矩阵：
+[
+\mat{S}=\mat{Q}\mat{K}^{\mathsf{T}}
+]
+中的元素为：
+[
+S_{ij}=\vect{q}_i^{\mathsf{T}}\vect{k}*j.
+]
+它表示第 $i$ 个 query 与第 $j$ 个 key 的匹配程度。若 $S*{ij}$ 大，则第 $i$ 个 token 更关注第 $j$ 个 token。
+
+对于一个长度为 $S$ 的序列，$\mat{S}$ 是一个 $S\times S$ 矩阵。第 $i$ 行表示 token $i$ 对所有 token 的注意力打分。经过 softmax 后：
+[
+P_{ij}
+======
+
+\frac{\exp(S_{ij})}{\sum_{j'=1}^{S}\exp(S_{ij'})}.
+]
+每一行的概率和为 $1$：
+[
+\sum_{j=1}^{S}P_{ij}=1.
+]
+
+从语言理解角度看，attention matrix 可以捕捉依赖关系。例如在句子“模型把输入映射到输出，因为它学习了参数”中，“它”可能需要关注“模型”。Self-Attention 允许这种长距离连接在单层中直接发生。
+
+从系统角度看，$QK^{\mathsf{T}}$ 是一个重要瓶颈。它的计算量约为：
+[
+2B n_h S^2 d_h,
+]
+其中 $n_h$ 是 head 数，$d_h$ 是每个 head 的维度。显式 attention score 的元素数为：
+[
+B n_h S^2.
+]
+当 $S$ 很大时，$S^2$ 项会迅速成为显存和带宽压力来源。
+
+\subsection{scale 因子 $\sqrt{d_k}$}
+\label{subsec:attention-scale-factor}
+
+为什么 attention 要除以 $\sqrt{d_k}$？考虑 query 和 key 的元素独立同分布，均值为 $0$，方差为 $1$。点积：
+[
+\vect{q}^{\mathsf{T}}\vect{k}
+=============================
+
+\sum_{i=1}^{d_k}q_i k_i.
+]
+若 $q_i,k_i$ 独立，则 $q_i k_i$ 的方差约为 $1$，因此和的方差约为：
+[
+\operatorname{Var}(\vect{q}^{\mathsf{T}}\vect{k})\approx d_k.
+]
+当 $d_k$ 较大时，点积值的尺度会变大，使 softmax 输入过大。softmax 在输入尺度很大时会变得极其尖锐，梯度可能变小，不利于训练。
+
+除以 $\sqrt{d_k}$ 后：
+[
+\operatorname{Var}
+\left(
+\frac{\vect{q}^{\mathsf{T}}\vect{k}}{\sqrt{d_k}}
+\right)
+\approx 1.
+]
+这样可以让 softmax 的输入尺度更稳定。
+
+这也是深度学习中常见的尺度控制思想：初始化、归一化、residual scaling、attention scaling 都是在控制信号和梯度的数值范围。对于大模型训练，数值尺度不仅影响收敛，也影响混合精度稳定性。
+
+\subsection{mask 机制}
+\label{subsec:attention-mask}
+
+Attention 中常见的 mask 有两类：
+
+\begin{itemize}
+\item \textbf{padding mask}：避免模型关注 padding token；
+\item \textbf{causal mask}：在自回归语言模型中，避免当前位置看到未来 token。
+\end{itemize}
+
+Decoder-only LLM 使用 causal mask。对于序列位置 $i$，只能关注 $j\le i$ 的位置。也就是说：
+[
+S_{ij}=
+\begin{cases}
+S_{ij}, & j\le i,\
+-\infty, & j>i.
+\end{cases}
+]
+softmax 后，未来位置概率为 $0$。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+cell/.style={draw, minimum width=0.42cm, minimum height=0.42cm},
+allowed/.style={fill=green!16},
+blocked/.style={fill=red!12},
+axislabel/.style={font=\scriptsize}
+]
+
+```
+\node[font=\bfseries] at (0,3.0) {Causal Mask：当前位置不能看到未来 token};
+
+\foreach \i in {0,...,7} {
+  \node[axislabel] at ({-1.7+0.45*\i},2.25) {$k_{\i}$};
+  \node[axislabel] at (-2.25,{1.8-0.45*\i}) {$q_{\i}$};
+}
+
+\foreach \r in {0,...,7} {
+  \foreach \c in {0,...,7} {
+    \ifnum\c>\r
+      \node[cell, blocked] at ({-1.7+0.45*\c},{1.8-0.45*\r}) {};
+    \else
+      \node[cell, allowed] at ({-1.7+0.45*\c},{1.8-0.45*\r}) {};
+    \fi
+  }
+}
+
+\node[draw, rounded corners=2pt, fill=green!16, minimum width=0.7cm, minimum height=0.4cm] at (2.6,1.0) {};
+\node[align=left] at (4.0,1.0) {可关注历史与当前位置};
+
+\node[draw, rounded corners=2pt, fill=red!12, minimum width=0.7cm, minimum height=0.4cm] at (2.6,0.25) {};
+\node[align=left] at (4.0,0.25) {未来位置被 mask};
+
+\node[align=left, text width=9.8cm] at (1.0,-2.15) {
+  Causal mask 保证自回归语言模型训练与推理一致。训练时虽然所有位置并行计算，
+  但每个位置的预测只能依赖它之前的 token。
+};
+```
+
+\end{tikzpicture}
+\caption{Decoder-only 模型中的 causal mask}
+\label{fig:causal-mask}
+\end{figure}
+
+工程实现中，mask 不一定真的构造一个 $S\times S$ 的完整矩阵。高性能 attention kernel 可以根据行列索引动态判断是否越过 causal 边界，从而避免额外显存开销。FlashAttention、xFormers、Triton attention kernel 等实现都会特别关注 mask 的高效处理。
+
+\subsection{attention score 到 weighted sum}
+\label{subsec:attention-score-to-weighted-sum}
+
+计算完 attention probability：
+[
+\mat{P}=\softmax(\mat{S}),
+]
+输出为：
+[
+\mat{O}=\mat{P}\mat{V}.
+]
+其中：
+[
+\vect{o}*i=\sum*{j=1}^{S}P_{ij}\vect{v}_j.
+]
+也就是说，每个输出 token 是所有 value 的加权平均。
+
+下面给出 PyTorch 风格的 Scaled Dot-Product Attention 实现。这个实现用于教学，强调公式对应关系；生产系统应使用高性能 fused attention kernel。
+
+\begin{lstlisting}[language=Python,caption={教学版 Scaled Dot-Product Attention},label={lst:scaled-dot-product-attention}]
+import math
+import torch
+
+def scaled_dot_product_attention(q, k, v, causal=True):
+"""
+q, k, v: [batch, heads, seq, head_dim]
+return: [batch, heads, seq, head_dim]
+"""
+B, H, S, D = q.shape
+
+```
+# QK^T: [B, H, S, D] @ [B, H, D, S] -> [B, H, S, S]
+scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(D)
+
+if causal:
+    # Create an upper-triangular mask.
+    # True means positions to mask out.
+    mask = torch.triu(
+        torch.ones(S, S, device=q.device, dtype=torch.bool),
+        diagonal=1,
+    )
+    scores = scores.masked_fill(mask, float("-inf"))
+
+# Softmax along key dimension.
+probs = torch.softmax(scores, dim=-1)
+
+# Weighted sum: [B, H, S, S] @ [B, H, S, D] -> [B, H, S, D]
+out = torch.matmul(probs, v)
+return out
+```
+
+\end{lstlisting}
+
+这段代码清楚但低效，原因包括：
+
+\begin{itemize}
+\item 显式物化了 $\mat{S}\in\mathbb{R}^{B\times H\times S\times S}$；
+\item 显式物化了 mask；
+\item softmax、mask、matmul 被拆成多个 kernel；
+\item 中间 attention probability 需要写回 HBM；
+\item 当 $S$ 很长时，显存占用和 HBM IO 都很高。
+\end{itemize}
+
+后续 FlashAttention 章节会展示如何通过 tiling、online softmax 和 kernel fusion 避免物化完整 attention matrix。
+
+\section{Multi-Head Attention}
+\label{sec:multi-head-attention}
+
+单头 attention 可以让每个 token 根据一个相似度空间关注其他 token。但语言中的关系非常复杂：有些 head 可能关注语法依赖，有些 head 可能关注实体指代，有些 head 可能关注位置模式。Multi-Head Attention 通过多个子空间并行建模不同关系。
+
+\subsection{为什么需要多头}
+\label{subsec:why-multi-head}
+
+设隐藏维度为 $H$，head 数为 $n_h$，每个 head 维度为：
+[
+d_h=\frac{H}{n_h}.
+]
+Multi-Head Attention 不是用一个 $H$ 维 attention，而是把隐藏状态投影到多个 head，每个 head 独立计算 attention：
+[
+\operatorname{head}_i
+=====================
+
+\Attention
+\left(
+\mat{Q}_i,\mat{K}_i,\mat{V}_i
+\right).
+]
+然后拼接所有 head：
+[
+\mat{O}
+=======
+
+\operatorname{Concat}
+\left(
+\operatorname{head}*1,\ldots,\operatorname{head}*{n_h}
+\right)
+\mat{W}_O.
+]
+
+多头的好处包括：
+
+\begin{itemize}
+\item \textbf{表达多个关系子空间}：不同 head 可以学习不同关注模式；
+\item \textbf{保持计算规模可控}：每个 head 的维度较小，点积尺度稳定；
+\item \textbf{适配并行计算}：head 维可以与 batch 维合并，形成 batched GEMM；
+\item \textbf{便于模型并行}：不同 head 可以在 tensor parallel 中被切分到不同 GPU。
+\end{itemize}
+
+\subsection{Head 维度切分}
+\label{subsec:head-dimension-split}
+
+输入张量：
+[
+\mat{X}\in\mathbb{R}^{B\times S\times H}
+]
+经过 QKV projection 后，通常得到：
+[
+\mat{Q},\mat{K},\mat{V}\in\mathbb{R}^{B\times S\times H}.
+]
+随后 reshape 为：
+[
+\mathbb{R}^{B\times S\times n_h\times d_h}.
+]
+为了方便 attention kernel 访问，常进一步 permute 为：
+[
+\mathbb{R}^{B\times n_h\times S\times d_h}.
+]
+
+这个 reshape/transpose 在数学上很简单，但工程上非常关键。若 transpose 后张量不 contiguous，传给某些 kernel 可能触发额外 copy；若 memory layout 不适合连续访问，attention 的 HBM 带宽利用率会下降。现代 attention kernel 通常会对 QKV layout 有严格要求，例如 packed QKV、separate Q/K/V、BSHD 或 BSHD-like layout 等。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+box/.style={draw, rounded corners=3pt, align=center, fill=blue!6, minimum height=0.75cm},
+head/.style={draw, rounded corners=2pt, align=center, fill=orange!12, minimum width=1.0cm, minimum height=0.55cm},
+arrow/.style={-{Latex[length=2.3mm]}, thick}
+]
+
+```
+\node[box, minimum width=2.4cm] (x) at (-5.3,0) {$X$\\$B,S,H$};
+\node[box, minimum width=2.8cm, fill=green!8] (qkv) at (-2.2,0) {QKV Projection\\$B,S,3H$};
+\node[box, minimum width=2.8cm, fill=yellow!14] (reshape) at (1.2,0) {Reshape\\$B,S,n_h,d_h$};
+\node[box, minimum width=2.8cm, fill=purple!10] (permute) at (4.6,0) {Permute\\$B,n_h,S,d_h$};
+
+\draw[arrow] (x) -- (qkv);
+\draw[arrow] (qkv) -- (reshape);
+\draw[arrow] (reshape) -- (permute);
+
+\foreach \i/\xpos in {1/-1.1,2/-0.25,3/0.6,4/1.45,5/2.3} {
+  \node[head] at (\xpos,-1.35) {head \i};
+}
+
+\draw[decorate,decoration={brace,amplitude=5pt},thick]
+  (-1.65,-1.75) -- (2.85,-1.75)
+  node[midway,below=7pt] {$H=n_h d_h$};
+
+\node[align=left, text width=10.0cm] at (0,-2.75) {
+  Head 维度切分在数学上是 reshape，在系统上涉及 stride、layout、contiguous 与 attention kernel 的输入约定。
+};
+```
+
+\end{tikzpicture}
+\caption{Multi-Head Attention 中 hidden 维到 head 维的切分}
+\label{fig:head-dimension-split}
+\end{figure}
+
+\subsection{concat 与 output projection}
+\label{subsec:concat-output-projection}
+
+每个 head 独立得到输出：
+[
+\mat{O}*i\in\mathbb{R}^{B\times S\times d_h}.
+]
+将所有 head 沿 hidden 维拼接：
+[
+\mat{O}*{\mathrm{concat}}
+=========================
+
+\operatorname{Concat}
+(\mat{O}*1,\ldots,\mat{O}*{n_h})
+\in\mathbb{R}^{B\times S\times H}.
+]
+随后通过 output projection：
+[
+\mat{Y}=\mat{O}_{\mathrm{concat}}\mat{W}_O.
+]
+
+为什么还需要 output projection？因为多个 head 的结果只是简单拼接，$\mat{W}_O$ 可以重新混合不同 head 的信息，把它们投影回 residual stream 所在的 hidden 空间。
+
+从参数量看，如果 Q、K、V、O 都是 $H\times H$ 矩阵，则 attention block 的主要参数量约为：
+[
+4H^2.
+]
+这还不包括 LayerNorm 和 bias。FFN 通常参数更多，后文会分析。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+head/.style={draw, rounded corners=3pt, minimum width=1.4cm, minimum height=0.75cm, align=center, fill=orange!12},
+op/.style={draw, rounded corners=3pt, minimum width=1.9cm, minimum height=0.8cm, align=center, fill=blue!6},
+arrow/.style={-{Latex[length=2.3mm]}, thick}
+]
+
+```
+\node[op] (input) at (-5.2,0) {$X$};
+
+\foreach \i/\y in {1/1.6,2/0.55,3/-0.55,4/-1.6} {
+  \node[head] (h\i) at (-2.6,\y) {Head \i\\Attention};
+  \draw[arrow] (input.east) .. controls (-4.0,\y) .. (h\i.west);
+}
+
+\node[op, fill=green!8, minimum width=2.1cm, minimum height=1.0cm] (concat) at (0.3,0) {Concat\\heads};
+\node[op, fill=purple!10, minimum width=2.1cm] (wo) at (3.0,0) {Output\\Projection $W_O$};
+\node[op, fill=yellow!14] (out) at (5.5,0) {$Y$};
+
+\foreach \i in {1,...,4} {
+  \draw[arrow] (h\i.east) -- (concat.west);
+}
+
+\draw[arrow] (concat) -- (wo);
+\draw[arrow] (wo) -- (out);
+
+\node[align=left, text width=9.8cm] at (0,-2.75) {
+  多个 head 独立计算注意力，拼接后通过 $W_O$ 重新混合。实际实现中，所有 head 常在同一个 fused attention kernel 中并行处理。
+};
+```
+
+\end{tikzpicture}
+\caption{Multi-Head Attention 的 head 并行、concat 与 output projection}
+\label{fig:multi-head-attention-structure}
+\end{figure}
+
+\subsection{MHA、MQA、GQA 对比}
+\label{subsec:mha-mqa-gqa}
+
+标准 Multi-Head Attention 中，每个 query head 都有自己的 key head 和 value head。若 query head 数为 $n_q$，则：
+[
+n_k=n_v=n_q.
+]
+这称为 MHA。
+
+在推理 decode 阶段，KV Cache 显存占用与 key/value head 数成正比。为了降低 KV Cache 成本，现代 LLM 常使用 MQA 或 GQA。
+
+\textbf{Multi-Query Attention, MQA} 让所有 query heads 共享同一组 key/value：
+[
+n_k=n_v=1,\quad n_q>1.
+]
+它显著降低 KV Cache 显存和带宽，但可能影响模型表达能力。
+
+\textbf{Grouped-Query Attention, GQA} 是 MHA 与 MQA 的折中。多个 query heads 分成若干组，每组共享一组 key/value：
+[
+1<n_k=n_v<n_q.
+]
+例如 $n_q=32$，$n_{kv}=8$，则每 $4$ 个 query head 共享一组 K/V。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+q/.style={draw, rounded corners=2pt, fill=blue!10, minimum width=0.48cm, minimum height=0.42cm},
+kv/.style={draw, rounded corners=2pt, fill=orange!16, minimum width=0.48cm, minimum height=0.42cm},
+title/.style={font=\bfseries},
+arrow/.style={-{Latex[length=1.9mm]}, thick}
+]
+
+```
+\node[title] at (-4.5,2.5) {MHA};
+\node[title] at (0,2.5) {MQA};
+\node[title] at (4.5,2.5) {GQA};
+
+% MHA
+\foreach \i in {0,...,5} {
+  \node[q] (mq\i) at ({-5.8+0.45*\i},1.6) {};
+  \node[kv] (mk\i) at ({-5.8+0.45*\i},0.8) {};
+  \node[kv] (mv\i) at ({-5.8+0.45*\i},0.1) {};
+  \draw[arrow] (mq\i) -- (mk\i);
+  \draw[arrow] (mq\i) -- (mv\i);
+}
+\node[align=center] at (-4.55,-0.7) {每个 Q head\\独享 K/V};
+
+% MQA
+\foreach \i in {0,...,5} {
+  \node[q] (qq\i) at ({-1.3+0.45*\i},1.6) {};
+}
+\node[kv, minimum width=2.8cm] (qk) at (0,0.8) {shared K};
+\node[kv, minimum width=2.8cm] (qv) at (0,0.1) {shared V};
+\foreach \i in {0,...,5} {
+  \draw[arrow] (qq\i) -- (qk.north);
+  \draw[arrow] (qq\i) -- (qv.north);
+}
+\node[align=center] at (0,-0.7) {所有 Q head\\共享一组 K/V};
+
+% GQA
+\foreach \i in {0,...,7} {
+  \node[q] (gq\i) at ({3.0+0.38*\i},1.6) {};
+}
+\node[kv, minimum width=1.3cm] (gk1) at (3.55,0.8) {K1};
+\node[kv, minimum width=1.3cm] (gk2) at (5.1,0.8) {K2};
+\node[kv, minimum width=1.3cm] (gv1) at (3.55,0.1) {V1};
+\node[kv, minimum width=1.3cm] (gv2) at (5.1,0.1) {V2};
+\foreach \i in {0,...,3} {
+  \draw[arrow] (gq\i) -- (gk1.north);
+  \draw[arrow] (gq\i) -- (gv1.north);
+}
+\foreach \i in {4,...,7} {
+  \draw[arrow] (gq\i) -- (gk2.north);
+  \draw[arrow] (gq\i) -- (gv2.north);
+}
+\node[align=center] at (4.35,-0.7) {每组 Q heads\\共享 K/V};
+
+\node[align=left, text width=10.4cm] at (0,-2.1) {
+  MQA/GQA 主要面向推理效率：减少 KV Cache 大小和 decode 阶段的内存带宽压力。
+  这是模型结构与 serving infra 共同设计的典型案例。
+};
+```
+
+\end{tikzpicture}
+\caption{MHA、MQA 与 GQA 的 KV 共享方式对比}
+\label{fig:mha-mqa-gqa-comparison}
+\end{figure}
+
+KV Cache 的详细机制会在推理篇专门讨论。这里需要提前建立直觉：\textbf{训练阶段的主要瓶颈常是计算与激活，推理 decode 阶段的瓶颈常是 KV Cache 带宽与调度。}GQA 的流行正是因为它能在不显著损害质量的情况下，降低推理系统成本。
+
+\section{Feed-Forward Network}
+\label{sec:feed-forward-network}
+
+Transformer block 除了 attention，还有一个逐 token 的前馈网络 Feed-Forward Network，简称 FFN 或 MLP。很多初学者以为 attention 是 Transformer 中参数最多的部分，但在典型 LLM 中，FFN 往往贡献了更大的参数量和计算量。
+
+\subsection{FFN 的参数量来源}
+\label{subsec:ffn-parameter-source}
+
+标准 Transformer FFN 可以写为：
+[
+\operatorname{FFN}(\vect{x})
+============================
+
+\phi(\vect{x}\mat{W}_1+\vect{b}_1)\mat{W}_2+\vect{b}*2.
+]
+其中：
+[
+\mat{W}*1\in\mathbb{R}^{H\times H*{\mathrm{ffn}}},
+\quad
+\mat{W}*2\in\mathbb{R}^{H*{\mathrm{ffn}}\times H}.
+]
+通常：
+[
+H*{\mathrm{ffn}}\approx 4H.
+]
+因此 FFN 参数量约为：
+[
+H\cdot 4H+4H\cdot H=8H^2.
+]
+
+而标准 attention 的 Q、K、V、O projection 参数量约为：
+[
+4H^2.
+]
+这说明 FFN 参数量通常约为 attention projection 的两倍。对于 Decoder-only LLM，绝大部分参数分布在每层的 attention 和 FFN 中，而 FFN 往往是更大的参数来源。
+
+\subsection{GELU、SwiGLU 与门控结构}
+\label{subsec:gelu-swiglu-gated-ffn}
+
+早期 Transformer 常使用 GELU：
+[
+\operatorname{FFN}(\mat{X})
+===========================
+
+\operatorname{GELU}(\mat{X}\mat{W}_1)\mat{W}_2.
+]
+现代 LLM 中常见 SwiGLU：
+[
+\operatorname{SwiGLU}(\mat{X})
+==============================
+
+\left[
+\operatorname{SiLU}(\mat{X}\mat{W}_g)
+\odot
+(\mat{X}\mat{W}_u)
+\right]\mat{W}_d.
+]
+这里有三个 projection：
+
+[
+\mat{W}*g\in\mathbb{R}^{H\times H*{\mathrm{mid}}},
+\quad
+\mat{W}*u\in\mathbb{R}^{H\times H*{\mathrm{mid}}},
+\quad
+\mat{W}*d\in\mathbb{R}^{H*{\mathrm{mid}}\times H}.
+]
+
+门控结构的直觉是：一条分支生成内容，另一条分支生成门控权重，二者逐元素相乘。它能提升表达能力，但也改变参数量和计算量。因此使用 SwiGLU 时，$H_{\mathrm{mid}}$ 往往不是简单的 $4H$，而会调整为较小值，以保持整体参数量可控。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+box/.style={draw, rounded corners=3pt, minimum width=1.55cm, minimum height=0.7cm, align=center},
+arrow/.style={-{Latex[length=2.3mm]}, thick},
+mult/.style={draw, circle, minimum size=0.65cm, fill=yellow!18}
+]
+
+```
+\node[box, fill=blue!6] (x) at (-5.2,0) {$X$};
+
+\node[box, fill=orange!12] (wg) at (-3.2,1.0) {$W_g$};
+\node[box, fill=orange!12] (wu) at (-3.2,-1.0) {$W_u$};
+
+\node[box, fill=green!10] (silu) at (-1.1,1.0) {SiLU};
+\node[box, fill=green!10] (up) at (-1.1,-1.0) {Up\\features};
+
+\node[mult] (mul) at (1.1,0) {$\odot$};
+\node[box, fill=purple!10] (wd) at (3.1,0) {$W_d$};
+\node[box, fill=blue!6] (out) at (5.0,0) {$Y$};
+
+\draw[arrow] (x) -- (wg);
+\draw[arrow] (x) -- (wu);
+\draw[arrow] (wg) -- (silu);
+\draw[arrow] (wu) -- (up);
+\draw[arrow] (silu) -- (mul);
+\draw[arrow] (up) -- (mul);
+\draw[arrow] (mul) -- (wd);
+\draw[arrow] (wd) -- (out);
+
+\node[align=left, text width=10.0cm] at (0,-2.35) {
+  SwiGLU 使用门控分支调制内容分支。工程上，$W_g$ 和 $W_u$ 常可合并为一个更大的 projection，
+  再在 hidden 维切分，减少输入读取和 kernel launch。
+};
+```
+
+\end{tikzpicture}
+\caption{SwiGLU 门控 FFN 结构}
+\label{fig:swiglu-ffn}
+\end{figure}
+
+\subsection{FFN 为什么常成为参数量大户}
+\label{subsec:why-ffn-parameter-heavy}
+
+设隐藏维度 $H=4096$，标准 FFN 中间维度 $H_{\mathrm{ffn}}=4H=16384$。两层线性层参数量约为：
+[
+4096\times 16384+16384\times 4096
+=================================
+
+134,217,728.
+]
+这是一层 FFN 的参数量，不含 bias。若模型有 $80$ 层，仅 FFN 部分就会达到约：
+[
+80\times 134,217,728
+\approx 10.7\mathrm{B}
+]
+参数。
+
+FFN 的计算也很重。对于 batch 和 sequence 合并后的 token 数：
+[
+N_{\mathrm{tok}}=B S,
+]
+FFN 两个 GEMM 的 FLOPs 约为：
+[
+2N_{\mathrm{tok}}H H_{\mathrm{ffn}}
++
+2N_{\mathrm{tok}}H_{\mathrm{ffn}}H
+==================================
+
+4N_{\mathrm{tok}}H H_{\mathrm{ffn}}.
+]
+当 $H_{\mathrm{ffn}}=4H$ 时：
+[
+\mathrm{FLOPs}*{\mathrm{FFN}}\approx 16N*{\mathrm{tok}}H^2.
+]
+
+因此，在 GPU profiling 中，Transformer block 的时间往往大量消耗在 FFN GEMM 上。好消息是 FFN GEMM 规则、密集、算术强度高，通常能很好利用 Tensor Core。坏消息是参数和激活体积大，在 tensor parallel 和 ZeRO 中会带来显著通信与显存压力。
+
+\section{Positional Encoding}
+\label{sec:positional-encoding}
+
+Self-Attention 本身对输入 token 的排列没有天然顺序感。若没有位置编码，模型只知道 token 内容，不知道它们出现在第几个位置。为了建模序列顺序，需要向 token embedding 注入位置信息。
+
+\subsection{绝对位置编码}
+\label{subsec:absolute-positional-encoding}
+
+最直接的方法是为每个位置学习一个位置向量：
+[
+\mat{P}\in\mathbb{R}^{S_{\max}\times H}.
+]
+输入 token embedding 为：
+[
+\mat{E}\in\mathbb{R}^{S\times H}.
+]
+加入位置编码后：
+[
+\mat{X}=\mat{E}+\mat{P}_{1:S}.
+]
+
+绝对位置编码简单有效，但存在外推问题：如果训练时最大长度为 $S_{\max}$，推理时想处理更长序列，模型没有学过更远位置的 embedding。即便可以插值或扩展，也不一定稳定。
+
+早期 Transformer 也使用正弦位置编码：
+[
+PE(pos,2i)=\sin\left(\frac{pos}{10000^{2i/H}}\right),
+]
+[
+PE(pos,2i+1)=\cos\left(\frac{pos}{10000^{2i/H}}\right).
+]
+它不需要学习参数，并具有一定外推结构。但现代 Decoder-only LLM 更常见的是 RoPE。
+
+\subsection{相对位置编码}
+\label{subsec:relative-positional-encoding}
+
+绝对位置编码告诉模型“当前位置是第几个 token”；相对位置编码更关注“两个 token 之间相隔多远”。在 attention 中，位置关系主要影响 query 与 key 的匹配，因此可以把相对位置信息加入 attention score：
+
+[
+S_{ij}
+======
+
+\vect{q}_i^{\mathsf{T}}\vect{k}*j
++
+b*{i-j}.
+]
+
+其中 $b_{i-j}$ 是与相对距离有关的 bias。相对位置编码适合表达局部关系、距离衰减和长上下文结构。ALiBi 等方法也是沿着类似方向设计的。
+
+从 Infra 角度看，相对位置 bias 的实现会影响 attention kernel。如果 bias 需要显式构造 $S\times S$ 矩阵，会增加显存与带宽；更高效的方法是在 kernel 内根据 $(i,j)$ 动态计算 bias。
+
+\subsection{RoPE}
+\label{subsec:rope}
+
+RoPE，即 Rotary Position Embedding，旋转位置编码，是现代 LLM 中非常常见的位置编码方式。它不是把位置向量加到 token embedding 上，而是对 query 和 key 的向量分量按位置进行旋转。
+
+对于二维向量：
+[
+\begin{bmatrix}
+x_{2i}\
+x_{2i+1}
+\end{bmatrix},
+]
+位置 $pos$ 对应旋转角度 $\theta_{pos,i}$，旋转后：
+[
+\begin{bmatrix}
+x'*{2i}\
+x'*{2i+1}
+\end{bmatrix}
+=============
+
+\begin{bmatrix}
+\cos\theta_{pos,i} & -\sin\theta_{pos,i}\
+\sin\theta_{pos,i} & \cos\theta_{pos,i}
+\end{bmatrix}
+\begin{bmatrix}
+x_{2i}\
+x_{2i+1}
+\end{bmatrix}.
+]
+
+RoPE 的关键性质是，旋转后的 query 与 key 点积可以表达相对位置信息。不同位置的旋转角度差会进入点积，从而让 attention score 感知相对距离。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+axis/.style={-{Latex[length=2.1mm]}, thick},
+vec/.style={-{Latex[length=2.5mm]}, thick, blue!75},
+vec2/.style={-{Latex[length=2.5mm]}, thick, orange!85!black},
+arrow/.style={-{Latex[length=2.3mm]}, thick}
+]
+
+```
+\node[font=\bfseries] at (0,3.0) {RoPE：按位置旋转 Query / Key 的二维子空间};
+
+\draw[axis] (-4.2,0) -- (-1.0,0) node[right] {$x_{2i}$};
+\draw[axis] (-2.6,-1.4) -- (-2.6,1.6) node[above] {$x_{2i+1}$};
+\draw[vec] (-2.6,0) -- (-1.45,0.8) node[above] {$\vect{x}$};
+
+\draw[axis] (1.0,0) -- (4.2,0) node[right] {$x'_{2i}$};
+\draw[axis] (2.6,-1.4) -- (2.6,1.6) node[above] {$x'_{2i+1}$};
+\draw[vec2] (2.6,0) -- (3.15,1.25) node[above] {$R_{\theta(pos)}\vect{x}$};
+
+\draw[arrow] (-0.6,0.4) -- node[above] {position-dependent rotation} (0.6,0.4);
+
+\draw[->, thick, gray!70] (3.25,0.0) arc (0:65:0.65);
+\node at (3.55,0.45) {$\theta$};
+
+\node[align=left, text width=10.2cm] at (0,-2.15) {
+  RoPE 将位置信息注入 Q/K，而不是直接加到 hidden state 上。
+  它让 attention score 自然包含相对位置关系，是 LLaMA 等现代 Decoder-only LLM 的常见选择。
+};
+```
+
+\end{tikzpicture}
+\caption{RoPE 旋转位置编码的二维几何直觉}
+\label{fig:rope-rotation}
+\end{figure}
+
+下面给出一个简化的 RoPE 实现：
+
+\begin{lstlisting}[language=Python,caption={简化版 RoPE 应用逻辑},label={lst:rope-implementation}]
+import torch
+
+def rotate_half(x):
+# x: [..., dim]
+x_even = x[..., 0::2]
+x_odd = x[..., 1::2]
+# [x0, x1] -> [-x1, x0]
+out = torch.stack((-x_odd, x_even), dim=-1)
+return out.flatten(-2)
+
+def apply_rope(q, k, cos, sin):
+"""
+q, k: [batch, heads, seq, head_dim]
+cos, sin: [seq, head_dim], broadcastable to q/k
+"""
+cos = cos[None, None, :, :]
+sin = sin[None, None, :, :]
+
+```
+q_rot = q * cos + rotate_half(q) * sin
+k_rot = k * cos + rotate_half(k) * sin
+return q_rot, k_rot
+```
+
+\end{lstlisting}
+
+RoPE 的工程细节包括：
+
+\begin{itemize}
+\item cos/sin cache 的预计算与设备放置；
+\item 长上下文扩展时的 base 调整或 scaling；
+\item Q/K layout 与 head dimension 对齐；
+\item 是否在 fused attention kernel 中融合 RoPE；
+\item prefill 与 decode 阶段位置索引管理。
+\end{itemize}
+
+\subsection{长上下文外推问题}
+\label{subsec:long-context-extrapolation}
+
+长上下文是现代 LLM 的重要需求。位置编码直接影响模型能否处理超过训练长度的序列。若模型训练时最大长度为 $4096$，推理时希望处理 $32768$ 或更长上下文，需要解决外推问题。
+
+常见策略包括：
+
+\begin{itemize}
+\item 对绝对位置 embedding 进行插值或扩展；
+\item 对 RoPE 的频率或 base 做 scaling；
+\item 使用相对位置 bias 或 ALiBi 类方法；
+\item 在长上下文数据上继续训练；
+\item 结合 sliding window、attention sink、memory token 或 retrieval。
+\end{itemize}
+
+但长上下文不仅是模型问题，也是 Infra 问题。标准 attention 的 $O(S^2)$ 成本会迅速上升；推理阶段 KV Cache 的显存随 $S$ 线性增长：
+[
+M_{\mathrm{KV}}
+\propto
+L\cdot B\cdot S\cdot n_{kv}\cdot d_h.
+]
+因此，长上下文模型需要算法、kernel、显存管理和调度系统共同优化。
+
+\section{Transformer Block 的现代变体}
+\label{sec:modern-transformer-block-variants}
+
+Transformer block 是 attention、FFN、归一化和 residual connection 的组合。不同模型族在细节上有所差异，例如 Post-Norm 与 Pre-Norm、LayerNorm 与 RMSNorm、GELU 与 SwiGLU、MHA 与 GQA、绝对位置编码与 RoPE 等。
+
+\subsection{Post-Norm 与 Pre-Norm}
+\label{subsec:postnorm-prenorm}
+
+原始 Transformer 常使用 Post-Norm：
+[
+\mat{Y}=\LayerNorm(\mat{X}+\operatorname{Sublayer}(\mat{X})).
+]
+也就是说，先 residual add，再做 LayerNorm。
+
+现代大语言模型更常使用 Pre-Norm：
+[
+\mat{Y}=\mat{X}+\operatorname{Sublayer}(\LayerNorm(\mat{X})).
+]
+归一化被放在 attention 或 FFN 之前。
+
+Pre-Norm 的优势是深层网络训练更稳定。因为 residual stream 可以更直接地跨层传递，梯度也更容易沿 residual 路径流动。Post-Norm 在层数较深时更容易出现训练不稳定，需要更精细的初始化和学习率控制。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+box/.style={draw, rounded corners=3pt, minimum width=1.55cm, minimum height=0.7cm, align=center},
+arrow/.style={-{Latex[length=2.3mm]}, thick},
+plus/.style={draw, circle, minimum size=0.55cm, fill=yellow!18}
+]
+
+```
+\node[font=\bfseries] at (0,3.0) {Post-Norm 与 Pre-Norm 对比};
+
+% PostNorm
+\node[font=\bfseries] at (-3.8,2.25) {Post-Norm};
+\node[box, fill=blue!6] (px) at (-5.5,1.2) {$X$};
+\node[box, fill=orange!12] (psub) at (-3.7,1.2) {Sublayer};
+\node[plus] (pplus) at (-2.2,1.2) {$+$};
+\node[box, fill=green!10] (pln) at (-0.8,1.2) {Norm};
+\node[box, fill=blue!6] (py) at (0.6,1.2) {$Y$};
+
+\draw[arrow] (px) -- (psub);
+\draw[arrow] (psub) -- (pplus);
+\draw[arrow] (pplus) -- (pln);
+\draw[arrow] (pln) -- (py);
+\draw[arrow] (px.south) .. controls (-4.0,0.35) and (-2.2,0.35) .. (pplus.south);
+
+% PreNorm
+\node[font=\bfseries] at (-3.8,-0.1) {Pre-Norm};
+\node[box, fill=blue!6] (x) at (-5.5,-1.1) {$X$};
+\node[box, fill=green!10] (ln) at (-4.0,-1.1) {Norm};
+\node[box, fill=orange!12] (sub) at (-2.4,-1.1) {Sublayer};
+\node[plus] (plus) at (-0.8,-1.1) {$+$};
+\node[box, fill=blue!6] (y) at (0.6,-1.1) {$Y$};
+
+\draw[arrow] (x) -- (ln);
+\draw[arrow] (ln) -- (sub);
+\draw[arrow] (sub) -- (plus);
+\draw[arrow] (plus) -- (y);
+\draw[arrow] (x.south) .. controls (-3.3,-2.0) and (-0.8,-2.0) .. (plus.south);
+
+\node[align=left, text width=5.4cm] at (4.0,0.1) {
+  现代 LLM 多采用 Pre-Norm。\\
+  它让 residual stream 更稳定，\\
+  有利于深层网络中的梯度传播。
+};
+```
+
+\end{tikzpicture}
+\caption{Post-Norm 与 Pre-Norm Transformer 子层结构}
+\label{fig:postnorm-prenorm}
+\end{figure}
+
+\subsection{LayerNorm 与 RMSNorm}
+\label{subsec:transformer-layernorm-rmsnorm}
+
+LayerNorm 对 hidden 维计算均值和方差：
+[
+\operatorname{LN}(\vect{x})
+===========================
+
+\gamma
+\frac{\vect{x}-\mu}{\sqrt{\sigma^2+\epsilon}}
++
+\beta.
+]
+RMSNorm 则只计算均方根：
+[
+\RMSNorm(\vect{x})
+==================
+
+\gamma
+\frac{\vect{x}}{\sqrt{\frac{1}{H}\sum_i x_i^2+\epsilon}}.
+]
+
+许多现代 LLM 使用 RMSNorm，原因包括：
+
+\begin{itemize}
+\item 计算略简单，不需要减均值；
+\item 不依赖 batch 统计，适合小 micro-batch；
+\item 在 Decoder-only 架构中训练表现稳定；
+\item 更容易写出高效 fused kernel。
+\end{itemize}
+
+归一化层的参数量很小，只有：
+[
+O(H)
+]
+级别。但它们对训练稳定性和 kernel 时间线有重要影响。Norm 通常是 memory-bound 操作，若与 residual add 或 dropout 拆成多个 kernel，会造成额外 HBM 往返。因此生产系统中经常使用 fused RMSNorm、fused LayerNorm 或 fused residual-norm。
+
+\subsection{Residual Connection}
+\label{subsec:residual-connection}
+
+Residual connection 是深层 Transformer 能够训练的关键机制。基本形式为：
+[
+\mat{Y}=\mat{X}+F(\mat{X}).
+]
+它允许模型学习相对于输入的增量，而不是每层都完全重写表示。梯度也可以沿着恒等路径传播，缓解深层网络中的梯度衰减。
+
+在 Transformer block 中，通常有两个 residual 分支：
+
+[
+\mat{X}'=\mat{X}+\operatorname{Attention}(\operatorname{Norm}(\mat{X})),
+]
+[
+\mat{Y}=\mat{X}'+\operatorname{FFN}(\operatorname{Norm}(\mat{X}')).
+]
+
+Residual stream 可以被理解为贯穿所有层的信息高速公路。Attention 和 FFN 每层向这个高速公路写入增量信息。许多可解释性研究也会从 residual stream 的角度分析模型内部表征。
+
+从系统角度看，residual add 是简单 elementwise 操作，计算量很小但需要读写完整激活张量。若单独作为 kernel 执行，可能成为时间线上的小 kernel。高性能实现常把 residual add 与 norm 融合。
+
+\subsection{Decoder-only 架构}
+\label{subsec:decoder-only-architecture}
+
+现代大语言模型大多采用 Decoder-only Transformer。它的核心特点是：
+
+\begin{itemize}
+\item 使用 causal self-attention；
+\item 训练目标是 next-token prediction；
+\item 输入和输出共享或不共享 embedding/lm head；
+\item 推理时逐 token 生成，并使用 KV Cache；
+\item 更适合统一处理文本补全、对话、代码生成和指令跟随任务。
+\end{itemize}
+
+一个 Pre-Norm Decoder Block 可以写作：
+
+[
+\mat{U}_{\ell}
+==============
+
+\mat{X}*{\ell}
++
+\operatorname{Attention}
+\left(
+\operatorname{Norm}*1(\mat{X}*{\ell})
+\right),
+]
+[
+\mat{X}*{\ell+1}
+================
+
+\mat{U}_{\ell}
++
+\operatorname{FFN}
+\left(
+\operatorname{Norm}*2(\mat{U}*{\ell})
+\right).
+]
+
+整个模型则是 embedding、多个 decoder block 和 lm head 的堆叠：
+
+[
+\mat{X}*0=\operatorname{Embedding}(\text{input ids})+\operatorname{PositionEncoding},
+]
+[
+\mat{X}*{\ell+1}=\operatorname{DecoderBlock}*{\ell}(\mat{X}*{\ell}),
+\quad
+\ell=0,\ldots,L-1,
+]
+[
+\mat{Z}=\mat{X}*{L}\mat{W}*{\mathrm{vocab}}.
+]
+
+其中 logits：
+[
+\mat{Z}\in\mathbb{R}^{B\times S\times V}
+]
+用于计算 cross entropy 或进行采样。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+box/.style={draw, rounded corners=3pt, minimum width=2.15cm, minimum height=0.72cm, align=center},
+arrow/.style={-{Latex[length=2.3mm]}, thick},
+plus/.style={draw, circle, minimum size=0.55cm, fill=yellow!18}
+]
+
+```
+\node[font=\bfseries] at (0,4.0) {Pre-Norm Transformer Decoder Block};
+
+\node[box, fill=blue!6] (x) at (-4.9,2.4) {$X_\ell$};
+
+\node[box, fill=green!10] (norm1) at (-2.9,2.4) {RMSNorm\\or LayerNorm};
+\node[box, fill=orange!12] (attn) at (-0.5,2.4) {Causal\\Self-Attention};
+\node[plus] (plus1) at (1.45,2.4) {$+$};
+\node[box, fill=blue!6] (u) at (3.15,2.4) {$U_\ell$};
+
+\draw[arrow] (x) -- (norm1);
+\draw[arrow] (norm1) -- (attn);
+\draw[arrow] (attn) -- (plus1);
+\draw[arrow] (plus1) -- (u);
+\draw[arrow] (x.south) .. controls (-2.0,1.45) and (1.45,1.45) .. (plus1.south);
+
+\node[box, fill=green!10] (norm2) at (-1.6,0.3) {RMSNorm\\or LayerNorm};
+\node[box, fill=purple!10] (ffn) at (0.9,0.3) {FFN / SwiGLU};
+\node[plus] (plus2) at (3.0,0.3) {$+$};
+\node[box, fill=blue!6] (y) at (5.0,0.3) {$X_{\ell+1}$};
+
+\draw[arrow] (u.south) .. controls (3.15,1.15) and (-1.6,1.15) .. (norm2.north);
+\draw[arrow] (norm2) -- (ffn);
+\draw[arrow] (ffn) -- (plus2);
+\draw[arrow] (plus2) -- (y);
+\draw[arrow] (u.south) .. controls (4.0,1.2) and (3.0,1.15) .. (plus2.north);
+
+\node[align=left, text width=10.4cm] at (0,-1.55) {
+  现代 Decoder-only LLM 通常使用 Pre-Norm、causal self-attention、SwiGLU FFN、RoPE 以及 RMSNorm。
+  每个 block 都围绕 residual stream 添加 attention 和 FFN 两类增量。
+};
+```
+
+\end{tikzpicture}
+\caption{现代 Pre-Norm Transformer Decoder Block}
+\label{fig:pre-norm-transformer-decoder-block}
+\end{figure}
+
+下面给出一个教学版 Decoder Block 的 PyTorch 实现。它省略了高性能 fused kernel、KV Cache、tensor parallel、dropout、FlashAttention 等细节，但结构上对应现代 LLM block。
+
+\begin{lstlisting}[language=Python,caption={教学版 Transformer Decoder Block},label={lst:decoder-block-pytorch}]
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class RMSNorm(nn.Module):
+def **init**(self, hidden_size, eps=1e-6):
+super().**init**()
+self.weight = nn.Parameter(torch.ones(hidden_size))
+self.eps = eps
+
+```
+def forward(self, x):
+    variance = x.pow(2).mean(dim=-1, keepdim=True)
+    x = x * torch.rsqrt(variance + self.eps)
+    return self.weight * x
+```
+
+class MultiHeadAttention(nn.Module):
+def **init**(self, hidden_size, num_heads):
+super().**init**()
+assert hidden_size % num_heads == 0
+self.hidden_size = hidden_size
+self.num_heads = num_heads
+self.head_dim = hidden_size // num_heads
+
+```
+    # Fused QKV projection.
+    self.qkv = nn.Linear(hidden_size, 3 * hidden_size, bias=False)
+    self.out_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+
+def forward(self, x):
+    B, S, H = x.shape
+
+    qkv = self.qkv(x)  # [B, S, 3H]
+    q, k, v = qkv.chunk(3, dim=-1)
+
+    # [B, S, H] -> [B, num_heads, S, head_dim]
+    q = q.view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
+    k = k.view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
+    v = v.view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
+
+    scores = q @ k.transpose(-2, -1)
+    scores = scores / math.sqrt(self.head_dim)
+
+    causal_mask = torch.triu(
+        torch.ones(S, S, device=x.device, dtype=torch.bool),
+        diagonal=1,
+    )
+    scores = scores.masked_fill(causal_mask, float("-inf"))
+
+    probs = F.softmax(scores, dim=-1)
+    out = probs @ v  # [B, heads, S, head_dim]
+
+    out = out.transpose(1, 2).contiguous().view(B, S, H)
+    return self.out_proj(out)
+```
+
+class SwiGLU(nn.Module):
+def **init**(self, hidden_size, intermediate_size):
+super().**init**()
+self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
+self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
+self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
+
+```
+def forward(self, x):
+    gate = F.silu(self.gate_proj(x))
+    up = self.up_proj(x)
+    return self.down_proj(gate * up)
+```
+
+class DecoderBlock(nn.Module):
+def **init**(self, hidden_size, num_heads, intermediate_size):
+super().**init**()
+self.norm1 = RMSNorm(hidden_size)
+self.attn = MultiHeadAttention(hidden_size, num_heads)
+self.norm2 = RMSNorm(hidden_size)
+self.mlp = SwiGLU(hidden_size, intermediate_size)
+
+```
+def forward(self, x):
+    # Pre-Norm attention residual.
+    x = x + self.attn(self.norm1(x))
+
+    # Pre-Norm FFN residual.
+    x = x + self.mlp(self.norm2(x))
+    return x
+```
+
+\end{lstlisting}
+
+这段代码适合理解结构，但不适合直接作为高性能 LLM 实现。它的低效点包括：
+
+\begin{itemize}
+\item 显式物化 attention score；
+\item causal mask 每次 forward 都构造；
+\item softmax 和 matmul 没有融合；
+\item transpose 后调用 \texttt{contiguous()} 可能产生额外拷贝；
+\item 没有 KV Cache，无法高效 decode；
+\item 没有 tensor parallel、sequence parallel 或 fused RMSNorm；
+\item 没有使用 FlashAttention 或 PyTorch SDPA backend。
+\end{itemize}
+
+实际大模型框架会用高度优化的 attention kernel、fused norm、fused MLP、并行线性层和分布式通信策略替换这些朴素实现。
+
+\section{从 Transformer 公式到系统成本}
+\label{sec:transformer-formula-to-system-cost}
+
+Transformer 的优雅之处在于结构规整；它的困难之处在于规模巨大。对 AI Infra 工程师来说，理解 Transformer 不能停留在 block 图，而要能估算每一部分的参数量、显存、计算量和通信代价。
+
+\subsection{单层参数量估算}
+\label{subsec:transformer-layer-parameter-estimation}
+
+设 hidden size 为 $H$，FFN 中间维度为 $H_{\mathrm{ffn}}$。一个标准 Decoder Block 的主要参数包括：
+
+\begin{itemize}
+\item QKV projection：$3H^2$；
+\item output projection：$H^2$；
+\item FFN up/down projection：$2HH_{\mathrm{ffn}}$；
+\item Norm 参数：约 $O(H)$，相对较小。
+\end{itemize}
+
+因此单层参数量近似：
+[
+N_{\mathrm{layer}}
+\approx
+4H^2+2HH_{\mathrm{ffn}}.
+]
+若 $H_{\mathrm{ffn}}=4H$：
+[
+N_{\mathrm{layer}}
+\approx
+4H^2+8H^2=12H^2.
+]
+
+若使用 SwiGLU，参数量为：
+[
+N_{\mathrm{FFN}}
+\approx
+3HH_{\mathrm{mid}}.
+]
+为了与标准 FFN 参数量接近，常将 $H_{\mathrm{mid}}$ 设置为小于 $4H$ 的值。
+
+\subsection{Attention 与 FFN 的 FLOPs}
+\label{subsec:attention-ffn-flops}
+
+对于 batch token 数：
+[
+N_{\mathrm{tok}}=B S,
+]
+attention projection FLOPs 约为：
+[
+\mathrm{FLOPs}*{QKV+O}
+\approx
+2N*{\mathrm{tok}}\cdot 4H^2
+===========================
+
+8BSH^2.
+]
+attention score 和 value 加权的 FLOPs 约为：
+[
+\mathrm{FLOPs}_{attn}
+\approx
+4B n_h S^2 d_h
+==============
+
+4BS^2H.
+]
+FFN FLOPs 对标准 $H_{\mathrm{ffn}}=4H$ 约为：
+[
+\mathrm{FLOPs}_{FFN}
+\approx
+16BSH^2.
+]
+
+这说明当 $S$ 不是特别大时，FFN 和 projection GEMM 往往占主导；当 $S$ 变得很大时，$S^2H$ 的 attention 项会迅速上升。这也是长上下文训练特别昂贵的根本原因。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+font=\small,
+axis/.style={-{Latex[length=2.3mm]}, thick},
+curve/.style={thick},
+label/.style={align=center}
+]
+
+```
+\node[font=\bfseries] at (0,3.0) {Attention 与 FFN 计算量随序列长度的增长趋势};
+
+\draw[axis] (-5.2,-1.2) -- (5.4,-1.2) node[right] {$S$};
+\draw[axis] (-5.2,-1.2) -- (-5.2,2.2) node[above] {relative cost};
+
+\draw[curve, blue!75]
+  plot[smooth] coordinates {
+    (-4.8,-0.7) (-3.2,-0.2) (-1.6,0.3) (0.0,0.8) (1.6,1.3) (3.2,1.8)
+  };
+\node[blue!75] at (3.7,1.9) {FFN / Projection\\$\propto S$};
+
+\draw[curve, orange!90!black]
+  plot[smooth] coordinates {
+    (-4.8,-0.9) (-3.2,-0.8) (-1.6,-0.45) (0.0,0.1) (1.6,0.95) (3.2,2.05)
+  };
+\node[orange!90!black] at (3.8,0.85) {Attention scores\\$\propto S^2$};
+
+\draw[dashed] (0.9,-1.2) -- (0.9,1.0);
+\node[align=center] at (0.9,-1.65) {长上下文\\拐点};
+
+\node[align=left, text width=10.2cm] at (0,-2.55) {
+  Transformer 的瓶颈随序列长度变化。短到中等长度时，FFN 与 projection GEMM 常占主要时间；
+  长上下文时，attention 的 $S^2$ 项和 KV Cache 压力变得突出。
+};
+```
+
+\end{tikzpicture}
+\caption{Attention 与 FFN 计算复杂度增长趋势}
+\label{fig:attention-ffn-cost-growth}
+\end{figure}
+
+\subsection{训练与推理的差异}
+\label{subsec:transformer-training-inference-difference}
+
+Transformer 训练和推理有显著差异：
+
+\begin{itemize}
+\item \textbf{训练}：给定完整序列，所有位置并行计算；需要 backward、保存激活、优化器状态和梯度通信。
+\item \textbf{推理 prefill}：给定 prompt，类似训练 forward，处理完整上下文；不需要 backward。
+\item \textbf{推理 decode}：每次只生成一个新 token；使用 KV Cache 避免重复计算历史 K/V。
+\end{itemize}
+
+训练阶段的 attention 可以一次处理 $S\times S$ 的关系；decode 阶段每一步只计算新 token 对历史所有 token 的 attention：
+[
+\mat{q}*{new}\mat{K}*{cache}^{\mathsf{T}}.
+]
+这时计算量随历史长度线性增长，但由于 batch 和矩阵形状较小，往往更 memory-bound。KV Cache 的读取带宽和请求调度成为推理系统关键。
+
+\begin{table}[H]
+\centering
+\small
+\caption{Transformer 训练、Prefill 与 Decode 的系统差异}
+\label{tab:training-prefill-decode}
+\begin{tabular}{p{0.18\textwidth}p{0.25\textwidth}p{0.25\textwidth}p{0.22\textwidth}}
+\toprule
+\textbf{阶段} & \textbf{输入形态} & \textbf{主要瓶颈} & \textbf{典型优化} \
+\midrule
+训练
+& 大 batch，完整序列
+& GEMM、attention、激活显存、通信
+& FlashAttention、并行训练、checkpointing、fused kernel \
+\midrule
+Prefill
+& prompt 完整序列
+& 大矩阵计算与 attention IO
+& FlashAttention、chunked prefill、continuous batching \
+\midrule
+Decode
+& 每步一个新 token
+& KV Cache 带宽、调度、小 batch kernel
+& PagedAttention、GQA/MQA、continuous batching、量化 \
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{本章小结}
+\label{sec:chapter04-summary}
+
+本章系统剖析了 Transformer 架构，从 RNN 的串行瓶颈讲到 Self-Attention 的并行优势，再到现代 Decoder-only LLM 的具体 block 结构。
+
+\begin{itemize}
+\item \textbf{RNN 的核心瓶颈是时间步串行依赖}，难以充分利用 GPU 的大规模并行能力。
+\item \textbf{Attention 的本质是根据相似度对 value 加权求和}，矩阵形式为 $\softmax(QK^{\mathsf{T}}/\sqrt{d_k})V$。
+\item \textbf{Scaled Dot-Product Attention 通过 $\sqrt{d_k}$ 控制数值尺度}，并通过 mask 机制支持 padding 和自回归训练。
+\item \textbf{Multi-Head Attention 在多个子空间中并行建模 token 关系}，同时天然适配 batched GEMM 和 tensor parallel。
+\item \textbf{MHA、MQA、GQA 的差异主要体现在 K/V head 共享方式}，这对推理阶段 KV Cache 显存和带宽有重要影响。
+\item \textbf{FFN 往往是 Transformer 参数量大户}，尤其当中间维度接近 $4H$ 时，其参数量和 FLOPs 都非常显著。
+\item \textbf{位置编码让 attention 感知序列顺序}，RoPE 通过旋转 Q/K 注入相对位置信息，是现代 LLM 的常见选择。
+\item \textbf{现代 Decoder-only Block 通常采用 Pre-Norm、RMSNorm、Causal Self-Attention、SwiGLU 和 Residual Connection}。
+\item \textbf{Transformer 的系统瓶颈随阶段变化}：训练关注激活、GEMM、attention 和通信；推理 decode 关注 KV Cache、带宽和调度。
+\end{itemize}
+
+下一章将继续从模型演进角度出发，梳理大语言模型的发展史与主流范式：从 N-gram、神经语言模型、GPT 系列，到 instruction tuning、RLHF、开源 LLM 生态和 scaling law。那一章会帮助我们理解为什么今天的 AI Infra 需要服务如此巨大的模型、数据和训练任务。
