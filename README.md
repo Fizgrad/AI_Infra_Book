@@ -1,5 +1,7 @@
 # 从基础到深渊：AI Infrastructure 全栈指南
 
+> **注意**：本书内容由 AI（大语言模型）辅助生成，经过人工审阅和调整。书中可能存在错误或不准确之处，欢迎提交 Issue 或 PR 进行修正。
+
 一本系统性地讲解 AI Infrastructure 的入门书，从数学基础、CUDA 编程、深度学习原理，到分布式训练架构、推理优化和集群硬件调度，帮助读者建立从数学公式到硬件成本的完整心智模型。
 
 ## 全书结构
@@ -53,17 +55,20 @@ appendices/                       # 附录
 
 ## 编译方法
 
-使用 XeLaTeX 编译（推荐 latexmk）：
+需要安装 TeX Live 2026 或更新版本。Windows 下推荐直接用提供的脚本：
 
-```bash
-latexmk -xelatex main.tex
+```powershell
+powershell -ExecutionPolicy Bypass -File compile.ps1
 ```
+
+脚本会自动完成三遍编译并生成带目录的 PDF。
 
 或手动编译：
 
 ```bash
-xelatex main.tex
-xelatex main.tex   # 第二次生成目录
+xelatex -interaction=nonstopmode main.tex   # 第一遍
+xelatex -interaction=nonstopmode main.tex   # 第二遍生成目录
+xelatex -interaction=nonstopmode main.tex   # 第三遍稳定页码
 ```
 
 ## 写作进度
@@ -71,10 +76,9 @@ xelatex main.tex   # 第二次生成目录
 - [x] 第一篇：基石（第 1--3 章）
 - [x] 第二篇：演进（第 4--6 章）
 - [x] 第三篇：分布式训练（第 7--11 章）
-- [x] 第四篇：推理优化（第 12--14 章）
-- [ ] 第四篇：推理优化（第 15--16 章）
-- [ ] 第五篇：硬件与调度（第 17--20 章）
-- [ ] 附录
+- [x] 第四篇：推理优化（第 12--16 章）
+- [x] 第五篇：硬件与调度（第 17--20 章）
+- [x] 附录
 
 ## 许可证
 

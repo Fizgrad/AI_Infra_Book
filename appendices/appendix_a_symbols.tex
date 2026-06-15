@@ -47,9 +47,9 @@ $V$ & 词表大小 vocabulary size。 \
 \end{longtable}
 
 若存在歧义，本书会在公式前显式说明索引含义。例如：
-[
+\[
 \tensor{X}_{b,s,:}
-]
+\]
 表示第 $b$ 个样本、第 $s$ 个 token 对应的 hidden vector。
 
 \section{Transformer 中的维度命名}
@@ -96,27 +96,27 @@ Logits & $[B, S, V]$ & 每个 token 位置上的词表 logits。 \
 \subsection{MHA、MQA 与 GQA 中的 head 维度}
 
 标准 Multi-Head Attention 中，Query、Key、Value 通常具有相同数量的 heads：
-[
+\[
 H_q = H_k = H_v = H.
-]
+\]
 
 在 Multi-Query Attention 中，多个 query heads 共享一组 key/value heads：
-[
+\[
 H_q = H,\qquad H_k = H_v = 1.
-]
+\]
 
 在 Grouped-Query Attention 中，query heads 被分组，每组共享一个 key/value head：
-[
+\[
 H_q = H,\qquad H_k = H_v = H_{\mathrm{kv}},\qquad H_{\mathrm{kv}} < H.
-]
+\]
 
 因此，KV Cache 的大小与 $H_{\mathrm{kv}}$ 直接相关，而不是只与 $H_q$ 相关。推理系统中估算显存时，应使用：
-[
+\[
 \mathrm{KVCacheBytes}
 =====================
 
 2 \cdot B \cdot S \cdot L \cdot H_{\mathrm{kv}} \cdot D_h \cdot \mathrm{bytes_per_element}.
-]
+\]
 其中系数 $2$ 分别对应 Key Cache 与 Value Cache。
 
 \section{batch、sequence、hidden、head 维度约定}
@@ -124,16 +124,16 @@ H_q = H,\qquad H_k = H_v = H_{\mathrm{kv}},\qquad H_{\mathrm{kv}} < H.
 \subsection{默认逻辑布局}
 
 除非特别说明，本书在数学推导中默认使用 batch-first 布局：
-[
+\[
 \tensor{X} \in \mathbb{R}^{B \times S \times D}.
-]
+\]
 
 这与许多现代 PyTorch 模型实现保持一致，便于读者理解 batch、sequence 与 hidden 的关系。在讲解注意力时，本书通常将 Q/K/V 写作：
-[
+\[
 \tensor{Q}, \tensor{K}, \tensor{V}
 \in
 \mathbb{R}^{B \times S \times H \times D_h}.
-]
+\]
 
 实际工程中，为了适配 kernel 或提高访存效率，常见布局还包括：
 
@@ -149,26 +149,26 @@ H_q = H,\qquad H_k = H_v = H_{\mathrm{kv}},\qquad H_{\mathrm{kv}} < H.
 \subsection{矩阵乘法方向}
 
 线性层通常写作：
-[
+\[
 \mat{Y} = \mat{X}\mat{W} + \vect{b},
-]
+\]
 其中：
-[
+\[
 \mat{X} \in \mathbb{R}^{N \times D_{\mathrm{in}}},
 \qquad
 \mat{W} \in \mathbb{R}^{D_{\mathrm{in}} \times D_{\mathrm{out}}},
 \qquad
 \mat{Y} \in \mathbb{R}^{N \times D_{\mathrm{out}}}.
-]
+\]
 
 在 PyTorch 的 \texttt{nn.Linear(in_features, out_features)} 中，权重参数的存储形状通常是：
-[
+\[
 [D_{\mathrm{out}}, D_{\mathrm{in}}],
-]
+\]
 前向计算在语义上等价于：
-[
+\[
 \mat{Y} = \mat{X}\mat{W}^{\top} + \vect{b}.
-]
+\]
 
 因此，阅读代码时不要只根据权重 tensor 的 shape 判断数学公式方向，而要结合框架 API 的约定。
 
@@ -177,14 +177,14 @@ H_q = H,\qquad H_k = H_v = H_{\mathrm{kv}},\qquad H_{\mathrm{kv}} < H.
 \subsection{公式与代码之间的对应关系}
 
 本书尽量保持公式与代码之间的一一对应。例如，Scaled Dot-Product Attention 写作：
-[
+\[
 \Attention(\mat{Q}, \mat{K}, \mat{V})
 =====================================
 
 \softmax\left(
 \frac{\mat{Q}\mat{K}^{\top}}{\sqrt{D_h}}
 \right)\mat{V}.
-]
+\]
 
 对应到伪代码时，通常写为：
 
@@ -200,14 +200,14 @@ out = probs @ v
 \subsection{复杂度记号}
 
 本书使用 $\mathcal{O}(\cdot)$ 表示渐进复杂度。若讨论 Transformer attention 的计算复杂度，常写作：
-[
+\[
 \mathcal{O}(B \cdot H \cdot S^2 \cdot D_h).
-]
+\]
 
 若讨论 KV Cache 显存复杂度，常写作：
-[
+\[
 \mathcal{O}(B \cdot L \cdot H_{\mathrm{kv}} \cdot S \cdot D_h).
-]
+\]
 
 需要注意，复杂度表达式只表达增长趋势，不等价于真实运行时间。真实性能还受到 kernel fusion、访存模式、HBM 带宽、Tensor Core 利用率、通信拓扑和调度策略影响。
 
